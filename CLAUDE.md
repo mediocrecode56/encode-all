@@ -1,0 +1,3 @@
+# Encode All
+
+@BIBLE.md

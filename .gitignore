@@ -1,0 +1,7 @@
+build/
+dist/
+*.exe
+*.res
+/data/
+/portable
+build-update-test/

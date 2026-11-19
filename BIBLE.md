@@ -1,0 +1,38 @@
+# Encode All: bible
+
+Native Windows downloader, converter and remuxer around yt-dlp, FFmpeg and FFprobe. Workspace rules: `E:\CODING\BIBLE.md`. Last verified: 2026-11-20.
+
+## Rules (never break)
+- The yt-dlp step is always bit-for-bit: format IDs picked in `src/dl/ytdlp.cpp`, merged or remuxed with `-c copy` only (never `--recode-video`, `--force-keyframes-at-cuts`, `--audio-format` or filters). Original stops there (native container, MKV for mixed families).
+- MP4 and MOV (owner's decision, 2026-11-20) then convert in our own FFmpeg step: x264/x265 preset `slow`, H.264 or H.265 at CRF 12/14/16 (extreme/high/normal). Video already in the chosen codec is copied. MP4 audio: AAC copied, else AAC 320k (80k per channel for surround, max 512k). MOV audio: copied if MOV holds it, else exact PCM. The queue labels the result COPY or LOSSY.
+- Audio only: MP3 320 CBR is a labelled lossy transcode (MP3 sources are copied); WAV decodes exactly (f32 for lossy sources, source depth for lossless); Original copies the stream. A download that is converted is fetched as `<name>.src.<ext>` and removed after verification.
+- Never overwrite: every output goes through `uniquePath` and a `.tmp` name, renamed after FFprobe verification. Never drop a stream silently: every excluded or unsupported stream is listed in the plan.
+- Performance first: no timers while idle, relayout only on change (a diff of the item list repaints only changed rectangles), FFmpeg at below-normal priority, all work off the UI thread. Runners read task specs through `RunCtx::spec()`/`specSet()` (queue lock), never `t.spec` directly.
+- UI: monochrome, white on black (dark) or black on white (light). Segoe UI for labels and boxed controls (buttons, checkboxes, dropdowns, segments, solid progress bars); Consolas for technical lines (streams, plans, logs, numbers). No colours, no animation.
+- Updates never touch running tasks: tool swaps wait until the tool is idle; app updates are staged and used on the next start. Closing the app keeps running tasks (`interrupted`): they come back waiting, and downloads keep their `.part` files.
+
+## Layout
+- `src/core`: UTF-8/path helpers, JSON, processes (job objects, kill tree, suspend), WinHTTP, SHA-256.
+- `src/media`: `probe` (ffprobe JSON), `compat` (container matrix, advice), `encode` (convert/remux plans, presets, estimates, warnings), `hwenc` (encoder detection by test encodes).
+- `src/dl`: yt-dlp info parsing, format choice, args, progress and error classes.
+- `src/app`: settings, `deps` (tool manager), `queue` and `runners`, `appupdate`. `src/ui`: window, painter, views, thumbnails.
+- Data: `%LOCALAPPDATA%\Encode All` (settings, presets, queue, history, log, `deps\<tool>\current|previous|new`). A `portable` file beside the exe keeps data in `data\` there.
+
+## Dependencies (downloaded at first run, never bundled)
+- yt-dlp: `yt-dlp/yt-dlp` latest `yt-dlp.exe` against `SHA2-256SUMS`; nightly (`yt-dlp/yt-dlp-nightly-builds`) only after an extraction failure on the latest stable.
+- FFmpeg/FFprobe: `yt-dlp/FFmpeg-Builds` `latest/ffmpeg-master-latest-win64-gpl.zip` against `checksums.sha256`. Deno (yt-dlp's JS runtime): `denoland/deno` zip + `.sha256sum` (PowerShell format; `extractHash` reads it).
+- Each install: download, verify, unzip with `%SystemRoot%\System32\tar.exe`, self-test, then `current` moves to `previous`. Checks compare published checksums only (no GitHub API). A rollback skips the build it left until a newer one appears.
+- YouTube thumbnails use `i.ytimg.com/vi/<id>/mqdefault.jpg`: the sized `sqp=` ones can be WebP, which clean Windows cannot decode.
+
+## Build and test
+- `.\build.ps1` (WinLibs g++, CMake, Ninja from TOOLS; static) builds `build\EncodeAll.exe`, `unit_tests.exe`, `integration_tests.exe`. `-Release` also stages `build\stage` (portable) and writes `dist\`. This PC can crash compilers under load: re-run once before debugging an internal compiler error.
+- `build\unit_tests.exe`: logic, under a second; run on every change.
+- `build\integration_tests.exe [--no-net]`: tools install through the app's own manager into `build\data`, then real media (remux packet hashes, lossless frame hashes, exact PCM, NVENC/QSV, pause/resume/cancel/retry/restart) and live downloads (bit-identical to the raw formats, MOV, 4K AV1 segment to H.264 MP4, MP3, segment, playlist). About 3 minutes with network.
+- `tests\update-test.ps1`: fake 9.9.9 build (`-DEA_VERSION_OVERRIDE`) served locally (`EA_UPDATE_BASE`): tampered package refused, swap, rollback after failed starts (`--update-now`, `--startup-check`). Pipe GUI-exe calls (`| Out-Null`) so PowerShell waits for them.
+- GUI checks run in WinTest's hidden Sandbox, never on the owner's desktop: `E:\CODING\WinTest\WinTest.ps1 launch encodeall` (fixture `build\stage`). The guest has network and a vGPU (NVENC, Quick Sync work). `ui click --at` takes screen coordinates (add the window origin from `ui inspect`); Ctrl shortcuts need `send-keys --via send-input`.
+
+## Release
+- Version lives in `src/version.h` (`EA_VERSION`, `EA_VERSION_W`, `EA_VERSION_NUM`) and CHANGELOG.md; build.ps1 passes it to the installer. Bump the last position on every committed change.
+- Publisher: GitHub Actions `release.yml` on a pushed `v*` tag builds, runs unit tests and uploads `EncodeAll-Setup-<v>.exe`, `EncodeAll-<v>-win64.zip` and `SHA256SUMS` to `mediocrecode56/encode-all` (public). Pushes to `main` only build and test.
+- Steps: unit, integration and update tests, WinTest launch check, CHANGELOG, commit, `git tag v<version>`, `git push origin main v<version>` (needs the owner's yes), then confirm the release is not a draft and has all three assets.
+- App update: zip verified by SHA256SUMS, `EncodeAll.exe` renamed to `.old`, new exe moved in and used on the next start; a third start that never reached "healthy" (15 s) restores `.old`.
