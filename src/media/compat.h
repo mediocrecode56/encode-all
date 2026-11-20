@@ -27,9 +27,9 @@ std::string normalizeYtCodec(const std::string& c);  // "avc1.64..." -> "h264", 
 bool chaptersFit(Container c);
 bool attachmentsFit(Container c);
 
-// The smallest change that keeps every stream bit-for-bit. Used by Remux recommendations.
+// MP4 or MOV, whichever keeps every stream bit-for-bit (the wanted one when neither does). Used by Remux.
 struct ContainerAdvice {
-    Container best = Container::MKV;
+    Container best = Container::MP4;
     int copyable = 0, convertible = 0, impossible = 0;
     std::vector<std::wstring> notes;  // human sentences, one per issue
 };

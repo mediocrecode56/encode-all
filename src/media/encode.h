@@ -84,7 +84,9 @@ struct Plan {
 
 const wchar_t* className(QualityClass c);  // "STREAM COPY (bit-for-bit)", ...
 
+// Auto takes the fastest encoder that works here: NVENC, then Quick Sync, then AMF, then x264/x265.
 std::string pickEncoder(VCodec c, Accel a, RateMode r, const EncoderCaps& caps, std::wstring* why = nullptr);
+const wchar_t* pcmBitsName(int bits);  // exact, 16-bit, 24-bit, 32-bit float
 Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& caps);
 
 enum class TrackAction { Copy, ToAAC, ToPCM, ToText, Exclude };
@@ -93,14 +95,15 @@ const wchar_t* trackActionName(TrackAction a);
 struct RemuxSpec {
     Container container = Container::MP4;
     std::map<int, TrackAction> actions;  // by source stream index; missing = default
-    int aacKbps = 256;
+    bool audioPcm = false;  // false keeps the original audio (PCM only where the container needs it); true decodes every track to PCM
+    int pcmBits = 0;        // 0 = exact (source depth, 32-bit float for lossy sources), 16, 24, 32 (float)
     bool chapters = true;
     bool faststart = true;
     json::Value toJson() const;
     static RemuxSpec fromJson(const json::Value& v);
 };
 
-TrackAction defaultAction(Container c, const StreamInfo& s);
+TrackAction defaultAction(Container c, const StreamInfo& s, bool audioPcm = false);
 std::vector<TrackAction> allowedActions(Container c, const StreamInfo& s);
 Plan planRemux(const MediaInfo& m, const RemuxSpec& s);
 

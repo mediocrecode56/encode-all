@@ -25,8 +25,10 @@ add_library(eacore STATIC ${CORE})
 target_link_libraries(eacore PUBLIC ${LIBS})
 
 add_executable(EncodeAll WIN32
-  src/ui/main.cpp src/ui/gfx.cpp src/ui/window.cpp src/ui/views.cpp src/ui/thumbs.cpp
+  src/ui/main.cpp src/ui/gfx.cpp src/ui/menu.cpp src/ui/window.cpp src/ui/views.cpp src/ui/thumbs.cpp
   src/app.rc)
+# windres does not report header dependencies: rebuild the resources when the version, icon or manifest changes.
+set_source_files_properties(src/app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/src/version.h;${CMAKE_SOURCE_DIR}/src/app.manifest;${CMAKE_SOURCE_DIR}/assets/encodeall.ico")
 target_link_libraries(EncodeAll PRIVATE eacore windowscodecs comctl32 uxtheme dwmapi comdlg32 imm32)
 target_link_options(EncodeAll PRIVATE -municode -mwindows -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -s)
 

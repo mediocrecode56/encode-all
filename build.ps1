@@ -1,4 +1,4 @@
-# Builds build\EncodeAll.exe and build\unit_tests.exe (static, no DLLs).
+# Builds build\EncodeAll.exe and build\unit_tests.exe (static, no DLLs), and copies the exe to the project root.
 # -Release also stages build\stage (portable, for WinTest) and writes dist\ (installer, zip, SHA256SUMS).
 param([switch]$Release, [switch]$Clean, [switch]$Test)
 $ErrorActionPreference = 'Stop'
@@ -16,6 +16,10 @@ if ($LASTEXITCODE) { throw 'CMake configure failed' }
 & cmake --build $build
 if ($LASTEXITCODE) { throw 'Build failed' }
 Write-Host "built EncodeAll $version"
+# The latest build also goes to the project root (EncodeAll.exe, git-ignored) for the owner to run.
+# Not portable there: it uses %LOCALAPPDATA%\Encode All. A running copy is left alone.
+try { Copy-Item "$build\EncodeAll.exe" "$root\EncodeAll.exe" -Force; Write-Host "copied to $root\EncodeAll.exe" }
+catch { Write-Warning "EncodeAll.exe in the project root is in use; close it and build again to update it" }
 if ($Test -or $Release) {
   & "$build\unit_tests.exe"
   if ($LASTEXITCODE) { throw 'Unit tests failed' }

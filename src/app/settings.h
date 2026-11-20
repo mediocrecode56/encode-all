@@ -11,6 +11,7 @@
 namespace ea {
 
 std::wstring dataDir();  // portable "data\" beside the exe, else %LOCALAPPDATA%\Encode All
+void setDataDir(const std::wstring& dir);  // tests only: keeps their data away from the app's
 bool isPortable();
 
 struct Settings {
@@ -28,8 +29,10 @@ struct Settings {
     bool keepAudioSource = false;
     ConvertSpec convert;
     Preset convertPreset = Preset::Balanced;
-    Container remuxContainer = Container::MP4;
-    int remuxAacKbps = 256;
+    Container remuxContainer = Container::MP4;  // MP4 or MOV
+    bool remuxPcm = false;   // Remux audio: original, or every track decoded to linear PCM
+    int remuxPcmBits = 0;    // 0 exact, 16, 24, 32 (float)
+    Accel encoder = Accel::Auto;  // every encode: Auto = fastest available (GPU first); set only in Settings
     int winX = INT32_MIN, winY = INT32_MIN, winW = 0, winH = 0;
     bool winMax = false;
     int tab = 0;

@@ -69,19 +69,19 @@ void applyPreset(ConvertSpec& s, Preset p) {
     }
     switch (p) {
         case Preset::Lossless:
-            s.vcodec = VCodec::H264; s.rate = RateMode::Lossless; s.accel = Accel::Software; s.speed = "veryfast";
+            s.vcodec = VCodec::H264; s.rate = RateMode::Lossless; s.speed = "veryfast";
             s.acodec = ACodec::Copy; s.width = s.height = 0; s.fps = 0; s.pixFmt.clear();
             break;
         case Preset::MaxQuality:
-            s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 16; s.accel = Accel::Software; s.speed = "slow";
+            s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 16; s.speed = "slow";
             s.acodec = ACodec::Copy; s.aacKbps = 320;
             break;
         case Preset::Balanced:
-            s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 22; s.accel = Accel::Auto; s.speed = "medium";
+            s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 22; s.speed = "medium";
             s.acodec = ACodec::Copy; s.aacKbps = 192;
             break;
         case Preset::Compact:
-            s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 28; s.accel = Accel::Auto; s.speed = "medium";
+            s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 28; s.speed = "medium";
             s.acodec = ACodec::AAC; s.aacKbps = 128;
             break;
         case Preset::Custom: break;
@@ -151,7 +151,8 @@ ConvertSpec ConvertSpec::fromJson(const json::Value& v) {
 json::Value RemuxSpec::toJson() const {
     json::Value v = json::Value::object();
     v.set("container", (int)container);
-    v.set("aacKbps", aacKbps);
+    v.set("audioPcm", audioPcm);
+    v.set("pcmBits", pcmBits);
     v.set("chapters", chapters);
     v.set("faststart", faststart);
     json::Value a = json::Value::object();
@@ -163,7 +164,9 @@ json::Value RemuxSpec::toJson() const {
 RemuxSpec RemuxSpec::fromJson(const json::Value& v) {
     RemuxSpec s;
     s.container = (Container)std::clamp((int)v["container"].num(0), 0, (int)Container::WEBM);
-    s.aacKbps = std::clamp((int)v["aacKbps"].num(256), 32, 512);
+    s.audioPcm = v["audioPcm"].boolean(false);
+    s.pcmBits = (int)v["pcmBits"].num(0);
+    if (s.pcmBits != 16 && s.pcmBits != 24 && s.pcmBits != 32) s.pcmBits = 0;
     s.chapters = v["chapters"].boolean(true);
     s.faststart = v["faststart"].boolean(true);
     for (auto& kv : v["actions"].o) s.actions[atoi(kv.first.c_str())] = (TrackAction)std::clamp((int)kv.second.num(0), 0, 4);
@@ -245,8 +248,9 @@ std::string pickEncoder(VCodec c, Accel a, RateMode r, const EncoderCaps& caps, 
         if (why) *why = t;
     };
     if (r == RateMode::Lossless) {
+        // Auto stays on x264/x265 here: only they keep every source exactly (10-bit, 4:2:2, 4:4:4).
         if (a == Accel::NVENC && caps.has(nv)) return nv;
-        if (a != Accel::Software && a != Accel::Auto) note(L"lossless needs the software encoder (or NVENC); using " + widen(sw));
+        if (a == Accel::QSV || a == Accel::AMF) note(L"lossless needs the software encoder (or NVENC); using " + widen(sw));
         return sw;
     }
     switch (a) {
@@ -382,7 +386,7 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
     if (naudio > 1)
         p.warnings.push_back(L"The file has " + I(naudio) + L" audio tracks; " +
                              (s.audio == AudioTarget::FLAC ? L"FLAC" : s.audio == AudioTarget::MP3 ? L"MP3" : L"WAV") +
-                             L" holds one, so only " + describeStream(a) + L" is converted. Use Remux to MKV to keep all.");
+                             L" holds one, so only " + describeStream(a) + L" is converted. Remux keeps every track.");
     Container c = s.audio == AudioTarget::FLAC ? Container::FLAC : s.audio == AudioTarget::MP3 ? Container::MP3 : Container::WAV;
     p.ext = containerExt(c);
     p.args = {L"-map", L"0:" + I(a.index)};
@@ -522,7 +526,7 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             haveVideo = true;
             if (s.vcodec == VCodec::Copy) {
                 if (fitStream(c, st) != Fit::Copy) {
-                    p.error = describeStream(st) + L" cannot be copied into " + containerName(c) + L". Pick a codec or use Remux to MKV.";
+                    p.error = describeStream(st) + L" cannot be copied into " + containerName(c) + L". Pick a codec instead of copy.";
                     return p;
                 }
                 p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index), L"-c:" + idx, L"copy"});
@@ -725,7 +729,7 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             if (fit == Fit::No) {
                 p.lines.push_back(L"subtitle #" + I(st.index) + L": NOT included");
                 p.warnings.push_back(L"Subtitle #" + I(st.index) + L" (" + W(st.codec) + L", image-based) cannot go in " + containerName(c) +
-                                     L". Remux to MKV keeps it with no compromise.");
+                                     L".");
                 continue;
             }
             p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
@@ -795,7 +799,12 @@ const wchar_t* trackActionName(TrackAction a) {
     return L"";
 }
 
-TrackAction defaultAction(Container c, const StreamInfo& s) {
+const wchar_t* pcmBitsName(int bits) {
+    return bits == 16 ? L"16-bit" : bits == 24 ? L"24-bit" : bits == 32 ? L"32-bit float" : L"exact";
+}
+
+TrackAction defaultAction(Container c, const StreamInfo& s, bool audioPcm) {
+    if (audioPcm && s.isAudio()) return TrackAction::ToPCM;
     Fit f = fitStream(c, s);
     if (f == Fit::Copy) return TrackAction::Copy;
     if (f == Fit::Convert) {
@@ -808,10 +817,7 @@ TrackAction defaultAction(Container c, const StreamInfo& s) {
 std::vector<TrackAction> allowedActions(Container c, const StreamInfo& s) {
     std::vector<TrackAction> r;
     if (fitStream(c, s) == Fit::Copy) r.push_back(TrackAction::Copy);
-    if (s.isAudio()) {
-        r.push_back(TrackAction::ToPCM);
-        r.push_back(TrackAction::ToAAC);
-    }
+    if (s.isAudio()) r.push_back(TrackAction::ToPCM);  // Remux stays lossless: no AAC here
     if (s.isSub() && s.textSub() && fitStream(c, s) != Fit::Copy) r.push_back(TrackAction::ToText);
     r.push_back(TrackAction::Exclude);
     return r;
@@ -830,9 +836,9 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
     double bps = 0;
     for (const auto& st : m.streams) {
         auto it = s.actions.find(st.index);
-        TrackAction a = it != s.actions.end() ? it->second : defaultAction(c, st);
+        TrackAction a = it != s.actions.end() ? it->second : defaultAction(c, st, s.audioPcm);
         auto allowed = allowedActions(c, st);
-        if (std::find(allowed.begin(), allowed.end(), a) == allowed.end()) a = defaultAction(c, st);
+        if (std::find(allowed.begin(), allowed.end(), a) == allowed.end()) a = defaultAction(c, st, s.audioPcm);
         std::wstring idx = I(o), d = describeStream(st);
         if (a == TrackAction::Exclude && st.codec == "bin_data" && m.chapters) {
             p.lines.push_back(d + L"  ->  chapter text track (chapters are carried separately)");
@@ -841,7 +847,7 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
         if (a == TrackAction::Exclude) {
             Fit f = fitStream(c, st);
             p.lines.push_back(d + L"  ->  EXCLUDED" + (f == Fit::No ? std::wstring(L" (") + containerName(c) + L" cannot hold it)" : L" (your choice)"));
-            if (f == Fit::No && st.type != "data") p.warnings.push_back(d + L" is left out: " + containerName(c) + L" cannot hold it. MKV keeps it bit-for-bit.");
+            if (f == Fit::No && st.type != "data") p.warnings.push_back(d + L" is left out: " + containerName(c) + L" cannot hold it.");
             continue;
         }
         p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
@@ -854,18 +860,15 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
                 if (st.isVideo() || st.isAudio()) p.copiedSourceStreams.push_back(st.index);
                 bps += st.bitrate > 0 ? st.bitrate : (st.isVideo() ? m.videoBitrate() : st.isAudio() ? 192000 : 0);
                 break;
-            case TrackAction::ToAAC: {
-                p.args.insert(p.args.end(), {L"-c:" + idx, L"aac", L"-b:" + idx, I(s.aacKbps) + L"k"});
-                if (st.channels > 8) p.args.insert(p.args.end(), {L"-ac:" + idx, L"8"});
-                p.lines.push_back(d + L"  ->  AAC " + I(s.aacKbps) + L" kb/s (lossy)");
-                anyLossy = anyEncode = true;
-                bps += s.aacKbps * 1000.0;
-                break;
-            }
             case TrackAction::ToPCM: {
-                std::string pc = pcmCodecFor(st, 0);
+                std::string pc = pcmCodecFor(st, s.pcmBits);
                 p.args.insert(p.args.end(), {L"-c:" + idx, W(pc)});
-                p.lines.push_back(d + L"  ->  " + W(pc) + L" (exact decode, lossless)");
+                bool exact = s.pcmBits == 0 || s.pcmBits == 32 || (!st.lossyAudio() && st.bitsPerSample && s.pcmBits >= st.bitsPerSample);
+                p.lines.push_back(d + L"  ->  " + W(pc) + (exact ? L" (exact decode, lossless)" : L" (samples rounded)"));
+                if (!exact) {
+                    anyLossy = true;
+                    p.warnings.push_back(d + L": " + I(s.pcmBits) + L"-bit PCM rounds the samples; 'exact' keeps them identical.");
+                }
                 anyEncode = true;
                 bps += pcmBitrate(st, pc, 0, 0);
                 break;
@@ -874,7 +877,7 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
                 const wchar_t* to = c == Container::MKV ? L"srt" : L"mov_text";
                 p.args.insert(p.args.end(), {L"-c:" + idx, to});
                 p.lines.push_back(d + L"  ->  " + to + L" (text kept, styling lost)");
-                if (st.codec == "ass" || st.codec == "ssa") p.warnings.push_back(d + L": ASS styling, fonts and positions are lost in " + to + L". MKV keeps them.");
+                if (st.codec == "ass" || st.codec == "ssa") p.warnings.push_back(d + L": ASS styling, fonts and positions are lost in " + to + L".");
                 break;
             }
             default: break;

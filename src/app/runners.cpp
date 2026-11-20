@@ -485,8 +485,8 @@ RunResult runDownload(RunCtx& c) {
         cs.vcodec = v && v->codec == wantCodec ? VCodec::Copy : prefs.hevc ? VCodec::H265 : VCodec::H264;
         cs.rate = RateMode::Quality;
         cs.quality = prefs.crf;
-        cs.speed = "slow";  // always slow for downloads: best quality per bit at these CRFs
-        cs.accel = Accel::Software;
+        cs.speed = "slow";  // slow for downloads: best quality per bit at these CRFs (NVENC p6)
+        cs.accel = c.t.triedSoftware ? Accel::Software : c.settings.encoder;  // fastest encoder unless Settings says otherwise
         if (out == DlOut::MP4) {
             cs.acodec = !au || au->codec == "aac" ? ACodec::Copy : ACodec::AAC;
             int ch = au ? std::max(2, au->channels) : 2;
@@ -553,7 +553,7 @@ static RunResult runEncodeTask(RunCtx& c, bool remux) {
         plan = planRemux(mi, RemuxSpec::fromJson(sp["remux"]));
     } else {
         ConvertSpec cs = ConvertSpec::fromJson(sp["convert"]);
-        if (c.t.triedSoftware) cs.accel = Accel::Software;
+        cs.accel = c.t.triedSoftware ? Accel::Software : c.settings.encoder;  // the encoder is a global setting
         plan = planConvert(mi, cs, c.caps);
     }
     if (!plan.ok) return fail(plan.error);

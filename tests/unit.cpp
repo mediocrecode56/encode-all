@@ -151,7 +151,7 @@ static void testCompat() {
     MediaInfo m;
     parseProbeJson(kProbe, m);
     ContainerAdvice a = adviseContainer(Container::MP4, m);
-    CHECK(a.best == Container::MKV);
+    CHECK(a.best == Container::MP4);  // neither MP4 nor MOV holds PGS + a font: Remux offers no MKV
     CHECK(a.impossible >= 2);  // PGS + attachment
     MediaInfo chap;
     parseProbeJson(R"({"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"},
@@ -336,10 +336,31 @@ static void testPlans() {
     p = planRemux(m, r);
     CHECK(p.ok && p.cls == QualityClass::Lossless);  // TrueHD -> PCM is exact
     CHECK(p.outStreams == 4);
-    CHECK(anyContains(p.warnings, L"MKV keeps it"));
+    CHECK(anyContains(p.warnings, L"cannot hold it") && !anyContains(p.warnings, L"MKV"));
+    CHECK(hasPair(p.args, L"-c:2", L"copy"));  // AAC kept as it is (audio: original)
+    // Audio as linear PCM: every audio track decodes exactly; a fixed depth below the source rounds.
+    r.audioPcm = true;
+    p = planRemux(m, r);
+    CHECK(p.cls == QualityClass::Lossless && hasPair(p.args, L"-c:1", L"pcm_s24le") && hasPair(p.args, L"-c:2", L"pcm_f32le"));
+    r.pcmBits = 16;
+    p = planRemux(m, r);
+    CHECK(p.cls == QualityClass::Lossy && hasPair(p.args, L"-c:1", L"pcm_s16le") && anyContains(p.warnings, L"rounds the samples"));
+    r.pcmBits = 0;
+    r.audioPcm = false;
+    // AAC is not a Remux choice any more: an old saved ToAAC falls back to the default.
     r.actions[1] = TrackAction::ToAAC;
     p = planRemux(m, r);
-    CHECK(p.cls == QualityClass::Lossy);
+    CHECK(p.cls == QualityClass::Lossless && hasPair(p.args, L"-c:1", L"pcm_s24le"));
+    CHECK(RemuxSpec::fromJson(r.toJson()).pcmBits == 0);
+    // Auto takes the fastest encoder that works; lossless stays on x264/x265 unless NVENC is chosen.
+    EncoderCaps hw;
+    hw.works["h264_nvenc"] = true;
+    hw.works["h264_qsv"] = true;
+    CHECK(pickEncoder(VCodec::H264, Accel::Auto, RateMode::Quality, hw) == "h264_nvenc");
+    hw.works["h264_nvenc"] = false;
+    CHECK(pickEncoder(VCodec::H264, Accel::Auto, RateMode::Quality, hw) == "h264_qsv");
+    CHECK(pickEncoder(VCodec::H264, Accel::Auto, RateMode::Lossless, hw) == "libx264");
+    CHECK(pickEncoder(VCodec::H264, Accel::Software, RateMode::Quality, hw) == "libx264");
     r.actions[1] = TrackAction::Exclude;
     r.actions[2] = TrackAction::Exclude;
     r.actions[0] = TrackAction::Exclude;

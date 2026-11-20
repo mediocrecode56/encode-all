@@ -85,6 +85,12 @@ static bool runTask(Queue& q, TaskKind k, const json::Value& spec, TaskView& out
     return false;
 }
 
+static bool logHas(Queue& q, uint64_t id, const std::wstring& what) {
+    for (auto& l : q.taskLog(id))
+        if (l.find(what) != std::wstring::npos) return true;
+    return false;
+}
+
 static json::Value convertSpec(const std::wstring& in, const ConvertSpec& cs) {
     json::Value v = json::Value::object();
     v.set("input", in);
@@ -108,8 +114,8 @@ int wmain(int argc, wchar_t** argv) {
     bool net = true;
     for (int i = 1; i < argc; i++)
         if (std::wstring(argv[i]) == L"--no-net") net = false;
-    std::wstring portable = joinPath(dirName(exePath()), L"portable");
-    if (!fileExists(portable)) writeFileAtomic(portable, "test data lives in data\\\n");
+    // Own data folder: the app beside this exe must never see test tasks, history or log lines.
+    setDataDir(joinPath(dirName(exePath()), L"test-data"));
     gWork = joinPath(dataDir(), L"itest");
     removeTree(gWork);
     makeDirs(joinPath(gWork, L"out"));
@@ -163,6 +169,7 @@ int wmain(int argc, wchar_t** argv) {
     Queue q;
     gSettings.maxEncodes = 2;
     gSettings.maxRemux = 2;
+    gSettings.encoder = Accel::Software;  // deterministic encodes; the hardware loop and live downloads switch it
     gSettings.dlDir = joinPath(gWork, L"dl");
     q.setRunner(TaskKind::Download, runDownload);
     q.setRunner(TaskKind::Convert, runConvert);
@@ -205,7 +212,6 @@ int wmain(int argc, wchar_t** argv) {
     CHECK(decodedVideo(t.output) == decodedVideo(b), "B -> lossless: 10-bit frames identical");
     cs = ConvertSpec();
     applyPreset(cs, Preset::Balanced);
-    cs.accel = Accel::Software;
     CHECK(runTask(q, TaskKind::Convert, convertSpec(a, cs), t), "A -> H.265 balanced (x265) finished");
     probeFile(gDeps.ffprobe(), t.output, m);
     CHECK(m.video() && m.video()->codec == "hevc" && t.cls == QualityClass::Lossy, "H.265 output, classed lossy");
@@ -220,10 +226,19 @@ int wmain(int argc, wchar_t** argv) {
         if (!caps.has(hw)) continue;
         cs = ConvertSpec();
         cs.vcodec = VCodec::H265;
-        cs.accel = std::string(hw) == "hevc_nvenc" ? Accel::NVENC : std::string(hw) == "hevc_qsv" ? Accel::QSV : Accel::AMF;
+        gSettings.encoder = std::string(hw) == "hevc_nvenc" ? Accel::NVENC : std::string(hw) == "hevc_qsv" ? Accel::QSV : Accel::AMF;
         std::string what = std::string("A -> H.265 with ") + hw;
-        CHECK(runTask(q, TaskKind::Convert, convertSpec(a, cs), t), what.c_str());
+        CHECK(runTask(q, TaskKind::Convert, convertSpec(a, cs), t) && logHas(q, t.id, L"(" + widen(hw) + L")"), what.c_str());
     }
+    gSettings.encoder = Accel::Auto;
+    cs = ConvertSpec();
+    cs.vcodec = VCodec::H264;
+    {
+        std::string fastest = pickEncoder(VCodec::H264, Accel::Auto, RateMode::Quality, caps);
+        std::string what = "A -> H.264 with the encoder setting on auto uses the fastest encoder (" + fastest + ")";
+        CHECK(runTask(q, TaskKind::Convert, convertSpec(a, cs), t) && logHas(q, t.id, L"(" + widen(fastest) + L")"), what.c_str());
+    }
+    gSettings.encoder = Accel::Software;
 
     printf("[audio]\n");
     ConvertSpec au;
@@ -294,6 +309,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (net) {
         printf("[download]\n");
+        gSettings.encoder = Accel::Auto;  // downloads convert with the default: the fastest encoder here
         std::wstring url = L"https://www.youtube.com/watch?v=jNQXAC9IVRw";  // "Me at the zoo", 19 s
         auto spec = makeDownloadSpec(gSettings, url, L"", L"", L"");
         CHECK(runTask(q, TaskKind::Download, spec, t, 900), "YouTube video -> MP4 download finished");
@@ -363,6 +379,7 @@ int wmain(int argc, wchar_t** argv) {
     q.shutdown();
 
     printf("[restart]\n");
+    gSettings.encoder = Accel::Software;  // slow enough to stop mid-encode
     {
         std::wstring big = joinPath(gWork, L"big.mkv");
         ConvertSpec slow;

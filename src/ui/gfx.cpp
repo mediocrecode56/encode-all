@@ -3,6 +3,8 @@
 #include <dwmapi.h>
 
 #include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace ea::ui {
 
@@ -146,6 +148,77 @@ std::wstring Painter::fit(const std::wstring& s, int maxPx, HFONT font) {
     }
     SelectObject(dc_, old);
     return r;
+}
+
+void Painter::icon(int k, const RECT& r, COLORREF c, int size) {
+    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    int h = std::max(3, size / 2);  // half the glyph box
+    int pw = std::max(1, (size + 8) / 16);
+    HPEN pen = CreatePen(PS_SOLID, pw, c);
+    HGDIOBJ op = SelectObject(dc_, pen);
+    HGDIOBJ ob = SelectObject(dc_, GetStockObject(NULL_BRUSH));
+    auto line = [&](int x0, int y0, int x1, int y1) {
+        MoveToEx(dc_, x0, y0, nullptr);
+        LineTo(dc_, x1, y1);
+    };
+    switch (k) {
+        case I_History: {  // clock face with two hands
+            Ellipse(dc_, cx - h, cy - h, cx + h + 1, cy + h + 1);
+            line(cx, cy, cx, cy - h * 3 / 5);
+            line(cx, cy, cx + h / 2, cy + 1);
+            break;
+        }
+        case I_Log: {  // lines of text
+            int g = std::max(3, h * 2 / 3);
+            for (int i = -1; i <= 1; i++) {
+                int y = cy + i * g;
+                fill(RECT{cx - h, y, cx - h + pw + 1, y + pw}, c);
+                line(cx - h + pw + std::max(2, h / 3), y, i == 1 ? cx + h / 3 : cx + h + 1, y);
+            }
+            break;
+        }
+        case I_Settings: {  // gear: eight flat teeth around a hole
+            std::vector<POINT> pts;
+            double ro = h, ri = h * 0.68;
+            const double pi = 3.14159265358979;
+            for (int t = 0; t < 8; t++) {
+                double a = t * pi / 4;
+                double d[4] = {-0.30, -0.17, 0.17, 0.30};
+                double rr[4] = {ri, ro, ro, ri};
+                for (int j = 0; j < 4; j++)
+                    pts.push_back(POINT{cx + (LONG)std::lround(std::cos(a + d[j]) * rr[j]), cy + (LONG)std::lround(std::sin(a + d[j]) * rr[j])});
+            }
+            Polygon(dc_, pts.data(), (int)pts.size());
+            int hr = std::max(2, h / 3);
+            Ellipse(dc_, cx - hr, cy - hr, cx + hr + 1, cy + hr + 1);
+            break;
+        }
+        case I_Close: {
+            int q = h * 3 / 4;
+            line(cx - q, cy - q, cx + q + 1, cy + q + 1);
+            line(cx - q, cy + q, cx + q + 1, cy - q - 1);
+            break;
+        }
+        case I_Check: {
+            int q = h * 3 / 4;
+            line(cx - q, cy, cx - q / 3, cy + q * 2 / 3);
+            line(cx - q / 3, cy + q * 2 / 3, cx + q + 1, cy - q * 2 / 3 - 1);
+            break;
+        }
+        case I_Chevron:
+        case I_Up:
+        case I_Down: {
+            int q = std::max(2, h / 2), dy = (k == I_Up) ? -1 : 1;
+            int top = cy - dy * q / 2;
+            line(cx - q, top, cx, top + dy * q);
+            line(cx, top + dy * q, cx + q + 1, top - dy);
+            break;
+        }
+        default: break;
+    }
+    SelectObject(dc_, ob);
+    SelectObject(dc_, op);
+    DeleteObject(pen);
 }
 
 void Painter::bitmap(HBITMAP b, const RECT& r) {

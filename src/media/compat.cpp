@@ -171,7 +171,7 @@ ContainerAdvice adviseContainer(Container wanted, const MediaInfo& m) {
             if (s.isSub())
                 a.notes.push_back(what + L": " + containerName(wanted) + L" needs it converted to mov_text (styling and positioning are lost)");
             else if (s.isAudio())
-                a.notes.push_back(what + L": " + containerName(wanted) + L" cannot copy it; decode to PCM (exact, larger) or AAC (lossy)");
+                a.notes.push_back(what + L": " + containerName(wanted) + L" cannot copy it; it is decoded to PCM (exact, larger)");
             else
                 a.notes.push_back(what + L": needs conversion for " + containerName(wanted));
         } else {
@@ -180,8 +180,8 @@ ContainerAdvice adviseContainer(Container wanted, const MediaInfo& m) {
     }
     if (m.chapters && !chaptersFit(wanted)) a.notes.push_back(std::to_wstring(m.chapters) + L" chapters: " + containerName(wanted) + L" cannot hold chapters");
     if (a.convertible || a.impossible) {
-        // Try the other containers in order of compatibility for a bit-for-bit fit.
-        for (Container c : {Container::MP4, Container::MOV, Container::MKV}) {
+        // Try the other Remux container for a bit-for-bit fit; with none, the wanted one stays.
+        for (Container c : {Container::MP4, Container::MOV}) {
             if (c == wanted) continue;
             bool all = true;
             for (auto& s : m.streams)
@@ -191,7 +191,6 @@ ContainerAdvice adviseContainer(Container wanted, const MediaInfo& m) {
                 break;
             }
         }
-        if (a.best == wanted) a.best = Container::MKV;
     }
     return a;
 }

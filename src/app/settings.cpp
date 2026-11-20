@@ -15,12 +15,17 @@ bool isPortable() {
     return p == 1;
 }
 
+static std::wstring gDataDir;
+
+void setDataDir(const std::wstring& dir) { gDataDir = dir; }
+
 std::wstring dataDir() {
-    static std::wstring d;
+    std::wstring& d = gDataDir;
+    static bool made = false;
     if (d.empty()) {
         d = isPortable() ? joinPath(dirName(exePath()), L"data") : joinPath(localAppData(), L"Encode All");
-        makeDirs(d);
     }
+    if (!made) made = makeDirs(d);
     return d;
 }
 
@@ -53,7 +58,9 @@ json::Value Settings::toJson() const {
     v.set("convert", convert.toJson());
     v.set("convertPreset", (int)convertPreset);
     v.set("remuxContainer", (int)remuxContainer);
-    v.set("remuxAacKbps", remuxAacKbps);
+    v.set("remuxPcm", remuxPcm);
+    v.set("remuxPcmBits", remuxPcmBits);
+    v.set("encoder", (int)encoder);
     v.set("winX", winX);
     v.set("winY", winY);
     v.set("winW", winW);
@@ -92,8 +99,11 @@ void Settings::fromJson(const json::Value& v) {
     keepAudioSource = v["keepAudioSource"].boolean(false);
     if (v["convert"].isObj()) convert = ConvertSpec::fromJson(v["convert"]);
     convertPreset = (Preset)std::clamp((int)v["convertPreset"].num(2), 0, 4);
-    remuxContainer = (Container)std::clamp((int)v["remuxContainer"].num(0), 0, 2);
-    remuxAacKbps = std::clamp((int)v["remuxAacKbps"].num(256), 64, 512);
+    remuxContainer = (Container)std::clamp((int)v["remuxContainer"].num(0), 0, 1);  // MP4 or MOV (an old MKV choice becomes MP4)
+    remuxPcm = v["remuxPcm"].boolean(false);
+    remuxPcmBits = (int)v["remuxPcmBits"].num(0);
+    if (remuxPcmBits != 16 && remuxPcmBits != 24 && remuxPcmBits != 32) remuxPcmBits = 0;
+    encoder = (Accel)std::clamp((int)v["encoder"].num(0), 0, (int)Accel::AMF);
     winX = (int)v["winX"].num(INT32_MIN);
     winY = (int)v["winY"].num(INT32_MIN);
     winW = (int)v["winW"].num(0);

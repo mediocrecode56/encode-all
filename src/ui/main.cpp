@@ -83,7 +83,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (AppUpdater::startupGuard()) return 0;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     OleInitialize(nullptr);
-    logLine(L"start " EA_VERSION_W);
     ui::MainWindow win;
     if (!win.create(inst, show, args)) {
         MessageBoxW(nullptr, L"Could not create the window.", L"Encode All", MB_ICONERROR);

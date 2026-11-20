@@ -15,6 +15,7 @@
 #include "../core/util.h"
 #include "../media/hwenc.h"
 #include "../version.h"
+#include "menu.h"
 
 namespace ea::ui {
 
@@ -395,7 +396,7 @@ int MainWindow::button(int x, int y, const std::wstring& label, std::function<vo
     int w = tw(label, style) + S(20);
     Item& it = add(K_Button, RECT{x, y + S(3), x + w, y + rowH() - S(3)}, label, style | (style & S_Disabled ? 0u : S_Click));
     if (!(style & S_Disabled)) it.click = std::move(fn);
-    return x + w + S(6);
+    return x + w + S(8);
 }
 
 int MainWindow::toggle(int x, int y, const std::wstring& label, bool on, std::function<void()> fn) {
@@ -413,9 +414,11 @@ int MainWindow::check(int x, int y, bool on, std::function<void()> fn) {
     return x + S(22);
 }
 
-int MainWindow::choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel) {
-    if (!label.empty()) x = text(x, y, label, S_Mid) + S(6);
-    int w = tw(value) + S(16) + S(14);
+int MainWindow::choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel,
+                       int maxW) {
+    if (!label.empty()) x = text(x, y, label, S_Mid) + S(8);
+    int w = std::max<int>(tw(value) + S(9) + S(26), S(64));
+    if (maxW > 0 && w > maxW) w = std::max<int>(maxW, S(64));
     Item& it = add(K_Box, RECT{x, y + S(3), x + w, y + rowH() - S(3)}, value, S_Click);
     it.click = std::move(open);
     it.wheel = std::move(wheel);
@@ -454,16 +457,58 @@ void MainWindow::placeEdit(Edit e, const RECT& r) {
 }
 
 int MainWindow::popup(const std::vector<std::wstring>& opts, int checked) {
-    HMENU m = CreatePopupMenu();
-    for (size_t i = 0; i < opts.size(); i++) {
-        if (opts[i] == L"-") AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-        else AppendMenuW(m, MF_STRING | ((int)i == checked ? MF_CHECKED : 0), i + 1, opts[i].c_str());
+    RECT a;
+    if (anchorValid_) {
+        a = anchor_;
+        MapWindowPoints(hwnd_, nullptr, (POINT*)&a, 2);
+    } else {
+        POINT p;
+        GetCursorPos(&p);
+        a = RECT{p.x, p.y, p.x, p.y};
     }
+    // The list replaces the hover state of the control that opened it.
+    pressed_ = -1;
+    int r = runMenu(hwnd_, a, opts, checked, theme_, fonts_, dpi_);
     POINT p;
     GetCursorPos(&p);
-    int r = (int)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, p.x, p.y, hwnd_, nullptr);
-    DestroyMenu(m);
-    return r - 1;
+    ScreenToClient(hwnd_, &p);
+    mouse_ = p;
+    int h = hitTest(p);
+    if (h != hover_) {
+        hover_ = h;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    return r;
+}
+
+int MainWindow::iconButton(int x, int y, int icon, bool on, std::function<void()> fn) {
+    int s = rowH() - S(4);
+    Item& it = add(K_Icon, RECT{x - s, y + S(2), x, y + S(2) + s}, L"", S_Click | (on ? S_Invert : 0));
+    it.value = icon;
+    it.click = std::move(fn);
+    return x - s;
+}
+
+int MainWindow::fieldLabel(int x, int y, const std::wstring& label, unsigned style) {
+    add(K_Text, RECT{x, y, x + labelW() - S(8), y + rowH()}, label, style);
+    return x + labelW();
+}
+
+int MainWindow::sectionTitle(int x, int y, const std::wstring& title) { return text(x, y, title, S_Bold); }
+
+void MainWindow::emptyState(const RECT& r, const std::wstring& l1, const std::wstring& l2) {
+    int h = rowH() * (l2.empty() ? 1 : 2);
+    int y = r.top + std::max<int>(0, (r.bottom - r.top - h) / 2);
+    add(K_Text, RECT{r.left, y, r.right, y + rowH()}, l1, S_Center);
+    if (!l2.empty()) add(K_Text, RECT{r.left, y + rowH() - S(4), r.right, y + rowH() * 2 - S(4)}, l2, S_Mid | S_Center);
+}
+
+void MainWindow::scrollbar(const RECT& v, int offset, int content) {
+    int viewH = v.bottom - v.top;
+    if (content <= viewH || viewH <= S(20)) return;
+    int th = std::max<int>(S(18), (int)((long long)viewH * viewH / content));
+    int ty = v.top + (int)((long long)(viewH - th) * offset / std::max(1, content - viewH));
+    add(K_Bar, RECT{v.right - S(3), ty, v.right, ty + th});
 }
 
 void MainWindow::scrollBy(int& off, int delta, int maxOff) {
@@ -588,12 +633,18 @@ void MainWindow::onPaint() {
             case K_Box: {
                 if (hov || press) p.fill(it.r, theme_.hover);
                 p.frame(it.r, hov ? theme_.ink : theme_.line);
-                p.text(RECT{it.r.left + S(8), it.r.top, it.r.right - S(18), it.r.bottom}, it.text, theme_.ink, f);
-                // Small down-pointing triangle.
-                int cx = it.r.right - S(11), cy = (it.r.top + it.r.bottom) / 2;
-                for (int k = 0; k < S(4); k++) p.hline(cx - S(4) + k, cx + S(4) - k + 1, cy - S(2) + k, theme_.mid);
+                p.text(RECT{it.r.left + S(9), it.r.top, it.r.right - S(22), it.r.bottom}, it.text, theme_.ink, f);
+                p.icon(I_Chevron, RECT{it.r.right - S(22), it.r.top, it.r.right - S(4), it.r.bottom}, hov ? theme_.ink : theme_.mid, S(12));
                 break;
             }
+            case K_Icon: {
+                bool on = (it.style & S_Invert) || press;
+                if (on) p.fill(it.r, theme_.ink);
+                else if (hov) p.fill(it.r, theme_.hover);
+                p.icon((int)it.value, it.r, on ? theme_.bg : theme_.ink, S(16));
+                break;
+            }
+            case K_Bar: p.fill(it.r, theme_.line); break;
             case K_WinBtn: {
                 // Weekly's chrome: inverted on hover, thin glyphs.
                 COLORREF c = theme_.ink;
@@ -886,7 +937,10 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
             if (p >= 0 && p < (int)items_.size() && hitTest(pt) == p) {
                 auto fn = items_[p].click;
                 InvalidateRect(hwnd_, &items_[p].r, FALSE);
+                anchor_ = items_[p].r;
+                anchorValid_ = true;
                 if (fn) fn();
+                anchorValid_ = false;
             }
             return 0;
         }
@@ -1334,7 +1388,8 @@ void MainWindow::startRemux() {
         }
         RemuxSpec rs = f.remux;
         rs.container = s.remuxContainer;
-        rs.aacKbps = s.remuxAacKbps;
+        rs.audioPcm = s.remuxPcm;
+        rs.pcmBits = s.remuxPcmBits;
         if (!planRemux(f.info, rs).ok) {
             keep.push_back(f);
             continue;

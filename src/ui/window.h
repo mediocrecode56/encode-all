@@ -29,7 +29,8 @@ enum : UINT { WM_APP_QUEUE = WM_APP + 1, WM_APP_DEPS, WM_APP_RESULT, WM_APP_THUM
 constexpr unsigned S_Bold = 1, S_Mid = 2, S_Invert = 4, S_Disabled = 8, S_Click = 16, S_Right = 32, S_Selected = 64, S_Big = 128, S_Center = 256,
                    S_Mono = 512;
 constexpr UINT_PTR T_QUEUE = 1, T_FLASH = 2, T_HEALTHY = 3, T_SAVE = 4;
-enum Kind { K_Text, K_Fill, K_Line, K_Progress, K_Thumb, K_Region, K_Frame, K_Button, K_Check, K_Box, K_Cell, K_WinBtn };
+enum Kind { K_Text, K_Fill, K_Line, K_Progress, K_Thumb, K_Region, K_Frame, K_Button, K_Check, K_Box, K_Cell, K_WinBtn, K_Icon, K_Bar };
+// K_Icon: a square icon button (value = Icon, S_Invert when its view is open). K_Bar: a scroll position mark.
 
 struct Item {
     RECT r{};
@@ -115,15 +116,22 @@ private:
     int toggle(int x, int y, const std::wstring& label, bool on, std::function<void()> fn);
     int check(int x, int y, bool on, std::function<void()> fn);  // a box without a label (list rows)
     HFONT fontFor(unsigned style) const;
-    int choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel = nullptr);
+    int choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel = nullptr,
+               int maxW = 0);
     int seg(int x, int y, const std::vector<std::wstring>& opts, int sel, std::function<void(int)> fn);
+    int iconButton(int x, int y, int icon, bool on, std::function<void()> fn);  // returns the left edge (laid out right to left)
+    int fieldLabel(int x, int y, const std::wstring& label, unsigned style = S_Mid);  // fixed label column; returns the control x
+    int labelW() const { return S(112); }
+    void scrollbar(const RECT& view, int offset, int content);
+    int sectionTitle(int x, int y, const std::wstring& title);  // bold title; returns its right edge
+    void emptyState(const RECT& r, const std::wstring& line1, const std::wstring& line2 = L"");
     void hline(int x0, int x1, int y);
     void progressBar(const RECT& r, double v);
     void region(const RECT& r, std::function<void(int)> wheel);
     void placeEdit(Edit e, const RECT& r);
     void beginClip(const RECT& r) { clip_ = r; clipping_ = true; }
     void endClip() { clipping_ = false; }
-    int popup(const std::vector<std::wstring>& items, int checked);
+    int popup(const std::vector<std::wstring>& items, int checked);  // the app's own dropdown, under the clicked control
     int rowH() const { return fonts_.lineH; }
     int barH() const { return S(40); }  // the top bar: drag area, title, window buttons (Weekly-style chrome)
     int denseH() const { return fonts_.denseH; }
@@ -169,6 +177,8 @@ private:
     bool clipping_ = false;
     int hover_ = -1, pressed_ = -1;
     POINT mouse_{-1, -1};
+    RECT anchor_{};  // the control whose click is running (client coordinates), for dropdown placement
+    bool anchorValid_ = false;
     RECT client_{};
 
     // state
@@ -197,6 +207,7 @@ private:
     bool revealTask_ = false;
     int queueScroll_ = 0, logScroll_ = 0, settingsScroll_ = 0;
     bool logApp_ = false;
+    int historyScroll_ = 0;
     std::vector<HistoryItem> history_;
     std::wstring flash_;  // one-line notice in the header
     ULONGLONG flashUntil_ = 0;

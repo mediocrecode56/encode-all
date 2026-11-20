@@ -15,7 +15,10 @@ struct Theme {
 
 bool systemPrefersDark();
 void applyDarkTitle(HWND h, bool dark);
-void allowDarkMenus(bool dark);  // uxtheme preferred app mode, so popup menus follow the theme
+void allowDarkMenus(bool dark);  // uxtheme preferred app mode, so native scroll bars and dialogs follow the theme
+
+// Line icons, drawn with GDI pens in the ink colour (no bitmaps, no colours).
+enum Icon { I_History, I_Log, I_Settings, I_Close, I_Check, I_Chevron, I_Up, I_Down };
 
 struct Fonts {
     // Segoe UI for labels and controls; Consolas for technical lines (streams, plans, logs, numbers).
@@ -37,6 +40,8 @@ public:
     int measure(const std::wstring& s, HFONT font = nullptr);
     std::wstring fit(const std::wstring& s, int maxPx, HFONT font = nullptr);
     void bitmap(HBITMAP b, const RECT& r);
+    // Draws icon k centred in r; size is the glyph box in pixels.
+    void icon(int k, const RECT& r, COLORREF c, int size);
     HDC dc() const { return dc_; }
 
 private:
