@@ -13,9 +13,10 @@ struct Menu {
     const Theme* theme = nullptr;
     const Fonts* fonts = nullptr;
     int dpi = 96;
-    int checked = -1, hover = -1, pressed = -1;
+    std::vector<int> checks;  // checked items (one per section in sectioned menus)
+    int hover = -1, pressed = -1;
     int scroll = 0, contentH = 0, viewH = 0, width = 0;
-    int rowH = 0, sepH = 0, padY = 0, padL = 0, padR = 0;
+    int rowH = 0, sepH = 0, headH = 0, padY = 0, padL = 0, padR = 0;
     std::vector<int> top;  // y of each item in content coordinates
     int result = -1;
     bool done = false;
@@ -23,7 +24,11 @@ struct Menu {
 
     int S(int v) const { return MulDiv(v, dpi, 96); }
     bool sep(int i) const { return (*items)[i] == L"-"; }
-    int height(int i) const { return sep(i) ? sepH : rowH; }
+    bool head(int i) const { return !(*items)[i].empty() && (*items)[i][0] == L'#'; }
+    bool inert(int i) const { return sep(i) || head(i); }
+    bool isChecked(int i) const { return std::find(checks.begin(), checks.end(), i) != checks.end(); }
+    int firstCheck() const { return checks.empty() ? -1 : checks.front(); }
+    int height(int i) const { return sep(i) ? sepH : head(i) ? headH : rowH; }
 
     void layout() {
         top.clear();
@@ -38,7 +43,7 @@ struct Menu {
         if (p.x < 0 || p.x >= width || p.y < 0 || p.y >= viewH) return -1;
         int y = p.y + scroll;
         for (size_t i = 0; i < items->size(); i++)
-            if (y >= top[i] && y < top[i] + height((int)i)) return sep((int)i) ? -1 : (int)i;
+            if (y >= top[i] && y < top[i] + height((int)i)) return inert((int)i) ? -1 : (int)i;
         return -1;
     }
     void clampScroll() { scroll = std::clamp(scroll, 0, std::max(0, contentH - viewH)); }
@@ -51,10 +56,10 @@ struct Menu {
     void move(int dir) {
         int n = (int)items->size();
         if (!n) return;
-        int i = hover >= 0 ? hover : (checked >= 0 ? checked - dir : (dir > 0 ? -1 : n));
+        int i = hover >= 0 ? hover : (firstCheck() >= 0 ? firstCheck() - dir : (dir > 0 ? -1 : n));
         for (int k = 0; k < n; k++) {
             i = (i + dir + n) % n;
-            if (!sep(i)) break;
+            if (!inert(i)) break;
         }
         hover = i;
         reveal(i);
@@ -83,11 +88,16 @@ struct Menu {
                 p.hline(S(10), right - S(10), y + h / 2, theme->line);
                 continue;
             }
+            if (head((int)i)) {  // section title: small, mid ink, no hover
+                p.text(RECT{S(10), y + S(2), right - S(8), y + h}, (*items)[i].substr(1), theme->mid, fonts->bold);
+                continue;
+            }
             RECT row{1, y, right, y + h};
             bool hot = (int)i == hover;
+            bool on = isChecked((int)i);
             if (hot) p.fill(row, (int)i == pressed ? theme->line : theme->hover);
-            if ((int)i == checked) p.icon(I_Check, RECT{1, y, padL, y + h}, theme->ink, S(12));
-            p.text(RECT{padL, y, right - S(8), y + h}, (*items)[i], theme->ink, (int)i == checked ? fonts->bold : fonts->normal);
+            if (on) p.icon(I_Check, RECT{1, y, padL, y + h}, theme->ink, S(12));
+            p.text(RECT{padL, y, right - S(8), y + h}, (*items)[i], theme->ink, on ? fonts->bold : fonts->normal);
         }
         if (scrollable) {
             int track = rc.bottom - S(8);
@@ -131,6 +141,11 @@ LRESULT CALLBACK menuProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }  // namespace
 
 int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& items, int checked, const Theme& theme, const Fonts& fonts, int dpi) {
+    return runMenu(owner, anchor, items, checked >= 0 ? std::vector<int>{checked} : std::vector<int>{}, theme, fonts, dpi);
+}
+
+int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& items, const std::vector<int>& checked, const Theme& theme, const Fonts& fonts,
+            int dpi) {
     if (items.empty()) return -1;
     static bool registered = false;
     HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
@@ -148,9 +163,11 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
     mn.theme = &theme;
     mn.fonts = &fonts;
     mn.dpi = dpi;
-    mn.checked = checked >= 0 && checked < (int)items.size() && items[checked] != L"-" ? checked : -1;
+    for (int c : checked)
+        if (c >= 0 && c < (int)items.size() && !mn.inert(c)) mn.checks.push_back(c);
     mn.rowH = fonts.lineH - mn.S(2);
     mn.sepH = mn.S(9);
+    mn.headH = fonts.denseH + mn.S(4);
     mn.padY = mn.S(4);
     mn.padL = mn.S(30);
     mn.padR = mn.S(22);
@@ -159,7 +176,7 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
     HDC dc = GetDC(owner);
     int textW = 0;
     for (size_t i = 0; i < items.size(); i++) {
-        HGDIOBJ old = SelectObject(dc, (int)i == mn.checked ? fonts.bold : fonts.normal);
+        HGDIOBJ old = SelectObject(dc, mn.isChecked((int)i) || mn.head((int)i) ? fonts.bold : fonts.normal);
         SIZE sz{};
         GetTextExtentPoint32W(dc, items[i].c_str(), (int)items[i].size(), &sz);
         SelectObject(dc, old);
@@ -185,7 +202,7 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
     int x = std::clamp<int>(anchor.left, work.left, std::max<int>(work.left, work.right - w));
     mn.width = w;
     mn.viewH = h;
-    mn.reveal(mn.checked);
+    mn.reveal(mn.firstCheck());
     HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kMenuClass, L"", WS_POPUP, x, y, w, h, owner, nullptr, inst, &mn);
     if (!hw) return -1;
     mn.hwnd = hw;
@@ -207,7 +224,7 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
                     case VK_RETURN:
                     case VK_SPACE:
                         if (mn.hover >= 0) mn.finish(mn.hover);
-                        else if (mn.checked >= 0) mn.finish(mn.checked);
+                        else if (mn.firstCheck() >= 0 && mn.checks.size() == 1) mn.finish(mn.firstCheck());
                         break;
                     case VK_ESCAPE:
                     case VK_TAB:
@@ -276,6 +293,206 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
     if (GetCapture() == hw) ReleaseCapture();
     DestroyWindow(hw);
     return mn.result;
+}
+
+// ---------- confirmation dialog ----------
+
+namespace {
+
+const wchar_t* kConfirmClass = L"EncodeAllConfirm";
+
+struct Confirm {
+    const std::wstring *title = nullptr, *message = nullptr, *labels[2] = {};
+    const Theme* theme = nullptr;
+    const Fonts* fonts = nullptr;
+    int dpi = 96;
+    int focus = 0, hover = -1, pressed = -1;  // 0 cancel, 1 confirm
+    RECT btn[2] = {};
+    RECT msgRect{};
+    bool done = false, result = false;
+
+    int S(int v) const { return MulDiv(v, dpi, 96); }
+    int at(POINT p) const {
+        for (int i = 0; i < 2; i++)
+            if (PtInRect(&btn[i], p)) return i;
+        return -1;
+    }
+    void paint(HWND h, HDC dc) {
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC m = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ old = SelectObject(m, bmp);
+        Painter p(m, *theme, *fonts);
+        p.fill(rc, theme->bg);
+        int pad = S(20);
+        p.text(RECT{pad, pad, rc.right - pad, pad + fonts->lineH}, *title, theme->ink, fonts->big);
+        HGDIOBJ of = SelectObject(m, fonts->normal);
+        SetTextColor(m, theme->ink);
+        RECT mr = msgRect;
+        DrawTextW(m, message->c_str(), (int)message->size(), &mr, DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(m, of);
+        for (int i = 0; i < 2; i++) {
+            // The focused button is inverted; the other is a framed box that fills on hover.
+            bool filled = focus == i || pressed == i;
+            if (filled) p.fill(btn[i], theme->ink);
+            else if (hover == i) p.fill(btn[i], theme->hover);
+            p.frame(btn[i], filled || hover == i ? theme->ink : theme->mid);
+            p.text(btn[i], *labels[i], filled ? theme->bg : theme->ink, fonts->bold, DT_CENTER);
+        }
+        p.frame(rc, theme->mid);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
+        SelectObject(m, old);
+        DeleteObject(bmp);
+        DeleteDC(m);
+    }
+};
+
+LRESULT CALLBACK confirmProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    Confirm* c = (Confirm*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+        case WM_NCCREATE: SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)l)->lpCreateParams); break;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            if (c) c->paint(h, dc);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_NCHITTEST: {  // drag anywhere outside the buttons
+            LRESULT r = DefWindowProcW(h, msg, w, l);
+            POINT p{(short)LOWORD(l), (short)HIWORD(l)};
+            ScreenToClient(h, &p);
+            return r == HTCLIENT && c && c->at(p) < 0 ? HTCAPTION : r;
+        }
+        case WM_MOUSEMOVE: {
+            if (!c) break;
+            int i = c->at(POINT{(short)LOWORD(l), (short)HIWORD(l)});
+            if (i != c->hover) {
+                c->hover = i;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            TRACKMOUSEEVENT te{sizeof te, TME_LEAVE, h, 0};
+            TrackMouseEvent(&te);
+            SetCursor(LoadCursor(nullptr, i >= 0 ? IDC_HAND : IDC_ARROW));
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            if (c && c->hover >= 0) {
+                c->hover = -1;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+            if (c) {
+                c->pressed = c->at(POINT{(short)LOWORD(l), (short)HIWORD(l)});
+                if (c->pressed >= 0) SetCapture(h);
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (c) {
+                int i = c->at(POINT{(short)LOWORD(l), (short)HIWORD(l)});
+                int was = c->pressed;
+                c->pressed = -1;
+                ReleaseCapture();
+                InvalidateRect(h, nullptr, FALSE);
+                if (i >= 0 && i == was) {
+                    c->result = i == 1;
+                    c->done = true;
+                }
+            }
+            return 0;
+        case WM_KEYDOWN:
+            if (!c) break;
+            if (w == VK_ESCAPE) c->done = true;
+            else if (w == VK_RETURN || w == VK_SPACE) {
+                c->result = c->focus == 1;
+                c->done = true;
+            } else if (w == VK_LEFT || w == VK_RIGHT || w == VK_TAB) {
+                c->focus = 1 - c->focus;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        case WM_CLOSE:
+            if (c) c->done = true;
+            return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(l) == HTCLIENT) return TRUE;
+            break;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
+}  // namespace
+
+bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& message, const std::wstring& confirm, const std::wstring& cancel,
+                const Theme& theme, const Fonts& fonts, int dpi) {
+    static bool registered = false;
+    HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof wc};
+        wc.lpfnWndProc = confirmProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = kConfirmClass;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    Confirm c;
+    c.title = &title;
+    c.message = &message;
+    c.labels[0] = &cancel;
+    c.labels[1] = &confirm;
+    c.theme = &theme;
+    c.fonts = &fonts;
+    c.dpi = dpi;
+    int pad = c.S(20), w = c.S(440);
+    // Measure the wrapped message, then size the window around it.
+    HDC dc = GetDC(owner);
+    HGDIOBJ old = SelectObject(dc, fonts.normal);
+    RECT mr{pad, 0, w - pad, 0};
+    DrawTextW(dc, message.c_str(), (int)message.size(), &mr, DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+    int bw = 0;
+    SelectObject(dc, fonts.bold);
+    for (auto* s : {&confirm, &cancel}) {
+        SIZE sz{};
+        GetTextExtentPoint32W(dc, s->c_str(), (int)s->size(), &sz);
+        bw = std::max<int>(bw, sz.cx + c.S(32));
+    }
+    SelectObject(dc, old);
+    ReleaseDC(owner, dc);
+    int msgTop = pad + fonts.lineH + c.S(6);
+    int msgH = mr.bottom - mr.top;
+    c.msgRect = RECT{pad, msgTop, w - pad, msgTop + msgH};
+    int by = msgTop + msgH + c.S(20);
+    int bh = fonts.lineH;
+    c.btn[1] = RECT{w - pad - bw, by, w - pad, by + bh};
+    c.btn[0] = RECT{c.btn[1].left - c.S(8) - bw, by, c.btn[1].left - c.S(8), by + bh};
+    int h = by + bh + pad;
+    RECT orc;
+    GetWindowRect(owner, &orc);
+    int x = (orc.left + orc.right - w) / 2, y = (orc.top + orc.bottom - h) / 2;
+    HWND hw = CreateWindowExW(0, kConfirmClass, title.c_str(), WS_POPUP, x, y, w, h, owner, nullptr, inst, &c);
+    if (!hw) return false;
+    EnableWindow(owner, FALSE);
+    ShowWindow(hw, SW_SHOW);
+    SetForegroundWindow(hw);
+    SetFocus(hw);
+    MSG m;
+    while (!c.done) {
+        if (!GetMessageW(&m, nullptr, 0, 0)) {
+            PostQuitMessage((int)m.wParam);
+            break;
+        }
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    DestroyWindow(hw);
+    return c.result;
 }
 
 }  // namespace ea::ui

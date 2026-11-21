@@ -174,7 +174,6 @@ static bool finalizeTmp(const std::wstring& tmp, std::wstring& finalPath) {
     // Never overwrite: if the name was taken meanwhile, pick the next free one.
     for (int i = 0; i < 5; i++) {
         if (!fileExists(finalPath) && MoveFileExW(tmp.c_str(), finalPath.c_str(), MOVEFILE_WRITE_THROUGH)) return true;
-        DeleteFileW((finalPath + L".tmp.reserve").c_str());
         finalPath = uniquePath(finalPath);
     }
     return false;

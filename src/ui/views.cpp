@@ -68,6 +68,35 @@ std::wstring qualityText(const ConvertSpec& s) {
     return L"CRF " + std::to_wstring(s.quality);
 }
 
+// Checked playlist entries as "1-3,7" (what the range box parses).
+std::wstring rangesText(const std::vector<char>& on) {
+    std::wstring r;
+    for (int i = 0; i < (int)on.size(); i++) {
+        if (!on[i]) continue;
+        int j = i;
+        while (j + 1 < (int)on.size() && on[j + 1]) j++;
+        r += (r.empty() ? L"" : L",") + std::to_wstring(i + 1) + (j > i ? L"-" + std::to_wstring(j + 1) : L"");
+        i = j;
+    }
+    return r;
+}
+
+// Size, frame rate and pixel format in a few words ("none" when all follow the source).
+std::wstring filtersText(const ConvertSpec& s) {
+    std::wstring r;
+    auto add = [&](const std::wstring& p) { r += (r.empty() ? L"" : L", ") + p; };
+    if (s.width && s.height) add(std::to_wstring(s.width) + L"x" + std::to_wstring(s.height));
+    else if (s.height) add(std::to_wstring(s.height) + L"p");
+    else if (s.width) add(std::to_wstring(s.width) + L"w");
+    if (s.fps > 0) add(fmtFps(s.fps) + L" fps");
+    if (s.pixFmt == "yuv420p") add(L"8-bit 4:2:0");
+    else if (s.pixFmt == "yuv420p10le") add(L"10-bit 4:2:0");
+    else if (s.pixFmt == "yuv422p10le") add(L"10-bit 4:2:2");
+    else if (s.pixFmt == "yuv444p10le") add(L"10-bit 4:4:4");
+    else if (!s.pixFmt.empty()) add(widen(s.pixFmt));
+    return r.empty() ? L"none" : r;
+}
+
 std::wstring audioText(const ConvertSpec& s) {
     switch (s.acodec) {
         case ACodec::Copy: return L"copy";
@@ -121,8 +150,10 @@ void MainWindow::build() {
     buildHeader(area);
     int total = area.bottom - area.top;
     int qh = std::clamp(total * 30 / 100, rowH() * 5, rowH() * 14);
-    RECT q{area.left, area.bottom - qh, area.right, area.bottom};
-    RECT sec{area.left, area.top, area.right, q.top - S(10)};
+    // Settings has the whole height; the queue slides down out of the way (queueOpen_ 1 -> 0) and back.
+    // The view takes its final size at once, so only the queue block moves while it slides.
+    bool queueFinal = overlay_ != Overlay::Settings;
+    RECT sec{area.left, area.top, area.right, queueFinal ? area.bottom - qh - S(10) : area.bottom};
     switch (overlay_) {
         case Overlay::Log: buildLog(sec); break;
         case Overlay::Settings: buildSettings(sec); break;
@@ -132,8 +163,15 @@ void MainWindow::build() {
             else if (tab_ == 1) buildConvert(sec);
             else buildRemux(sec);
     }
-    hline(area.left, area.right, q.top - S(5));
-    buildQueue(RECT{q.left, q.top + S(2), q.right, q.bottom});
+    int shown = (int)std::lround(qh * queueOpen_);
+    if (shown <= 0) return;
+    int qTop = area.bottom - shown;
+    bound_ = RECT{0, qTop - S(10), client_.right, client_.bottom};
+    bounded_ = true;
+    if (!queueFinal || animOn_) add(K_Clear, bound_);  // covers the view underneath while it slides
+    hline(area.left, area.right, qTop - S(5));
+    buildQueue(RECT{area.left, qTop + S(2), area.right, qTop + qh});
+    bounded_ = false;
 }
 
 void MainWindow::buildHeader(RECT& a) {
@@ -164,9 +202,7 @@ void MainWindow::buildHeader(RECT& a) {
         Item& it = add(K_Button, RECT{rx, y + S(3), rx + w, y + rh - S(3)}, label, S_Bold | S_Click);
         it.click = [this] {
             if (queue_.running() > 0) {
-                flash_ = L"Finish or pause running tasks first; the update also applies on the next start.";
-                SetTimer(hwnd_, T_FLASH, 5000, nullptr);
-                relayout();
+                flash(L"Finish or pause running tasks first; the update also applies on the next start.", 5000);
                 return;
             }
             if (AppUpdater::relaunch()) DestroyWindow(hwnd_);
@@ -192,10 +228,7 @@ void MainWindow::buildHeader(RECT& a) {
     int sw = std::min<int>(tw(st), std::max<int>(0, rx - (a.left + S(260))));
     rx -= sw;
     Item& s = add(K_Text, RECT{rx, y, rx + sw, y + rh}, st, (problem ? S_Bold : S_Mid) | S_Click);
-    s.click = [this] {
-        overlay_ = Overlay::Settings;
-        relayout(true);
-    };
+    s.click = [this] { setOverlay(Overlay::Settings); };
     hline(0, client_.right, bh - 1);
     // Sections on the left, views (history, log, settings) as icons on the far right of the same row.
     y = bh + S(8);
@@ -208,15 +241,7 @@ void MainWindow::buildHeader(RECT& a) {
         it.click = [this, i] { setTab(i); };
         x += w + S(2);
     }
-    auto toggleView = [this](Overlay o) {
-        overlay_ = overlay_ == o ? Overlay::None : o;
-        if (overlay_ == Overlay::History) {
-            history_ = loadHistory(500);
-            historyScroll_ = 0;
-        }
-        if (overlay_ == Overlay::Log) logScroll_ = 0;
-        relayout(true);
-    };
+    auto toggleView = [this](Overlay o) { setOverlay(overlay_ == o ? Overlay::None : o); };
     int ix = a.right;
     ix = iconButton(ix, y, I_Settings, overlay_ == Overlay::Settings, [toggleView] { toggleView(Overlay::Settings); }) - S(4);
     ix = iconButton(ix, y, I_Log, overlay_ == Overlay::Log, [toggleView] { toggleView(Overlay::Log); }) - S(4);
@@ -345,13 +370,12 @@ void MainWindow::buildDownload(RECT a) {
                 int xx = text(a.left + S(4), ry, L"!", S_Bold) + S(10);
                 xx = button(xx, ry, L"retry", [this, gi] {
                     std::wstring u = groups_[gi].url;
-                    groups_.erase(groups_.begin() + gi);
+                    removeGroup(gi);
                     SetWindowTextW(edits_[E_URLS], u.c_str());
                     analyzeUrls();
                 });
                 xx = button(xx, ry, L"remove", [this, gi] {
-                    groups_.erase(groups_.begin() + gi);
-                    selGroup_ = -1;
+                    removeGroup(gi);
                     relayout(true);
                 });
                 text(xx + S(4), ry, g.url, S_Mid, rowRight - xx);
@@ -379,13 +403,14 @@ void MainWindow::buildDownload(RECT a) {
                 it.click = [this, gi] {
                     selGroup_ = gi;
                     selEntry_ = 0;
+                    // The one range box moves to this playlist: show its selection, not the last one's.
+                    SetWindowTextW(edits_[E_RANGE], rangesText(groups_[gi].checked).c_str());
                     relayout(true);
                 };
                 xx += cw * 14 + S(12);
             }
             xx = button(xx, ry + S(2), L"remove", [this, gi] {
-                groups_.erase(groups_.begin() + gi);
-                selGroup_ = -1;
+                removeGroup(gi);
                 relayout(true);
             });
             text(xx + S(4), ry + S(2), std::to_wstring(sel) + L"/" + std::to_wstring(g.entries.size()) + L"  " + g.title, S_Mid, rowRight - xx);
@@ -522,11 +547,7 @@ void MainWindow::buildConvert(RECT a) {
         add(K_Text, RECT{nx + S(16), ry, rowRight - S(40), ry + rh}, info, S_Mid | S_Mono);
         Item& x2 = add(K_Icon, RECT{rowRight - S(28), ry + S(3), rowRight - S(2), ry + rh - S(3)}, L"", S_Click);
         x2.value = I_Close;
-        x2.click = [this, i] {
-            conv_.erase(conv_.begin() + i);
-            if (selConv_ >= (int)conv_.size()) selConv_ = (int)conv_.size() - 1;
-            relayout(true);
-        };
+        x2.click = [this, i] { removeFile(1, i); };
     }
     endClip();
     scrollbar(list, convScroll_, (int)conv_.size() * rh);
@@ -541,11 +562,10 @@ void MainWindow::buildConvert(RECT a) {
         customPreset_ = -1;
         relayout();
     };
-    // Preset row.
+    // PRESET: the four built-in presets, then one dropdown for saved presets (pick, save, delete).
     x = fieldLabel(a.left, y, L"PRESET");
-    int ps = s.convertPreset == Preset::Custom ? 4 : (int)s.convertPreset;
-    x = seg(x, y, {L"lossless", L"max quality", L"balanced", L"compact", L"custom"}, ps, [this](int i) {
-        if (i == 4) return;
+    int ps = s.convertPreset == Preset::Custom ? -1 : (int)s.convertPreset;
+    x = seg(x, y, {L"lossless", L"max quality", L"balanced", L"compact"}, ps, [this](int i) {
         updateSetting([i](Settings& st) {
             applyPreset(st.convert, (Preset)i);
             st.convertPreset = (Preset)i;
@@ -553,57 +573,62 @@ void MainWindow::buildConvert(RECT a) {
         customPreset_ = -1;
         relayout();
     });
-    std::wstring mine = customPreset_ >= 0 && customPreset_ < (int)presets_.size() ? presets_[customPreset_].name : L"saved presets";
-    x = choice(x, y, L"", mine, [this] {
+    bool savedOn = customPreset_ >= 0 && customPreset_ < (int)presets_.size();
+    std::wstring mine = savedOn ? presets_[customPreset_].name : s.convertPreset == Preset::Custom ? L"custom" : L"my presets";
+    choice(x, y, L"", mine, [this] {
+        RECT at = anchor_;
         std::vector<std::wstring> o;
+        int first = presets_.empty() ? 0 : 1, n = (int)presets_.size();
+        if (n) o.push_back(L"#SAVED");
         for (auto& p : presets_) o.push_back(p.name);
-        if (!presets_.empty()) o.push_back(L"-");
-        size_t delStart = o.size();
-        for (auto& p : presets_) o.push_back(L"delete " + p.name);
-        if (o.empty()) {
-            flash_ = L"No saved presets yet: set things up, then 'save preset'.";
-            SetTimer(hwnd_, T_FLASH, 4000, nullptr);
-            relayout();
-            return;
+        if (n) o.push_back(L"-");
+        int saveAt = (int)o.size();
+        o.push_back(L"save current settings...");
+        int delStart = -1;
+        if (n) {
+            o.push_back(L"#DELETE");
+            delStart = (int)o.size();
+            for (auto& p : presets_) o.push_back(L"delete " + p.name);
         }
-        int r = popup(o, customPreset_);
+        int r = popup(o, customPreset_ >= 0 ? customPreset_ + first : -1);
         if (r < 0) return;
-        if ((size_t)r < presets_.size()) {
-            ConvertSpec sp = presets_[r].spec;
+        if (n && r >= first && r < first + n) {
+            ConvertSpec sp = presets_[r - first].spec;
             updateSetting([&](Settings& st) {
                 st.convert = sp;
                 st.convertPreset = Preset::Custom;
             });
-            customPreset_ = r;
-        } else if ((size_t)r >= delStart) {
+            customPreset_ = r - first;
+        } else if (r == saveAt) {
+            std::wstring init = customPreset_ >= 0 && customPreset_ < n ? presets_[customPreset_].name : L"my preset";
+            customValue(init, at, [this](const std::wstring& name) {
+                if (name.empty()) return;
+                Settings st = settingsCopy();
+                bool replaced = false;
+                for (auto& p : presets_)
+                    if (p.name == name) {
+                        p.spec = st.convert;
+                        replaced = true;
+                    }
+                if (!replaced) presets_.push_back({name, st.convert});
+                savePresets(presets_);
+                for (size_t i = 0; i < presets_.size(); i++)
+                    if (presets_[i].name == name) customPreset_ = (int)i;
+                flash(L"preset saved: " + name, 3000);
+            });
+        } else if (delStart >= 0 && r >= delStart) {
+            std::wstring name = presets_[r - delStart].name;
             presets_.erase(presets_.begin() + (r - delStart));
             savePresets(presets_);
             customPreset_ = -1;
+            flash(L"preset deleted: " + name, 3000);
         }
         relayout();
-    }) - S(8);
-    int bx = x;
-    button(bx, y, L"save preset", [this, bx, y] {
-        customValue(L"name", L"my preset", RECT{bx, y + S(4), bx + S(200), y + rowH() - S(4)}, [this](const std::wstring& name) {
-            if (name.empty()) return;
-            Settings st = settingsCopy();
-            bool replaced = false;
-            for (auto& p : presets_)
-                if (p.name == name) {
-                    p.spec = st.convert;
-                    replaced = true;
-                }
-            if (!replaced) presets_.push_back({name, st.convert});
-            savePresets(presets_);
-            for (size_t i = 0; i < presets_.size(); i++)
-                if (presets_[i].name == name) customPreset_ = (int)i;
-            flash_ = L"preset saved: " + name;
-            SetTimer(hwnd_, T_FLASH, 3000, nullptr);
-        });
     });
     if (customDone_) placeEdit(E_CUSTOM, editRects_[E_CUSTOM]);
     y += rh + S(2);
-    // Target row: the encoder is chosen automatically (fastest available); Settings can pin one.
+    // TARGET: everything about the output in one row, the same dropdown control throughout; it wraps
+    // to the control column on narrow windows. The encoder is automatic (Settings can pin one).
     EncoderCaps caps;
     {
         std::lock_guard<std::mutex> lk(capsMu_);
@@ -611,25 +636,47 @@ void MainWindow::buildConvert(RECT a) {
     }
     ConvertSpec planSpec = cs;
     planSpec.accel = s.encoder;
+    bool audioTarget = cs.audio != AudioTarget::None;
+    bool encodesVideo = !audioTarget && cs.vcodec != VCodec::Copy;
     int ti = targetIndex(cs);
+    int left = a.left + labelW();
     x = fieldLabel(a.left, y, L"TARGET");
-    x = choice(x, y, L"", kTargets[ti], [this, ti] {
-        int r = popup(kTargets, ti);
-        if (r >= 0) {
-            updateSetting([r](Settings& st) {
-                setTarget(st.convert, r);
-                st.convertPreset = Preset::Custom;
-            });
-            relayout();
+    field(x, y, left, a.right, L"", kTargets[ti], [this, ti] {
+        // Grouped: video, intermediate, copy, audio only.
+        std::vector<std::wstring> o;
+        std::vector<int> map;
+        const std::pair<int, const wchar_t*> groups[] = {{0, L"#VIDEO"}, {4, L"#INTERMEDIATE (DNxHR)"}, {9, L"#COPY VIDEO"}, {11, L"#AUDIO ONLY"}};
+        for (int i = 0; i < (int)kTargets.size(); i++) {
+            for (auto& g : groups)
+                if (g.first == i) {
+                    o.push_back(g.second);
+                    map.push_back(-1);
+                }
+            o.push_back(kTargets[i]);
+            map.push_back(i);
         }
+        int checked = (int)(std::find(map.begin(), map.end(), ti) - map.begin());
+        int r = popup(o, checked);
+        if (r < 0 || map[r] < 0) return;
+        int t = map[r];
+        updateSetting([t](Settings& st) {
+            setTarget(st.convert, t);
+            st.convertPreset = Preset::Custom;
+        });
+        customPreset_ = -1;
+        relayout();
     }, [this, ti](int n) {
         int r = std::clamp(ti - n, 0, (int)kTargets.size() - 1);
-        updateSetting([r](Settings& st) { setTarget(st.convert, r); st.convertPreset = Preset::Custom; });
+        updateSetting([r](Settings& st) {
+            setTarget(st.convert, r);
+            st.convertPreset = Preset::Custom;
+        });
+        customPreset_ = -1;
         relayout();
     });
-    bool audioTarget = cs.audio != AudioTarget::None;
-    if (!audioTarget && cs.vcodec != VCodec::Copy && !isDnxhr(cs.vcodec)) {
-        x = choice(x, y, L"QUALITY", qualityText(cs), [this, change, x, y] {
+    if (encodesVideo && !isDnxhr(cs.vcodec)) {
+        field(x, y, left, a.right, L"QUALITY", qualityText(cs), [this, change] {
+            RECT at = anchor_;
             std::vector<std::wstring> o = {L"lossless", L"CRF 16 (very high)", L"CRF 18", L"CRF 20", L"CRF 22 (balanced)", L"CRF 24", L"CRF 26", L"CRF 28 (compact)",
                                            L"CRF 30", L"-", L"4 Mb/s", L"8 Mb/s", L"12 Mb/s", L"20 Mb/s", L"35 Mb/s", L"50 Mb/s", L"-", L"custom CRF...", L"custom Mb/s..."};
             ConvertSpec cur = settingsCopy().convert;
@@ -649,7 +696,7 @@ void MainWindow::buildConvert(RECT a) {
             else if (r == 17 || r == 18) {
                 bool isCrf = r == 17;
                 std::wstring init = isCrf ? std::to_wstring(cur.quality) : fmtFixed(cur.mbps, 1);
-                customValue(L"", init, RECT{x, y + S(4), x + S(120), y + rowH() - S(4)}, [isCrf, change](const std::wstring& v) {
+                customValue(init, at, [isCrf, change](const std::wstring& v) {
                     double d = _wtof(v.c_str());
                     if (isCrf && d >= 0 && d <= 51) change([&](ConvertSpec& c) { c.rate = RateMode::Quality; c.quality = (int)d; });
                     else if (!isCrf && d > 0.1 && d < 2000) change([&](ConvertSpec& c) { c.rate = RateMode::Bitrate; c.mbps = d; });
@@ -661,7 +708,7 @@ void MainWindow::buildConvert(RECT a) {
                 else if (c.rate == RateMode::Bitrate) c.mbps = std::clamp(c.mbps + n * (c.mbps >= 20 ? 5.0 : 1.0), 0.5, 500.0);
             });
         });
-        x = choice(x, y, L"SPEED", widen(cs.speed), [this, change] {
+        field(x, y, left, a.right, L"SPEED", widen(cs.speed), [this, change] {
             std::vector<std::wstring> o = {L"ultrafast", L"superfast", L"veryfast", L"faster", L"fast", L"medium", L"slow", L"slower", L"veryslow"};
             int cur = 5;
             for (size_t i = 0; i < o.size(); i++)
@@ -669,113 +716,81 @@ void MainWindow::buildConvert(RECT a) {
             int r = popup(o, cur);
             if (r >= 0) change([&](ConvertSpec& c) { c.speed = narrow(o[r]); });
         });
-        std::string enc = pickEncoder(cs.vcodec, s.encoder, cs.rate, caps);
-        std::wstring ev = encoderLabel(enc) + (s.encoder == Accel::Auto ? L" (fastest here)" : L" (set in Settings)");
-        if (!caps.probed && capsRunning_) ev = encoderLabel(enc) + L" (looking for graphics encoders...)";
-        x = text(x, y, L"ENCODER", S_Mid) + S(8);
-        int ew = tw(ev);
-        Item& ei = add(K_Text, RECT{x, y, std::min<int>(x + ew, a.right), y + rh}, ev, S_Click);
-        ei.click = [this] {
-            overlay_ = Overlay::Settings;
-            settingsScroll_ = 0;
-            relayout(true);
-        };
-    } else if (isDnxhr(cs.vcodec)) {
-        text(x, y, L"intermediate codec, fixed rate per profile (visually lossless, not mathematically)", S_Mid, a.right - x);
-    } else if (cs.vcodec == VCodec::Copy && !audioTarget) {
-        text(x, y, L"video copied bit-for-bit", S_Mid);
     }
-    y += rh;
-    // Audio row.
-    x = fieldLabel(a.left, y, L"AUDIO");
     if (!audioTarget) {
-        x = choice(x, y, L"", audioText(cs), [this, change] {
-            std::vector<std::wstring> o = {L"copy (bit-for-bit)", L"AAC 128k", L"AAC 160k", L"AAC 192k", L"AAC 256k", L"AAC 320k", L"PCM exact (lossless)", L"PCM 16-bit", L"PCM 24-bit"};
+        field(x, y, left, a.right, L"AUDIO", audioText(cs), [this, change] {
+            std::vector<std::wstring> o = {L"copy (bit-for-bit)", L"-", L"AAC 128k", L"AAC 160k", L"AAC 192k", L"AAC 256k", L"AAC 320k", L"-",
+                                           L"PCM exact (lossless)", L"PCM 16-bit", L"PCM 24-bit"};
             ConvertSpec cur = settingsCopy().convert;
-            const int k[] = {0, 128, 160, 192, 256, 320};
-            int checked = cur.acodec == ACodec::Copy ? 0 : cur.acodec == ACodec::PCM ? (cur.pcmBits == 16 ? 7 : cur.pcmBits == 24 ? 8 : 6) : -1;
-            for (int i = 1; i <= 5; i++)
-                if (cur.acodec == ACodec::AAC && cur.aacKbps == k[i]) checked = i;
+            const int k[] = {128, 160, 192, 256, 320};
+            int checked = cur.acodec == ACodec::Copy ? 0 : cur.acodec == ACodec::PCM ? (cur.pcmBits == 16 ? 9 : cur.pcmBits == 24 ? 10 : 8) : -1;
+            for (int i = 0; i < 5; i++)
+                if (cur.acodec == ACodec::AAC && cur.aacKbps == k[i]) checked = 2 + i;
             int r = popup(o, checked);
             if (r == 0) change([](ConvertSpec& c) { c.acodec = ACodec::Copy; });
-            else if (r >= 1 && r <= 5) change([&](ConvertSpec& c) { c.acodec = ACodec::AAC; c.aacKbps = k[r]; });
-            else if (r >= 6) change([&](ConvertSpec& c) { c.acodec = ACodec::PCM; c.pcmBits = r == 6 ? 0 : r == 7 ? 16 : 24; });
+            else if (r >= 2 && r <= 6) change([&](ConvertSpec& c) { c.acodec = ACodec::AAC; c.aacKbps = k[r - 2]; });
+            else if (r >= 8) change([&](ConvertSpec& c) { c.acodec = ACodec::PCM; c.pcmBits = r == 8 ? 0 : r == 9 ? 16 : 24; });
         });
-        x = toggle(x, y, L"subtitles", cs.keepSubs, [change] { change([](ConvertSpec& c) { c.keepSubs = !c.keepSubs; }); });
-        if (cs.container != Container::MKV) x = toggle(x, y, L"faststart", cs.faststart, [change] { change([](ConvertSpec& c) { c.faststart = !c.faststart; }); });
-        if (cs.vcodec != VCodec::Copy)
-            button(x, y, advanced_ ? L"fewer options" : L"more options", [this] {
-                advanced_ = !advanced_;
-                relayout(true);
-            });
-        y += rh;
-        if (advanced_ && cs.vcodec != VCodec::Copy) {
-            x = fieldLabel(a.left, y, L"PICTURE");
-            std::wstring sz = cs.height ? std::to_wstring(cs.height) + L"p" : cs.width ? std::to_wstring(cs.width) + L"w" : L"source";
-            if (cs.width && cs.height) sz = std::to_wstring(cs.width) + L"x" + std::to_wstring(cs.height);
-            x = choice(x, y, L"SIZE", sz, [this, change, x, y] {
-                std::vector<std::wstring> o = {L"source", L"2160p", L"1440p", L"1080p", L"720p", L"480p", L"custom WxH..."};
-                const int h[] = {0, 2160, 1440, 1080, 720, 480};
+        if (encodesVideo)
+            field(x, y, left, a.right, L"FILTERS", filtersText(cs), [this, change] {
+                // One list, three sections: size, frame rate, pixel format (one check each).
+                RECT at = anchor_;
                 ConvertSpec cur = settingsCopy().convert;
-                int checked = -1;
+                std::vector<std::wstring> o = {L"#SIZE", L"source", L"2160p", L"1440p", L"1080p", L"720p", L"480p", L"custom WxH...",
+                                               L"#FRAME RATE", L"source", L"23.976", L"24", L"25", L"29.97", L"30", L"50", L"59.94", L"60",
+                                               L"#PIXEL FORMAT", L"source", L"8-bit 4:2:0", L"10-bit 4:2:0", L"10-bit 4:2:2", L"10-bit 4:4:4"};
+                const int hgt[] = {0, 2160, 1440, 1080, 720, 480};
+                const double fps[] = {0, 24000.0 / 1001, 24, 25, 30000.0 / 1001, 30, 50, 60000.0 / 1001, 60};
+                const char* pix[] = {"", "yuv420p", "yuv420p10le", "yuv422p10le", "yuv444p10le"};
+                std::vector<int> checks;
+                int sizeCheck = cur.width ? 7 : -1;
                 for (int i = 0; i < 6; i++)
-                    if (cur.width == 0 && cur.height == h[i]) checked = i;
-                int r = popup(o, checked);
-                if (r >= 0 && r <= 5) change([&](ConvertSpec& c) { c.height = h[r]; c.width = 0; });
-                else if (r == 6)
-                    customValue(L"", L"1920x1080", RECT{x, y + S(4), x + S(140), y + rowH() - S(4)}, [change](const std::wstring& v) {
-                        int w2 = 0, h2 = 0;
-                        if (swscanf(v.c_str(), L"%dx%d", &w2, &h2) == 2 && w2 > 0 && h2 > 0 && w2 <= 16384 && h2 <= 16384)
-                            change([&](ConvertSpec& c) { c.width = w2 & ~1; c.height = h2 & ~1; });
-                    });
-            });
-            x = choice(x, y, L"FPS", cs.fps > 0 ? fmtFps(cs.fps) : L"source", [this, change] {
-                std::vector<std::wstring> o = {L"source", L"23.976", L"24", L"25", L"29.97", L"30", L"50", L"59.94", L"60"};
-                const double f[] = {0, 24000.0 / 1001, 24, 25, 30000.0 / 1001, 30, 50, 60000.0 / 1001, 60};
-                double cur = settingsCopy().convert.fps;
-                int checked = -1;
+                    if (cur.width == 0 && cur.height == hgt[i]) sizeCheck = 1 + i;
+                checks.push_back(sizeCheck);
                 for (int i = 0; i < 9; i++)
-                    if (std::fabs(cur - f[i]) < 0.001) checked = i;
-                int r = popup(o, checked);
-                if (r >= 0) change([&](ConvertSpec& c) { c.fps = f[r]; });
-            });
-            choice(x, y, L"PIXELS", cs.pixFmt.empty() ? L"source" : widen(cs.pixFmt), [this, change] {
-                std::vector<std::wstring> o = {L"source", L"yuv420p (8-bit 4:2:0)", L"yuv420p10le (10-bit 4:2:0)", L"yuv422p10le (10-bit 4:2:2)", L"yuv444p10le (10-bit 4:4:4)"};
-                const char* v[] = {"", "yuv420p", "yuv420p10le", "yuv422p10le", "yuv444p10le"};
-                std::string cur = settingsCopy().convert.pixFmt;
-                int checked = -1;
+                    if (std::fabs(cur.fps - fps[i]) < 0.001) checks.push_back(9 + i);
                 for (int i = 0; i < 5; i++)
-                    if (cur == v[i]) checked = i;
-                int r = popup(o, checked);
-                if (r >= 0) change([&](ConvertSpec& c) { c.pixFmt = v[r]; });
+                    if (cur.pixFmt == pix[i]) checks.push_back(19 + i);
+                int r = popup(o, checks);
+                if (r >= 1 && r <= 6) change([&](ConvertSpec& c) { c.height = hgt[r - 1]; c.width = 0; });
+                else if (r == 7)
+                    customValue(cur.width && cur.height ? std::to_wstring(cur.width) + L"x" + std::to_wstring(cur.height) : L"1920x1080", at,
+                                [change](const std::wstring& v) {
+                                    int w2 = 0, h2 = 0;
+                                    if (swscanf(v.c_str(), L"%dx%d", &w2, &h2) == 2 && w2 > 0 && h2 > 0 && w2 <= 16384 && h2 <= 16384)
+                                        change([&](ConvertSpec& c) { c.width = w2 & ~1; c.height = h2 & ~1; });
+                                });
+                else if (r >= 9 && r <= 17) change([&](ConvertSpec& c) { c.fps = fps[r - 9]; });
+                else if (r >= 19 && r <= 23) change([&](ConvertSpec& c) { c.pixFmt = pix[r - 19]; });
             });
-            y += rh;
-        }
+        if (isDnxhr(cs.vcodec) && a.right - x > S(160)) text(x, y, L"fixed rate per profile, visually lossless", S_Mid, a.right - x);
+        else if (cs.vcodec == VCodec::Copy && a.right - x > S(160)) text(x, y, L"video copied bit-for-bit", S_Mid, a.right - x);
     } else {
         if (cs.audio == AudioTarget::FLAC)
-            x = choice(x, y, L"LEVEL", std::to_wstring(cs.flacLevel), [this, change] {
+            field(x, y, left, a.right, L"LEVEL", std::to_wstring(cs.flacLevel), [this, change] {
                 std::vector<std::wstring> o;
                 for (int i = 0; i <= 12; i++) o.push_back(std::to_wstring(i) + (i == 0 ? L" (fastest)" : i == 8 ? L" (default)" : i == 12 ? L" (smallest)" : L""));
                 int r = popup(o, settingsCopy().convert.flacLevel);
                 if (r >= 0) change([r](ConvertSpec& c) { c.flacLevel = r; });
             }, [change](int n) { change([n](ConvertSpec& c) { c.flacLevel = std::clamp(c.flacLevel + n, 0, 12); }); });
         if (cs.audio == AudioTarget::MP3)
-            x = choice(x, y, L"MP3", cs.mp3Vbr ? L"VBR V" + std::to_wstring(cs.mp3Quality) : L"CBR " + std::to_wstring(cs.mp3Kbps) + L"k", [this, change] {
-                std::vector<std::wstring> o = {L"CBR 320k (maximum)", L"CBR 256k", L"CBR 192k", L"CBR 128k", L"VBR V0 (~245k)", L"VBR V2 (~190k)", L"VBR V4 (~165k)"};
+            field(x, y, left, a.right, L"BITRATE", cs.mp3Vbr ? L"VBR V" + std::to_wstring(cs.mp3Quality) : L"CBR " + std::to_wstring(cs.mp3Kbps) + L"k", [this, change] {
+                std::vector<std::wstring> o = {L"#CONSTANT", L"CBR 320k (maximum)", L"CBR 256k", L"CBR 192k", L"CBR 128k",
+                                               L"#VARIABLE", L"VBR V0 (~245k)", L"VBR V2 (~190k)", L"VBR V4 (~165k)"};
                 const int k[] = {320, 256, 192, 128};
                 const int v[] = {0, 2, 4};
                 ConvertSpec cur = settingsCopy().convert;
                 int checked = -1;
                 for (int i = 0; i < 4; i++)
-                    if (!cur.mp3Vbr && cur.mp3Kbps == k[i]) checked = i;
+                    if (!cur.mp3Vbr && cur.mp3Kbps == k[i]) checked = 1 + i;
                 for (int i = 0; i < 3; i++)
-                    if (cur.mp3Vbr && cur.mp3Quality == v[i]) checked = 4 + i;
+                    if (cur.mp3Vbr && cur.mp3Quality == v[i]) checked = 6 + i;
                 int r = popup(o, checked);
-                if (r >= 0 && r <= 3) change([&](ConvertSpec& c) { c.mp3Vbr = false; c.mp3Kbps = k[r]; });
-                else if (r >= 4) change([&](ConvertSpec& c) { c.mp3Vbr = true; c.mp3Quality = v[r - 4]; });
+                if (r >= 1 && r <= 4) change([&](ConvertSpec& c) { c.mp3Vbr = false; c.mp3Kbps = k[r - 1]; });
+                else if (r >= 6) change([&](ConvertSpec& c) { c.mp3Vbr = true; c.mp3Quality = v[r - 6]; });
             });
         if (cs.audio != AudioTarget::MP3)
-            x = choice(x, y, L"BITS", cs.bitDepth ? std::to_wstring(cs.bitDepth) + (cs.bitDepth == 32 ? L" float" : L"") : L"source (exact)", [this, change] {
+            field(x, y, left, a.right, L"BITS", cs.bitDepth ? std::to_wstring(cs.bitDepth) + (cs.bitDepth == 32 ? L" float" : L"") : L"source (exact)", [this, change] {
                 ConvertSpec cur = settingsCopy().convert;
                 std::vector<std::wstring> o = {L"source (exact)", L"16", L"24"};
                 if (cur.audio == AudioTarget::WAV) o.push_back(L"32 float");
@@ -786,7 +801,7 @@ void MainWindow::buildConvert(RECT a) {
                 int r = popup(o, checked);
                 if (r >= 0) change([&](ConvertSpec& c) { c.bitDepth = b[r]; });
             });
-        x = choice(x, y, L"RATE", cs.sampleRate ? std::to_wstring(cs.sampleRate) : L"source", [this, change] {
+        field(x, y, left, a.right, L"RATE", cs.sampleRate ? std::to_wstring(cs.sampleRate) : L"source", [this, change] {
             std::vector<std::wstring> o = {L"source", L"44100", L"48000", L"96000"};
             const int r2[] = {0, 44100, 48000, 96000};
             int cur = settingsCopy().convert.sampleRate, checked = -1;
@@ -795,20 +810,21 @@ void MainWindow::buildConvert(RECT a) {
             int r = popup(o, checked);
             if (r >= 0) change([&](ConvertSpec& c) { c.sampleRate = r2[r]; });
         });
-        choice(x, y, L"CHANNELS", cs.channels ? (cs.channels == 1 ? L"mono" : cs.channels == 2 ? L"stereo" : std::to_wstring(cs.channels)) : L"source", [this, change] {
-            std::vector<std::wstring> o = {L"source", L"stereo", L"mono"};
-            const int c2[] = {0, 2, 1};
-            int cur = settingsCopy().convert.channels, checked = -1;
-            for (int i = 0; i < 3; i++)
-                if (cur == c2[i]) checked = i;
-            int r = popup(o, checked);
-            if (r >= 0) change([&](ConvertSpec& c) { c.channels = c2[r]; });
-        });
-        y += rh;
+        field(x, y, left, a.right, L"CHANNELS", cs.channels ? (cs.channels == 1 ? L"mono" : cs.channels == 2 ? L"stereo" : std::to_wstring(cs.channels)) : L"source",
+              [this, change] {
+                  std::vector<std::wstring> o = {L"source", L"stereo", L"mono"};
+                  const int c2[] = {0, 2, 1};
+                  int cur = settingsCopy().convert.channels, checked = -1;
+                  for (int i = 0; i < 3; i++)
+                      if (cur == c2[i]) checked = i;
+                  int r = popup(o, checked);
+                  if (r >= 0) change([&](ConvertSpec& c) { c.channels = c2[r]; });
+              });
     }
-    // Output folder.
+    y += rh;
+    // SAVE TO, with the stream options on the same row (as on Download), and the encoder at the right.
     x = fieldLabel(a.left, y, L"SAVE TO");
-    choice(x, y, L"", s.convertDir.empty() ? L"next to the source" : s.convertDir, [this] {
+    x = choice(x, y, L"", s.convertDir.empty() ? L"next to the source" : s.convertDir, [this] {
         int r = popup({L"next to the source", L"choose folder..."}, settingsCopy().convertDir.empty() ? 0 : 1);
         if (r == 0) updateSetting([](Settings& st) { st.convertDir.clear(); });
         else if (r == 1) {
@@ -816,7 +832,26 @@ void MainWindow::buildConvert(RECT a) {
             if (!d.empty()) updateSetting([&](Settings& st) { st.convertDir = d; });
         }
         relayout();
-    }, nullptr, (a.right - x) / 2);
+    }, nullptr, (a.right - x) / 3);
+    if (!audioTarget) {
+        x = toggle(x, y, L"subtitles", cs.keepSubs, [change] { change([](ConvertSpec& c) { c.keepSubs = !c.keepSubs; }); });
+        if (cs.container != Container::MKV) x = toggle(x, y, L"faststart", cs.faststart, [change] { change([](ConvertSpec& c) { c.faststart = !c.faststart; }); });
+    }
+    if (encodesVideo) {
+        std::string enc = pickEncoder(cs.vcodec, s.encoder, cs.rate, caps);
+        std::wstring ev = encoderLabel(enc) + (s.encoder == Accel::Auto ? L" (fastest here)" : L" (set in Settings)");
+        if (!caps.probed && capsRunning_) ev = encoderLabel(enc) + L" (looking for graphics encoders...)";
+        int capW = tw(L"ENCODER", S_Mid) + S(8), ew = tw(ev);
+        int ex = a.right - ew;
+        if (ex - capW > x) {
+            text(ex - capW, y, L"ENCODER", S_Mid);
+            Item& ei = add(K_Text, RECT{ex, y, a.right, y + rh}, ev, S_Click);
+            ei.click = [this] {
+                settingsScroll_ = 0;
+                setOverlay(Overlay::Settings);
+            };
+        }
+    }
     y += rh + S(4);
     hline(a.left, a.right, y);
     y += S(8);
@@ -833,9 +868,10 @@ void MainWindow::buildConvert(RECT a) {
         if (adv.mode != Advice::Convert && !adv.text.empty()) {
             int xx = text(a.left, yy, adv.text, S_Bold, a.right - a.left - S(150));
             button(xx + S(12), yy, L"send to remux", [this] {
+                if (selConv_ < 0 || selConv_ >= (int)conv_.size()) return;
                 FileRow f2 = conv_[selConv_];
                 conv_.erase(conv_.begin() + selConv_);
-                selConv_ = conv_.empty() ? -1 : 0;
+                selConv_ = conv_.empty() ? -1 : std::min(selConv_, (int)conv_.size() - 1);
                 f2.key = nextKey_++;
                 remux_.push_back(f2);
                 selRemux_ = (int)remux_.size() - 1;
@@ -936,26 +972,22 @@ void MainWindow::buildRemux(RECT a) {
         add(K_Text, RECT{nx + S(16), ry, rowRight - S(40), ry + rh}, info, S_Mid | S_Mono);
         Item& x2 = add(K_Icon, RECT{rowRight - S(28), ry + S(3), rowRight - S(2), ry + rh - S(3)}, L"", S_Click);
         x2.value = I_Close;
-        x2.click = [this, i] {
-            remux_.erase(remux_.begin() + i);
-            if (selRemux_ >= (int)remux_.size()) selRemux_ = (int)remux_.size() - 1;
-            relayout(true);
-        };
+        x2.click = [this, i] { removeFile(2, i); };
     }
     endClip();
     scrollbar(list, remuxScroll_, (int)remux_.size() * rh);
     y += listH + S(6);
     hline(a.left, a.right, y);
     y += S(8);
+    // One row, as on Convert: container, then audio kept as it is or decoded to linear PCM
+    // (exact by default; a fixed depth is optional).
     x = fieldLabel(a.left, y, L"CONTAINER");
-    seg(x, y, {L"MP4", L"MOV"}, s.remuxContainer == Container::MOV ? 1 : 0, [this](int i) {
+    x = seg(x, y, {L"MP4", L"MOV"}, s.remuxContainer == Container::MOV ? 1 : 0, [this](int i) {
         updateSetting([i](Settings& st) { st.remuxContainer = i == 0 ? Container::MP4 : Container::MOV; });
         for (auto& f : remux_) f.remux.actions.clear();  // defaults depend on the container
         relayout();
     });
-    y += rh;
-    // Audio: kept as it is, or decoded to linear PCM (exact by default; a fixed depth is optional).
-    x = fieldLabel(a.left, y, L"AUDIO");
+    x = text(x, y, L"AUDIO", S_Mid) + S(8);
     x = seg(x, y, {L"Original", L"Linear PCM"}, s.remuxPcm ? 1 : 0, [this](int i) {
         updateSetting([i](Settings& st) { st.remuxPcm = i == 1; });
         for (auto& f : remux_)
@@ -966,8 +998,9 @@ void MainWindow::buildRemux(RECT a) {
             }
         relayout();
     });
+    std::wstring note = s.remuxPcm ? L"every audio track is decoded to PCM" : L"audio copied bit-for-bit; PCM only where the container cannot hold a track";
     if (s.remuxPcm) {
-        x = choice(x, y, L"DEPTH", std::wstring(pcmBitsName(s.remuxPcmBits)) + (s.remuxPcmBits == 0 ? L" (lossless)" : L""), [this] {
+        field(x, y, a.left + labelW(), a.right, L"DEPTH", std::wstring(pcmBitsName(s.remuxPcmBits)) + (s.remuxPcmBits == 0 ? L" (lossless)" : L""), [this] {
             std::vector<std::wstring> o = {L"exact (lossless: source depth, float for lossy sources)", L"16-bit", L"24-bit", L"32-bit float"};
             const int b[] = {0, 16, 24, 32};
             int cur = settingsCopy().remuxPcmBits, checked = 0;
@@ -977,10 +1010,8 @@ void MainWindow::buildRemux(RECT a) {
             if (r >= 0) updateSetting([&](Settings& st) { st.remuxPcmBits = b[r]; });
             relayout();
         });
-        text(x, y, L"every audio track is decoded to PCM", S_Mid, a.right - x);
-    } else {
-        text(x, y, L"copied bit-for-bit; PCM only where the container cannot hold a track", S_Mid, a.right - x);
     }
+    if (a.right - x > S(120)) text(x, y, note, S_Mid, a.right - x);
     y += rh;
     x = fieldLabel(a.left, y, L"SAVE TO");
     choice(x, y, L"", s.remuxDir.empty() ? L"next to the source" : s.remuxDir, [this] {
@@ -1232,10 +1263,8 @@ void MainWindow::buildQueue(RECT a) {
             yy += denseH() + S(2);
             int xx = tx;
             xx = button(xx, yy, L"log", [this] {
-                overlay_ = Overlay::Log;
                 logApp_ = false;
-                logScroll_ = 0;
-                relayout(true);
+                setOverlay(Overlay::Log);
             });
             if (!t.output.empty()) {
                 std::wstring out = t.output;
@@ -1270,10 +1299,7 @@ void MainWindow::buildLog(RECT a) {
         relayout(true);
     });
     std::vector<std::wstring> lines = app ? recentLog(2000) : queue_.taskLog(selTask_);
-    int rx = iconButton(a.right, y, I_Close, false, [this] {
-        overlay_ = Overlay::None;
-        relayout(true);
-    }) - S(12);
+    int rx = iconButton(a.right, y, I_Close, false, [this] { setOverlay(Overlay::None); }) - S(12);
     auto rb = [&](const std::wstring& l, std::function<void()> fn, unsigned st = 0) {
         rx -= tw(l) + S(20);
         button(rx, y, l, std::move(fn), st);
@@ -1284,9 +1310,7 @@ void MainWindow::buildLog(RECT a) {
         std::wstring all;
         for (auto& l : lines) all += l + L"\r\n";
         copyText(all);
-        flash_ = L"log copied";
-        SetTimer(hwnd_, T_FLASH, 2000, nullptr);
-        relayout();
+        flash(L"log copied", 2000);
     }, lines.empty() ? S_Disabled : 0);
     std::wstring sub = app ? L"downloads, conversions, remuxes and tool updates" : taskTitle;
     text(x + S(4), y, sub, S_Mid, rx - x - S(12));
@@ -1336,10 +1360,7 @@ void MainWindow::buildHistory(RECT a) {
     int y = a.top;
     int x = sectionTitle(a.left, y, L"HISTORY") + S(16);
     text(x, y, history_.empty() ? L"" : std::to_wstring(history_.size()) + L" downloads, newest first. Click one to show its file.", S_Mid);
-    int rx = iconButton(a.right, y, I_Close, false, [this] {
-        overlay_ = Overlay::None;
-        relayout(true);
-    }) - S(12);
+    int rx = iconButton(a.right, y, I_Close, false, [this] { setOverlay(Overlay::None); }) - S(12);
     Settings s = settingsCopy();
     rx -= tw(L"open downloads folder") + S(20);
     button(rx, y, L"open downloads folder", [this, d = s.dlDir] { openFolder(d); });
@@ -1386,10 +1407,7 @@ void MainWindow::buildSettings(RECT a) {
     int y = a.top;
     sectionTitle(a.left, y, L"SETTINGS");
     text(a.left + tw(L"SETTINGS", S_Bold) + S(16), y, L"saved as you change them", S_Mid);
-    iconButton(a.right, y, I_Close, false, [this] {
-        overlay_ = Overlay::None;
-        relayout(true);
-    });
+    iconButton(a.right, y, I_Close, false, [this] { setOverlay(Overlay::None); });
     y += rh + S(4);
     RECT view{a.left, y, a.right, a.bottom};
     // Two columns: what the setting is, and its control. Kept to a readable width on wide windows.
@@ -1506,14 +1524,8 @@ void MainWindow::buildSettings(RECT a) {
             if (r == 0) upd([](Settings& st) { st.cookiesBrowser.clear(); st.cookiesFile.clear(); });
             else if (r >= 1 && r <= 7) upd([&](Settings& st) { st.cookiesBrowser = o[r]; st.cookiesFile.clear(); });
             else if (r == 9) {
-                wchar_t buf[MAX_PATH] = L"";
-                OPENFILENAMEW of{sizeof of};
-                of.hwndOwner = hwnd_;
-                of.lpstrFilter = L"cookies.txt\0*.txt\0All files\0*.*\0";
-                of.lpstrFile = buf;
-                of.nMaxFile = MAX_PATH;
-                of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-                if (GetOpenFileNameW(&of)) upd([&](Settings& st) { st.cookiesFile = buf; st.cookiesBrowser.clear(); });
+                auto f = openFiles(L"cookies.txt", L"*.txt", false);
+                if (!f.empty()) upd([&](Settings& st) { st.cookiesFile = f[0]; st.cookiesBrowser.clear(); });
             }
         });
         y += rh;
@@ -1537,15 +1549,19 @@ void MainWindow::buildSettings(RECT a) {
         UpdateState us = updater_.state();
         int x = row(L"Encode All");
         x = text(x, y, L"v" EA_VERSION_W, S_Mono) + S(16);
+        bool checking = us.checking || updateBusy_;
         x = button(x, y, L"check now", [this] {
+            if (updateBusy_) return;  // never join a running check on the UI thread
             if (updateThread_.joinable()) updateThread_.join();
+            updateBusy_ = true;
             updateThread_ = std::thread([this] {
                 updater_.checkAndStage(stop_);
+                updateBusy_ = false;
                 PostMessageW(hwnd_, WM_APP_UPDATE, 0, 0);
             });
             relayout();
-        }, us.checking ? S_Disabled : 0);
-        text(x + S(4), y, us.checking ? L"checking..." : us.error.empty() ? us.status : us.error, us.error.empty() ? S_Mid : S_Bold, maxR - x);
+        }, checking ? S_Disabled : 0);
+        text(x + S(4), y, checking ? L"checking..." : us.error.empty() ? us.status : us.error, us.error.empty() ? S_Mid : S_Bold, maxR - x);
         y += rh;
         x = row(L"Automatic updates");
         toggle(x, y, L"update Encode All (applies on the next start)", s.autoUpdateApp, [upd] { upd([](Settings& st) { st.autoUpdateApp = !st.autoUpdateApp; }); });
@@ -1568,7 +1584,7 @@ void MainWindow::buildSettings(RECT a) {
             add(K_Text, RECT{x, y, x + verW, y + rh}, st, S_Mono | (v.error.empty() ? 0 : S_Bold));
             x += verW + S(12);
             x = button(x, y, L"update", [this, d] {
-                workers_.emplace_back([this, d] {
+                spawn([this, d] {
                     if (d == Dep::YtDlp) {
                         std::wstring n;
                         deps_.updateYtDlpNow(false, n);
@@ -1581,9 +1597,7 @@ void MainWindow::buildSettings(RECT a) {
             button(x, y, L"roll back", [this, d] {
                 std::wstring note2;
                 deps_.rollback(d, note2);
-                flash_ = note2;
-                SetTimer(hwnd_, T_FLASH, 5000, nullptr);
-                relayout();
+                flash(note2, 5000);
             }, v.hasPrevious && !v.busy ? 0 : S_Disabled);
             y += rh;
         }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2 - 2026-11-21
+- Convert: target, quality, speed, audio and filters (size, frame rate, pixel format, one sectioned list) sit in one TARGET row of identical dropdowns, wrapping on narrow windows; subtitles and faststart moved to the SAVE TO row (as on Download) with the encoder at its right. Presets: the four built-ins, then one dropdown to pick, save or delete your own (the dead "custom" cell and the separate save button are gone). Target and MP3 lists are grouped under section titles.
+- Remux: container and audio in one row.
+- Settings: the queue slides away when Settings opens and back when it closes (160 ms, no flicker; nothing else moves).
+- Quitting with running tasks asks in the app's own dialog instead of a Windows message box; edit boxes use the app's own cut/copy/paste menu; the cookies file uses the same file dialog as Add files.
+- Icons are anti-aliased with whole-pixel strokes, so the clock, gear and close marks are smooth and the window buttons stay sharp at every scale.
+- Fixes: removing a link or file no longer loses or shifts the selection; the playlist range box shows the selected playlist's own range; "check now" never freezes the window while the startup update check waits; finished background threads are released as new ones start (they piled up until exit); text clipped to a negative width no longer spills over its neighbours; the log view repaints only changed lines.
+- Cleanup: one helper for notices and one for the file dialog, a dead `.tmp.reserve` delete removed, singular and plural messages ("1 download queued").
+
 ## 1.0.1 - 2026-11-20
 - Encoder: every encode picks the fastest encoder that works on this PC (NVENC, Quick Sync, AMF, then x264/x265), downloads included. The choice moved out of Convert into Settings (Encoding); presets no longer pin an encoder. Convert shows which encoder will run.
 - Remux: MP4 or MOV (MKV removed). New audio choice: Original (copied) or Linear PCM for every track, exact or 16-bit, 24-bit or 32-bit float. AAC is no longer a Remux option.

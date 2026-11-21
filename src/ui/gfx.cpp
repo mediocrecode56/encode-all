@@ -1,6 +1,8 @@
 #include "gfx.h"
 
 #include <dwmapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <cmath>
@@ -150,75 +152,112 @@ std::wstring Painter::fit(const std::wstring& s, int maxPx, HFONT font) {
     return r;
 }
 
+namespace {
+
+// GDI+ draws the line icons with anti-aliasing; GDI pens alias diagonals and curves.
+bool gdipReady() {
+    static ULONG_PTR token = 0;
+    static bool ok = [] {
+        Gdiplus::GdiplusStartupInput in;
+        return Gdiplus::GdiplusStartup(&token, &in, nullptr) == Gdiplus::Ok;
+    }();
+    return ok;
+}
+
+}  // namespace
+
 void Painter::icon(int k, const RECT& r, COLORREF c, int size) {
-    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-    int h = std::max(3, size / 2);  // half the glyph box
-    int pw = std::max(1, (size + 8) / 16);
-    HPEN pen = CreatePen(PS_SOLID, pw, c);
-    HGDIOBJ op = SelectObject(dc_, pen);
-    HGDIOBJ ob = SelectObject(dc_, GetStockObject(NULL_BRUSH));
-    auto line = [&](int x0, int y0, int x1, int y1) {
-        MoveToEx(dc_, x0, y0, nullptr);
-        LineTo(dc_, x1, y1);
-    };
+    if (!gdipReady()) return;
+    using namespace Gdiplus;
+    Graphics g(dc_);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(PixelOffsetModeNone);  // integer coordinates are pixel centres
+    // Stroke: about 1/12 of the glyph in whole pixels, so straight lines stay sharp at every scale.
+    bool chrome = k >= I_Min;
+    float sw = chrome ? std::max(1.0f, std::floor(size / 10.0f)) : std::max(1.0f, std::round(size / 12.0f));
+    // Axis-aligned strokes land on whole pixels (odd widths on centres, even widths between them).
+    bool odd = ((int)std::lround(sw)) % 2 == 1 && std::fabs(sw - std::round(sw)) < 0.01f;
+    auto snap = [&](float v) { return odd ? std::round(v) : std::floor(v) + 0.5f; };
+    float cx = snap((r.left + r.right - 1) / 2.0f), cy = snap((r.top + r.bottom - 1) / 2.0f);
+    float h = std::max(3.0f, size / 2.0f);
+    Color col(255, GetRValue(c), GetGValue(c), GetBValue(c));
+    Pen pen(col, sw);
+    pen.SetLineJoin(LineJoinRound);
+    pen.SetStartCap(chrome ? LineCapFlat : LineCapRound);
+    pen.SetEndCap(chrome ? LineCapFlat : LineCapRound);
+    auto line = [&](float x0, float y0, float x1, float y1) { g.DrawLine(&pen, x0, y0, x1, y1); };
     switch (k) {
         case I_History: {  // clock face with two hands
-            Ellipse(dc_, cx - h, cy - h, cx + h + 1, cy + h + 1);
-            line(cx, cy, cx, cy - h * 3 / 5);
-            line(cx, cy, cx + h / 2, cy + 1);
+            float R = std::round(h * 0.86f);
+            g.DrawEllipse(&pen, cx - R, cy - R, 2 * R, 2 * R);
+            line(cx, cy, cx, cy - R * 0.58f);
+            line(cx, cy, cx + R * 0.42f, cy + R * 0.24f);
             break;
         }
-        case I_Log: {  // lines of text
-            int g = std::max(3, h * 2 / 3);
+        case I_Log: {  // lines of text with bullets
+            float gap = std::round(h * 0.56f);  // whole pixels: every line stays on the grid
+            SolidBrush b(col);
+            float dot = std::max(1.0f, sw * 0.75f);
             for (int i = -1; i <= 1; i++) {
-                int y = cy + i * g;
-                fill(RECT{cx - h, y, cx - h + pw + 1, y + pw}, c);
-                line(cx - h + pw + std::max(2, h / 3), y, i == 1 ? cx + h / 3 : cx + h + 1, y);
+                float y = cy + i * gap;
+                g.FillEllipse(&b, cx - h * 0.82f - dot, y - dot, dot * 2, dot * 2);
+                line(cx - h * 0.38f, y, i == 1 ? cx + h * 0.36f : cx + h * 0.86f, y);
             }
             break;
         }
-        case I_Settings: {  // gear: eight flat teeth around a hole
-            std::vector<POINT> pts;
-            double ro = h, ri = h * 0.68;
-            const double pi = 3.14159265358979;
+        case I_Settings: {  // gear: eight teeth around a hole, as an outline
+            const float pi = 3.14159265f;
+            std::vector<PointF> pts;
+            float ro = h * 0.94f, ri = h * 0.70f;
             for (int t = 0; t < 8; t++) {
-                double a = t * pi / 4;
-                double d[4] = {-0.30, -0.17, 0.17, 0.30};
-                double rr[4] = {ri, ro, ro, ri};
-                for (int j = 0; j < 4; j++)
-                    pts.push_back(POINT{cx + (LONG)std::lround(std::cos(a + d[j]) * rr[j]), cy + (LONG)std::lround(std::sin(a + d[j]) * rr[j])});
+                float a = t * pi / 4;
+                const float d[4] = {-0.30f, -0.15f, 0.15f, 0.30f};
+                const float rr[4] = {ri, ro, ro, ri};
+                for (int j = 0; j < 4; j++) pts.push_back(PointF(cx + std::cos(a + d[j]) * rr[j], cy + std::sin(a + d[j]) * rr[j]));
             }
-            Polygon(dc_, pts.data(), (int)pts.size());
-            int hr = std::max(2, h / 3);
-            Ellipse(dc_, cx - hr, cy - hr, cx + hr + 1, cy + hr + 1);
+            g.DrawPolygon(&pen, pts.data(), (INT)pts.size());
+            float hr = h * 0.30f;
+            g.DrawEllipse(&pen, cx - hr, cy - hr, 2 * hr, 2 * hr);
             break;
         }
         case I_Close: {
-            int q = h * 3 / 4;
-            line(cx - q, cy - q, cx + q + 1, cy + q + 1);
-            line(cx - q, cy + q, cx + q + 1, cy - q - 1);
+            float q = h * 0.62f;
+            line(cx - q, cy - q, cx + q, cy + q);
+            line(cx - q, cy + q, cx + q, cy - q);
             break;
         }
         case I_Check: {
-            int q = h * 3 / 4;
-            line(cx - q, cy, cx - q / 3, cy + q * 2 / 3);
-            line(cx - q / 3, cy + q * 2 / 3, cx + q + 1, cy - q * 2 / 3 - 1);
+            float q = h * 0.72f;
+            PointF p[3] = {PointF(cx - q, cy + q * 0.02f), PointF(cx - q * 0.32f, cy + q * 0.66f), PointF(cx + q, cy - q * 0.62f)};
+            g.DrawLines(&pen, p, 3);
             break;
         }
         case I_Chevron:
         case I_Up:
         case I_Down: {
-            int q = std::max(2, h / 2), dy = (k == I_Up) ? -1 : 1;
-            int top = cy - dy * q / 2;
-            line(cx - q, top, cx, top + dy * q);
-            line(cx, top + dy * q, cx + q + 1, top - dy);
+            float q = h * 0.5f, dy = (k == I_Up) ? -1.0f : 1.0f;
+            PointF p[3] = {PointF(cx - q, cy - dy * q * 0.5f), PointF(cx, cy + dy * q * 0.5f), PointF(cx + q, cy - dy * q * 0.5f)};
+            g.DrawLines(&pen, p, 3);
+            break;
+        }
+        // Window buttons: square glyphs of whole pixels, like Windows' own.
+        case I_Min: line(cx - h, cy, cx + h, cy); break;
+        case I_Max: g.DrawRectangle(&pen, cx - h, cy - h, 2 * h, 2 * h); break;
+        case I_Restore: {
+            float o = std::round(h * 0.4f);
+            g.DrawRectangle(&pen, cx - h, cy - h + o, 2 * h - o, 2 * h - o);
+            PointF p[4] = {PointF(cx - h + o, cy - h + o), PointF(cx - h + o, cy - h), PointF(cx + h, cy - h), PointF(cx + h, cy + h - o)};
+            g.DrawLines(&pen, p, 4);
+            break;
+        }
+        case I_WinClose: {
+            g.SetPixelOffsetMode(PixelOffsetModeHalf);
+            line(cx - h, cy - h, cx + h + 1, cy + h + 1);
+            line(cx - h, cy + h + 1, cx + h + 1, cy - h);
             break;
         }
         default: break;
     }
-    SelectObject(dc_, ob);
-    SelectObject(dc_, op);
-    DeleteObject(pen);
 }
 
 void Painter::bitmap(HBITMAP b, const RECT& r) {

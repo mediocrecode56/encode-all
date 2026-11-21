@@ -17,8 +17,9 @@ bool systemPrefersDark();
 void applyDarkTitle(HWND h, bool dark);
 void allowDarkMenus(bool dark);  // uxtheme preferred app mode, so native scroll bars and dialogs follow the theme
 
-// Line icons, drawn with GDI pens in the ink colour (no bitmaps, no colours).
-enum Icon { I_History, I_Log, I_Settings, I_Close, I_Check, I_Chevron, I_Up, I_Down };
+// Line icons in the ink colour (no bitmaps, no colours).
+// Anti-aliased (GDI+); the window glyphs (I_Min and after) keep whole-pixel strokes so they stay sharp.
+enum Icon { I_History, I_Log, I_Settings, I_Close, I_Check, I_Chevron, I_Up, I_Down, I_Min, I_Max, I_Restore, I_WinClose };
 
 struct Fonts {
     // Segoe UI for labels and controls; Consolas for technical lines (streams, plans, logs, numbers).

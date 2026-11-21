@@ -213,6 +213,10 @@ static LRESULT CALLBACK editProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return r;
     }
     if (m == WM_KILLFOCUS) SendMessageW(parent, WM_COMMAND, MAKEWPARAM(id, 0x7004), (LPARAM)h);
+    if (m == WM_CONTEXTMENU) {  // the app's own menu instead of the native edit menu
+        SendMessageW(parent, WM_APP_EDITMENU, (WPARAM)h, l);
+        return 0;
+    }
     return CallWindowProcW(gEditProc, h, m, w, l);
 }
 
@@ -266,10 +270,11 @@ void MainWindow::onCreate() {
     deps_.startMaintenance(settings_.autoUpdateDeps, false);
     detectEncodersIfNeeded();
     if (settings_.autoUpdateApp && nowUnix() - settings_.lastAppCheck > 6 * 3600) {
+        updateBusy_ = true;
         updateThread_ = std::thread([this] {
-            Sleep(4000);
-            if (stop_) return;
-            updater_.checkAndStage(stop_);
+            for (int i = 0; i < 40 && !stop_; i++) Sleep(100);  // let the window settle first; quits promptly on close
+            if (!stop_) updater_.checkAndStage(stop_);
+            updateBusy_ = false;
             PostMessageW(hwnd_, WM_APP_UPDATE, 0, 0);
         });
         updateSetting([](Settings& s) { s.lastAppCheck = nowUnix(); });
@@ -296,8 +301,9 @@ void MainWindow::onDestroy() {
     queue_.shutdown();
     deps_.shutdown();
     thumbs_.stop();
-    for (auto& t : workers_)
-        if (t.joinable()) t.join();
+    KillTimer(hwnd_, T_ANIM);
+    for (auto& w : workers_)
+        if (w.t.joinable()) w.t.join();
     if (updateThread_.joinable()) updateThread_.join();
     if (backBmp_) DeleteObject(backBmp_);
     if (backDc_) DeleteDC(backDc_);
@@ -363,8 +369,10 @@ Item& MainWindow::add(int kind, const RECT& r, const std::wstring& t, unsigned s
     it.r = r;
     it.text = t;
     it.style = style;
-    if (clipping_) {
-        it.clip = clip_;
+    if (clipping_ || bounded_) {
+        RECT c = clipping_ ? clip_ : bound_;
+        if (clipping_ && bounded_) IntersectRect(&c, &clip_, &bound_);
+        it.clip = c;
         it.clipped = true;
     }
     return it;
@@ -386,7 +394,7 @@ int MainWindow::tw(const std::wstring& s, unsigned style) {
 
 int MainWindow::text(int x, int y, const std::wstring& s, unsigned style, int maxW) {
     int w = tw(s, style);
-    if (maxW > 0 && w > maxW) w = maxW;
+    if (maxW != 0 && w > maxW) w = std::max(0, maxW);  // 0 = no limit; a negative room draws nothing
     add(K_Text, RECT{x, y, x + w, y + rowH()}, s, style);
     return x + w;
 }
@@ -457,6 +465,10 @@ void MainWindow::placeEdit(Edit e, const RECT& r) {
 }
 
 int MainWindow::popup(const std::vector<std::wstring>& opts, int checked) {
+    return popup(opts, checked >= 0 ? std::vector<int>{checked} : std::vector<int>{});
+}
+
+int MainWindow::popup(const std::vector<std::wstring>& opts, const std::vector<int>& checked) {
     RECT a;
     if (anchorValid_) {
         a = anchor_;
@@ -492,6 +504,21 @@ int MainWindow::iconButton(int x, int y, int icon, bool on, std::function<void()
 int MainWindow::fieldLabel(int x, int y, const std::wstring& label, unsigned style) {
     add(K_Text, RECT{x, y, x + labelW() - S(8), y + rowH()}, label, style);
     return x + labelW();
+}
+
+int MainWindow::fieldW(const std::wstring& caption, const std::wstring& value) {
+    int w = std::max<int>(tw(value) + S(35), S(64));
+    if (!caption.empty()) w += tw(caption, S_Mid) + S(8);
+    return w;
+}
+
+void MainWindow::field(int& x, int& y, int left, int right, const std::wstring& caption, const std::wstring& value, std::function<void()> open,
+                       std::function<void(int)> wheel) {
+    if (x > left && x + fieldW(caption, value) > right) {
+        y += rowH();
+        x = left;
+    }
+    x = choice(x, y, caption, value, std::move(open), std::move(wheel));
 }
 
 int MainWindow::sectionTitle(int x, int y, const std::wstring& title) { return text(x, y, title, S_Bold); }
@@ -652,36 +679,12 @@ void MainWindow::onPaint() {
                     p.fill(it.r, theme_.ink);
                     c = theme_.bg;
                 }
-                int cx = (it.r.left + it.r.right) / 2, cy = (it.r.top + it.r.bottom) / 2, r = S(5);
-                HPEN pen = CreatePen(PS_SOLID, std::max<int>(1, S(1)), c);
-                HGDIOBJ op = SelectObject(m, pen);
-                HGDIOBJ ob = SelectObject(m, GetStockObject(NULL_BRUSH));
-                int k = (int)it.value;
-                if (k == 0) {
-                    MoveToEx(m, cx - r, cy, nullptr);
-                    LineTo(m, cx + r + 1, cy);
-                } else if (k == 1) {
-                    Rectangle(m, cx - r, cy - r, cx + r + 1, cy + r + 1);
-                } else if (k == 3) {
-                    int o = S(2);
-                    Rectangle(m, cx - r, cy - r + o, cx + r + 1 - o, cy + r + 1);
-                    MoveToEx(m, cx - r + o, cy - r + o, nullptr);
-                    LineTo(m, cx - r + o, cy - r);
-                    LineTo(m, cx + r, cy - r);
-                    LineTo(m, cx + r, cy + r - o + 1);
-                    LineTo(m, cx + r - o, cy + r - o + 1);
-                } else {
-                    MoveToEx(m, cx - r, cy - r, nullptr);
-                    LineTo(m, cx + r + 1, cy + r + 1);
-                    MoveToEx(m, cx - r, cy + r, nullptr);
-                    LineTo(m, cx + r + 1, cy - r - 1);
-                }
-                SelectObject(m, ob);
-                SelectObject(m, op);
-                DeleteObject(pen);
+                const int glyph[] = {I_Min, I_Max, I_WinClose, I_Restore};
+                p.icon(glyph[std::clamp((int)it.value, 0, 3)], it.r, c, S(10));
                 break;
             }
             case K_Fill: p.fill(it.r, (it.style & S_Invert) ? theme_.ink : theme_.off); break;
+            case K_Clear: p.fill(it.r, theme_.bg); break;
             case K_Line: p.fill(it.r, theme_.line); break;
             case K_Frame: p.frame(it.r, theme_.line); break;
             case K_Progress: {
@@ -768,13 +771,11 @@ bool MainWindow::preTranslate(MSG& m) {
         return true;
     }
     if (ctrl && k == 'L') {
-        overlay_ = overlay_ == Overlay::Log ? Overlay::None : Overlay::Log;
-        relayout(true);
+        setOverlay(overlay_ == Overlay::Log ? Overlay::None : Overlay::Log);
         return true;
     }
     if (ctrl && k == VK_OEM_COMMA) {
-        overlay_ = overlay_ == Overlay::Settings ? Overlay::None : Overlay::Settings;
-        relayout(true);
+        setOverlay(overlay_ == Overlay::Settings ? Overlay::None : Overlay::Settings);
         return true;
     }
     if (ctrl && k == VK_RETURN) {
@@ -788,8 +789,7 @@ bool MainWindow::preTranslate(MSG& m) {
         return true;
     }
     if (k == VK_ESCAPE && overlay_ != Overlay::None && !editFocused()) {
-        overlay_ = Overlay::None;
-        relayout(true);
+        setOverlay(Overlay::None);
         return true;
     }
     if (editFocused()) return false;
@@ -831,8 +831,10 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
         case WM_CLOSE: {
             int running = queue_.running();
             if (running > 0) {
-                std::wstring msg = std::to_wstring(running) + L" task(s) are running.\n\nQuit anyway? Downloads resume where they stopped next time; conversions start again.";
-                if (MessageBoxW(hwnd_, msg.c_str(), L"Encode All", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return 0;
+                std::wstring msg = running == 1 ? L"1 task is running. It comes back waiting on the next start: "
+                                                : std::to_wstring(running) + L" tasks are running. They come back waiting on the next start: ";
+                msg += L"downloads resume where they stopped, conversions start again.";
+                if (!runConfirm(hwnd_, L"Quit Encode All?", msg, L"quit", L"keep working", theme_, fonts_, dpi_)) return 0;
             }
             DestroyWindow(hwnd_);
             return 0;
@@ -1019,6 +1021,8 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
             } else if (w == T_SAVE) {
                 KillTimer(hwnd_, T_SAVE);
                 saveSettingsNow();
+            } else if (w == T_ANIM) {
+                stepQueueAnim();
             }
             return 0;
         case WM_APP_QUEUE: {
@@ -1035,8 +1039,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
             last = now;
             queuePosted_ = false;
             refreshTasks();
-            if (overlay_ == Overlay::Log) relayout(true);
-            else relayout();
+            relayout();
             return 0;
         }
         case WM_APP_DEPS:
@@ -1048,6 +1051,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_THUMB: relayout(); return 0;
         case WM_APP_UPDATE: relayout(); return 0;
         case WM_APP_CAPS: relayout(); return 0;
+        case WM_APP_EDITMENU: editMenu((HWND)w, l); return 0;
         case WM_COPYDATA: {
             auto cd = (COPYDATASTRUCT*)l;
             if (cd->dwData == 0xEA01 && cd->lpData) {
@@ -1082,8 +1086,115 @@ void MainWindow::openArgs(const std::vector<std::wstring>& args) {
 
 void MainWindow::setTab(int t) {
     tab_ = std::clamp(t, 0, 2);
-    overlay_ = Overlay::None;
+    setOverlay(Overlay::None);
+}
+
+void MainWindow::setOverlay(Overlay o) {
+    if (o != overlay_) {
+        overlay_ = o;
+        if (o == Overlay::History) {
+            history_ = loadHistory(500);
+            historyScroll_ = 0;
+        }
+        if (o == Overlay::Log) logScroll_ = 0;
+        animateQueue();
+    }
     relayout(true);
+}
+
+// The queue slides out of the way under Settings and back elsewhere: 160 ms, ease-out. The views
+// take their final layout at once; only the queue block moves, so nothing else jumps or redraws twice.
+void MainWindow::animateQueue() {
+    double target = overlay_ == Overlay::Settings ? 0 : 1;
+    if (target == animTo_ && (animOn_ || queueOpen_ == target)) return;
+    animFrom_ = queueOpen_;
+    animTo_ = target;
+    animStart_ = GetTickCount64();
+    if (!animOn_) {
+        SetTimer(hwnd_, T_ANIM, 8, nullptr);
+        animOn_ = true;
+    }
+}
+
+void MainWindow::stepQueueAnim() {
+    const double dur = 160;
+    double t = std::min(1.0, (GetTickCount64() - animStart_) / dur);
+    double e = 1 - (1 - t) * (1 - t) * (1 - t);
+    queueOpen_ = animFrom_ + (animTo_ - animFrom_) * e;
+    if (t >= 1) {
+        queueOpen_ = animTo_;
+        KillTimer(hwnd_, T_ANIM);
+        animOn_ = false;
+    }
+    relayout();
+    UpdateWindow(hwnd_);  // paint each frame now
+}
+
+void MainWindow::flash(const std::wstring& msg, UINT ms) {
+    flash_ = msg;
+    SetTimer(hwnd_, T_FLASH, ms, nullptr);
+    relayout();
+}
+
+void MainWindow::removeGroup(int gi) {
+    if (gi < 0 || gi >= (int)groups_.size()) return;
+    groups_.erase(groups_.begin() + gi);
+    if (selGroup_ == gi) {
+        selGroup_ = groups_.empty() ? -1 : std::min(gi, (int)groups_.size() - 1);
+        selEntry_ = 0;
+    } else if (selGroup_ > gi) {
+        selGroup_--;
+    }
+}
+
+void MainWindow::removeFile(int tab, int i) {
+    auto& list = tab == 2 ? remux_ : conv_;
+    int& sel = tab == 2 ? selRemux_ : selConv_;
+    if (i < 0 || i >= (int)list.size()) return;
+    list.erase(list.begin() + i);
+    if (sel > i || sel >= (int)list.size()) sel--;
+    if (sel < 0 && !list.empty()) sel = 0;
+    detailScroll_ = 0;
+    relayout(true);
+}
+
+void MainWindow::spawn(std::function<void()> fn) {
+    reapWorkers();
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread t([fn = std::move(fn), done] {
+        fn();
+        *done = true;
+    });
+    workers_.push_back({std::move(t), done});
+}
+
+void MainWindow::reapWorkers() {
+    for (auto it = workers_.begin(); it != workers_.end();) {
+        if (*it->done) {
+            it->t.join();
+            it = workers_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void MainWindow::editMenu(HWND e, LPARAM at) {
+    POINT p{GET_X_LPARAM(at), GET_Y_LPARAM(at)};
+    if (p.x == -1 && p.y == -1) {  // from the keyboard: under the box
+        RECT r;
+        GetWindowRect(e, &r);
+        p = {r.left + S(8), r.bottom};
+    }
+    DWORD a = 0, b = 0;
+    SendMessageW(e, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    SetFocus(e);
+    std::vector<std::wstring> items = {L"cut", L"copy", L"paste", L"-", L"select all"};
+    int r = runMenu(hwnd_, RECT{p.x, p.y, p.x, p.y}, items, -1, theme_, fonts_, dpi_);
+    if (r == 0 && a != b) SendMessageW(e, WM_CUT, 0, 0);
+    else if (r == 1 && a != b) SendMessageW(e, WM_COPY, 0, 0);
+    else if (r == 2) SendMessageW(e, WM_PASTE, 0, 0);
+    else if (r == 4) SendMessageW(e, EM_SETSEL, 0, -1);
 }
 
 void MainWindow::copyText(const std::wstring& t) {
@@ -1135,16 +1246,22 @@ std::wstring MainWindow::pickFolder(const std::wstring& initial) {
 }
 
 void MainWindow::pickFiles(int tab) {
+    auto files = openFiles(L"Media files", L"*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m4v;*.mts;*.m2ts;*.ts;*.mxf;*.wmv;*.flv;*.mpg;*.mpeg;*.vob;*.3gp;*.ogv;"
+                                           L"*.mp3;*.m4a;*.aac;*.flac;*.wav;*.opus;*.ogg;*.wma;*.aiff;*.aif;*.ac3;*.eac3;*.dts;*.mka;*.alac;*.ape;*.wv",
+                           true);
+    if (!files.empty()) addFiles(files, tab);
+}
+
+// The shell's file dialog (the one system dialog the app keeps: it is the file system, not a control).
+std::vector<std::wstring> MainWindow::openFiles(const wchar_t* typeName, const wchar_t* spec, bool multi) {
+    std::vector<std::wstring> files;
     IFileOpenDialog* d = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return files;
     DWORD o;
     d->GetOptions(&o);
-    d->SetOptions(o | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
-    COMDLG_FILTERSPEC f[] = {{L"Media files", L"*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m4v;*.mts;*.m2ts;*.ts;*.mxf;*.wmv;*.flv;*.mpg;*.mpeg;*.vob;*.3gp;*.ogv;"
-                                              L"*.mp3;*.m4a;*.aac;*.flac;*.wav;*.opus;*.ogg;*.wma;*.aiff;*.aif;*.ac3;*.eac3;*.dts;*.mka;*.alac;*.ape;*.wv"},
-                             {L"All files", L"*.*"}};
+    d->SetOptions(o | (multi ? FOS_ALLOWMULTISELECT : 0) | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    COMDLG_FILTERSPEC f[] = {{typeName, spec}, {L"All files", L"*.*"}};
     d->SetFileTypes(2, f);
-    std::vector<std::wstring> files;
     if (SUCCEEDED(d->Show(hwnd_))) {
         IShellItemArray* arr = nullptr;
         if (SUCCEEDED(d->GetResults(&arr))) {
@@ -1163,7 +1280,7 @@ void MainWindow::pickFiles(int tab) {
         }
     }
     d->Release();
-    if (!files.empty()) addFiles(files, tab);
+    return files;
 }
 
 void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
@@ -1184,6 +1301,7 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
     }
     tab_ = tab;
     overlay_ = Overlay::None;
+    animateQueue();
     auto& list = tab == 2 ? remux_ : conv_;
     for (auto& f : files) {
         bool dup = false;
@@ -1194,7 +1312,7 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
         row.path = f;
         list.push_back(row);
         uint64_t key = row.key;
-        workers_.emplace_back([this, key, f] {
+        spawn([this, key, f] {
             WorkResult r;
             r.type = 2;
             r.key = key;
@@ -1230,7 +1348,7 @@ void MainWindow::analyzeUrls() {
         g.title = u;
         groups_.push_back(g);
         uint64_t key = g.key;
-        workers_.emplace_back([this, key, u, s] {
+        spawn([this, key, u, s] {
             WorkResult r;
             r.type = 1;
             r.key = key;
@@ -1270,6 +1388,7 @@ void MainWindow::analyzeUrls() {
     }
     tab_ = 0;
     overlay_ = Overlay::None;
+    animateQueue();
     relayout(true);
 }
 
@@ -1348,8 +1467,7 @@ void MainWindow::startDownloads() {
     selGroup_ = groups_.empty() ? -1 : 0;
     selEntry_ = 0;
     dlScroll_ = 0;
-    flash_ = std::to_wstring(n) + L" download(s) queued";
-    SetTimer(hwnd_, T_FLASH, 4000, nullptr);
+    flash(std::to_wstring(n) + (n == 1 ? L" download queued" : L" downloads queued"));
     relayout(true);
 }
 
@@ -1372,8 +1490,7 @@ void MainWindow::startConvert() {
     if (!n) return;
     conv_ = keep;
     selConv_ = conv_.empty() ? -1 : 0;
-    flash_ = std::to_wstring(n) + L" conversion(s) queued";
-    SetTimer(hwnd_, T_FLASH, 4000, nullptr);
+    flash(std::to_wstring(n) + (n == 1 ? L" conversion queued" : L" conversions queued"));
     relayout(true);
 }
 
@@ -1404,13 +1521,11 @@ void MainWindow::startRemux() {
     if (!n) return;
     remux_ = keep;
     selRemux_ = remux_.empty() ? -1 : 0;
-    flash_ = std::to_wstring(n) + L" remux job(s) queued";
-    SetTimer(hwnd_, T_FLASH, 4000, nullptr);
+    flash(std::to_wstring(n) + (n == 1 ? L" remux queued" : L" remuxes queued"));
     relayout(true);
 }
 
-void MainWindow::customValue(const std::wstring& prompt, const std::wstring& initial, const RECT& at, std::function<void(const std::wstring&)> done) {
-    (void)prompt;
+void MainWindow::customValue(const std::wstring& initial, const RECT& at, std::function<void(const std::wstring&)> done) {
     customDone_ = std::move(done);
     RECT r = at;
     if (r.right - r.left < S(160)) r.right = r.left + S(160);
@@ -1441,7 +1556,7 @@ void MainWindow::detectEncodersIfNeeded() {
         if (caps_.probed && !hash.empty() && settings_.encoderCapsFor == hash) return;
     }
     capsRunning_ = true;
-    workers_.emplace_back([this, hash] {
+    spawn([this, hash] {
         deps_.acquire(Dep::FFmpeg);
         EncoderCaps c = detectEncoders(deps_.ffmpeg(), &stop_);
         deps_.release(Dep::FFmpeg);

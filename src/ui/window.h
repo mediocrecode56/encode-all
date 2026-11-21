@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,13 +25,14 @@
 
 namespace ea::ui {
 
-enum : UINT { WM_APP_QUEUE = WM_APP + 1, WM_APP_DEPS, WM_APP_RESULT, WM_APP_THUMB, WM_APP_UPDATE, WM_APP_CAPS };
+enum : UINT { WM_APP_QUEUE = WM_APP + 1, WM_APP_DEPS, WM_APP_RESULT, WM_APP_THUMB, WM_APP_UPDATE, WM_APP_CAPS, WM_APP_EDITMENU };
 
 constexpr unsigned S_Bold = 1, S_Mid = 2, S_Invert = 4, S_Disabled = 8, S_Click = 16, S_Right = 32, S_Selected = 64, S_Big = 128, S_Center = 256,
                    S_Mono = 512;
-constexpr UINT_PTR T_QUEUE = 1, T_FLASH = 2, T_HEALTHY = 3, T_SAVE = 4;
-enum Kind { K_Text, K_Fill, K_Line, K_Progress, K_Thumb, K_Region, K_Frame, K_Button, K_Check, K_Box, K_Cell, K_WinBtn, K_Icon, K_Bar };
+constexpr UINT_PTR T_QUEUE = 1, T_FLASH = 2, T_HEALTHY = 3, T_SAVE = 4, T_ANIM = 5;  // T_ANIM runs only while the queue slides
+enum Kind { K_Text, K_Fill, K_Clear, K_Line, K_Progress, K_Thumb, K_Region, K_Frame, K_Button, K_Check, K_Box, K_Cell, K_WinBtn, K_Icon, K_Bar };
 // K_Icon: a square icon button (value = Icon, S_Invert when its view is open). K_Bar: a scroll position mark.
+// K_Clear: background fill (the sliding queue covers what is under it).
 
 struct Item {
     RECT r{};
@@ -131,20 +133,36 @@ private:
     void placeEdit(Edit e, const RECT& r);
     void beginClip(const RECT& r) { clip_ = r; clipping_ = true; }
     void endClip() { clipping_ = false; }
+    // field: an inline caption and a dropdown, flowing left to right and wrapping to the control column.
+    void field(int& x, int& y, int left, int right, const std::wstring& caption, const std::wstring& value, std::function<void()> open,
+               std::function<void(int)> wheel = nullptr);
+    int fieldW(const std::wstring& caption, const std::wstring& value);
     int popup(const std::vector<std::wstring>& items, int checked);  // the app's own dropdown, under the clicked control
+    int popup(const std::vector<std::wstring>& items, const std::vector<int>& checked);  // sectioned: one check per section
     int rowH() const { return fonts_.lineH; }
     int barH() const { return S(40); }  // the top bar: drag area, title, window buttons (Weekly-style chrome)
     int denseH() const { return fonts_.denseH; }
 
     // actions
     void setTab(int t);
+    void setOverlay(Overlay o);  // switches views; the queue slides away under Settings and back
+    void animateQueue();
+    void stepQueueAnim();
+    void flash(const std::wstring& msg, UINT ms = 4000);
+    void removeGroup(int gi);
+    void removeFile(int tab, int i);
+    void spawn(std::function<void()> fn);  // a worker thread; finished ones are joined as new ones start
+    void reapWorkers();
+    void editMenu(HWND edit, LPARAM at);
     void analyzeUrls();
     void startDownloads();
     void addFiles(const std::vector<std::wstring>& files, int tab);
     void pickFiles(int tab);
+    std::vector<std::wstring> openFiles(const wchar_t* typeName, const wchar_t* spec, bool multi);
     void startConvert();
     void startRemux();
-    void customValue(const std::wstring& prompt, const std::wstring& initial, const RECT& at, std::function<void(const std::wstring&)> done);
+    // An inline text box over the clicked control (at least 160 px wide); Enter or leaving it commits, Esc cancels.
+    void customValue(const std::wstring& initial, const RECT& at, std::function<void(const std::wstring&)> done);
     void commitCustom(bool ok);
     std::wstring pickFolder(const std::wstring& initial);
     void saveSettingsNow();
@@ -175,6 +193,8 @@ private:
     std::vector<Item> items_, prev_;
     RECT clip_{};
     bool clipping_ = false;
+    RECT bound_{};  // outer clip for everything added (the sliding queue)
+    bool bounded_ = false;
     int hover_ = -1, pressed_ = -1;
     POINT mouse_{-1, -1};
     RECT anchor_{};  // the control whose click is running (client coordinates), for dropdown placement
@@ -217,8 +237,16 @@ private:
     std::atomic<ULONGLONG> lastQueuePost_{0};
     std::mutex resMu_;
     std::vector<WorkResult> results_;
-    std::vector<std::thread> workers_;
+    struct Worker {
+        std::thread t;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::vector<Worker> workers_;
     std::thread updateThread_;
+    std::atomic<bool> updateBusy_{false};
+    double queueOpen_ = 1, animFrom_ = 1, animTo_ = 1;  // 1 = queue shown
+    ULONGLONG animStart_ = 0;
+    bool animOn_ = false;
     uint64_t nextKey_ = 1;
     bool timerOn_ = false;
     bool healthy_ = false;
