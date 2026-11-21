@@ -68,20 +68,12 @@ std::wstring qualityText(const ConvertSpec& s) {
     return L"CRF " + std::to_wstring(s.quality);
 }
 
-// Size, frame rate and pixel format in a few words ("none" when all follow the source).
-std::wstring filtersText(const ConvertSpec& s) {
-    std::wstring r;
-    auto add = [&](const std::wstring& p) { r += (r.empty() ? L"" : L", ") + p; };
-    if (s.width && s.height) add(std::to_wstring(s.width) + L"x" + std::to_wstring(s.height));
-    else if (s.height) add(std::to_wstring(s.height) + L"p");
-    else if (s.width) add(std::to_wstring(s.width) + L"w");
-    if (s.fps > 0) add(fmtFps(s.fps) + L" fps");
-    if (s.pixFmt == "yuv420p") add(L"8-bit 4:2:0");
-    else if (s.pixFmt == "yuv420p10le") add(L"10-bit 4:2:0");
-    else if (s.pixFmt == "yuv422p10le") add(L"10-bit 4:2:2");
-    else if (s.pixFmt == "yuv444p10le") add(L"10-bit 4:4:4");
-    else if (!s.pixFmt.empty()) add(widen(s.pixFmt));
-    return r.empty() ? L"none" : r;
+// The SIZE dropdown's value: "source", "1080p", "1920x1080" or "1280w".
+std::wstring sizeText(const ConvertSpec& s) {
+    if (s.width && s.height) return std::to_wstring(s.width) + L"x" + std::to_wstring(s.height);
+    if (s.height) return std::to_wstring(s.height) + L"p";
+    if (s.width) return std::to_wstring(s.width) + L"w";
+    return L"source";
 }
 
 std::wstring audioText(const ConvertSpec& s) {
@@ -101,28 +93,6 @@ std::wstring encoderLabel(const std::string& enc) {
     if (enc == "libx264") return L"x264";
     if (enc == "libx265") return L"x265";
     return widen(enc);
-}
-
-std::wstring shortMedia(const MediaInfo& m) {
-    std::wstring r;
-    if (const StreamInfo* v = m.video()) {
-        r += widen(v->codec) + L" " + std::to_wstring(v->width) + L"x" + std::to_wstring(v->height);
-        if (v->fps > 0) r += L" " + fmtFps(v->fps);
-        if (v->bitDepth > 8) r += L" " + std::to_wstring(v->bitDepth) + L"b";
-        if (v->hdr()) r += L" HDR";
-        r += L"  \u00b7  ";
-    }
-    int na = m.count("audio");
-    if (const StreamInfo* a = m.audio()) {
-        r += widen(a->codec) + L" " + (a->layout.empty() ? std::to_wstring(a->channels) + L"ch" : widen(a->layout));
-        if (na > 1) r += L" +" + std::to_wstring(na - 1);
-        r += L"  \u00b7  ";
-    }
-    int ns = m.count("subtitle");
-    if (ns) r += std::to_wstring(ns) + L" subs  \u00b7  ";
-    r += fmtDuration(m.duration) + L"  \u00b7  " + fmtBytes((double)m.size);
-    if (m.bitrate > 0) r += L"  \u00b7  " + fmtBitrate(m.bitrate);
-    return r;
 }
 
 // What a download will fetch with the current options.
@@ -279,8 +249,8 @@ void MainWindow::buildHeader(RECT& a) {
 // ---------- sections ----------
 // Every section works the same way: a bar at the top takes links or files, the options below it apply
 // to what you start, and the list holds every item, before and after it starts. Each row opens its
-// link or file, shows its folder and starts (or pauses, resumes, retries) on its own; "start all" at
-// the top right starts every item that is ready. A click on a row shows its details under it.
+// link or file, shows its folder and starts (or pauses, resumes, retries) on its own; "download all"
+// ("convert all", "remux all") at the top right starts every item that is ready. A click on a row shows its details under it.
 
 void MainWindow::syncRange(uint64_t key) {
     if (key != rangeKey_) return;
@@ -434,13 +404,10 @@ void MainWindow::buildSection(RECT a) {
     part(paused, L"paused");
     part(failed, L"failed");
     part(done, L"finished");
-    int rx = a.right;
-    std::wstring go = ready ? L"start all  " + std::to_wstring(ready) : L"start all";
-    int gw = tw(go, S_Bold) + S(32);
-    rx -= gw;
-    Item& gb = add(K_Button, RECT{rx, y + S(3), rx + gw, y + rh - S(3)}, go, S_Bold | (ready ? S_Invert | S_Click : S_Disabled));
-    if (ready) gb.click = [this] { startAll(tab_); };
-    gb.tip = L"start every item that is ready (Ctrl+Enter)";
+    std::wstring go = tab_ == 0 ? L"download all" : tab_ == 1 ? L"convert all" : L"remux all";
+    if (ready) go += L"  " + std::to_wstring(ready);
+    int rx = iconButtonText(a.right, y, go, tab_ == 0 ? I_Download : I_Go, [this] { startAll(tab_); }, S_Bold | (ready ? S_Invert : S_Disabled));
+    items_.back().tip = tab_ == 0 ? L"download every link that is ready (Ctrl+Enter)" : L"start every file that is ready (Ctrl+Enter)";
     rx -= S(10);
     auto rb = [&](const std::wstring& l, const std::wstring& tip, std::function<void()> fn) {
         rx -= tw(l) + S(20);
@@ -490,7 +457,7 @@ void MainWindow::buildSection(RECT a) {
         selTop = selBottom = INT32_MIN;
         for (auto& r : rows) {
             bool sel = r.id == sel_[tab_];
-            int h = r.type == ListRow::Head ? rh + S(14) : itemH();
+            int h = r.type == ListRow::Head ? rh + S(22) : itemH();
             if (sel || (ry + h > list.top && ry < list.bottom)) h = buildRow(r, list.left, rowRight, ry, sel);
             if (sel) {
                 selTop = ry - list.top - 1 + scroll;
@@ -753,38 +720,6 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
             else if (r >= 2 && r <= 6) change([&](ConvertSpec& c) { c.acodec = ACodec::AAC; c.aacKbps = k[r - 2]; });
             else if (r >= 8) change([&](ConvertSpec& c) { c.acodec = ACodec::PCM; c.pcmBits = r == 8 ? 0 : r == 9 ? 16 : 24; });
         });
-        if (encodesVideo)
-            field(x, y, left, a.right, L"FILTERS", filtersText(cs), [this, change] {
-                // One list, three sections: size, frame rate, pixel format (one check each).
-                RECT at = anchor_;
-                ConvertSpec cur = settingsCopy().convert;
-                std::vector<std::wstring> o = {L"#SIZE", L"source", L"2160p", L"1440p", L"1080p", L"720p", L"480p", L"custom WxH...",
-                                               L"#FRAME RATE", L"source", L"23.976", L"24", L"25", L"29.97", L"30", L"50", L"59.94", L"60",
-                                               L"#PIXEL FORMAT", L"source", L"8-bit 4:2:0", L"10-bit 4:2:0", L"10-bit 4:2:2", L"10-bit 4:4:4"};
-                const int hgt[] = {0, 2160, 1440, 1080, 720, 480};
-                const double fps[] = {0, 24000.0 / 1001, 24, 25, 30000.0 / 1001, 30, 50, 60000.0 / 1001, 60};
-                const char* pix[] = {"", "yuv420p", "yuv420p10le", "yuv422p10le", "yuv444p10le"};
-                std::vector<int> checks;
-                int sizeCheck = cur.width ? 7 : -1;
-                for (int i = 0; i < 6; i++)
-                    if (cur.width == 0 && cur.height == hgt[i]) sizeCheck = 1 + i;
-                checks.push_back(sizeCheck);
-                for (int i = 0; i < 9; i++)
-                    if (std::fabs(cur.fps - fps[i]) < 0.001) checks.push_back(9 + i);
-                for (int i = 0; i < 5; i++)
-                    if (cur.pixFmt == pix[i]) checks.push_back(19 + i);
-                int r = popup(o, checks);
-                if (r >= 1 && r <= 6) change([&](ConvertSpec& c) { c.height = hgt[r - 1]; c.width = 0; });
-                else if (r == 7)
-                    customValue(cur.width && cur.height ? std::to_wstring(cur.width) + L"x" + std::to_wstring(cur.height) : L"1920x1080", at,
-                                [change](const std::wstring& v) {
-                                    int w2 = 0, h2 = 0;
-                                    if (swscanf(v.c_str(), L"%dx%d", &w2, &h2) == 2 && w2 > 0 && h2 > 0 && w2 <= 16384 && h2 <= 16384)
-                                        change([&](ConvertSpec& c) { c.width = w2 & ~1; c.height = h2 & ~1; });
-                                });
-                else if (r >= 9 && r <= 17) change([&](ConvertSpec& c) { c.fps = fps[r - 9]; });
-                else if (r >= 19 && r <= 23) change([&](ConvertSpec& c) { c.pixFmt = pix[r - 19]; });
-            });
         if (isDnxhr(cs.vcodec) && a.right - x > S(160)) text(x, y, L"fixed rate per profile, visually lossless", S_Mid, a.right - x);
         else if (cs.vcodec == VCodec::Copy && a.right - x > S(160)) text(x, y, L"video copied bit-for-bit", S_Mid, a.right - x);
     } else {
@@ -823,26 +758,114 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
                 int r = popup(o, checked);
                 if (r >= 0) change([&](ConvertSpec& c) { c.bitDepth = b[r]; });
             });
-        field(x, y, left, a.right, L"RATE", cs.sampleRate ? std::to_wstring(cs.sampleRate) : L"source", [this, change] {
-            std::vector<std::wstring> o = {L"source", L"44100", L"48000", L"96000"};
-            const int r2[] = {0, 44100, 48000, 96000};
-            int cur = settingsCopy().convert.sampleRate, checked = -1;
-            for (int i = 0; i < 4; i++)
-                if (cur == r2[i]) checked = i;
-            int r = popup(o, checked);
-            if (r >= 0) change([&](ConvertSpec& c) { c.sampleRate = r2[r]; });
-        });
-        field(x, y, left, a.right, L"CHANNELS", cs.channels ? (cs.channels == 1 ? L"mono" : cs.channels == 2 ? L"stereo" : std::to_wstring(cs.channels)) : L"source",
-              [this, change] {
-                  std::vector<std::wstring> o = {L"source", L"stereo", L"mono"};
-                  const int c2[] = {0, 2, 1};
-                  int cur = settingsCopy().convert.channels, checked = -1;
-                  for (int i = 0; i < 3; i++)
-                      if (cur == c2[i]) checked = i;
-                  int r = popup(o, checked);
-                  if (r >= 0) change([&](ConvertSpec& c) { c.channels = c2[r]; });
-              });
     }
+    y += rh;
+    // PICTURE and SOUND: one dropdown per kind of change, each on "source" or "off" until it is set.
+    // PICTURE shows only when the video is encoded; SOUND changes re-encode the audio they touch.
+    // A dropdown over a fixed list of values: the box shows the short name, the wheel steps through them.
+    auto pick = [&](const std::wstring& cap, const std::vector<std::wstring>& names, const std::vector<int>& vals, int cur,
+                    std::function<void(ConvertSpec&, int)> set) {
+        int ci = -1;
+        for (size_t i = 0; i < vals.size(); i++)
+            if (vals[i] == cur) ci = (int)i;
+        field(x, y, left, a.right, cap, ci >= 0 ? names[ci] : std::to_wstring(cur), [this, names, vals, ci, set, change] {
+            int r = popup(names, ci);
+            if (r >= 0 && r < (int)vals.size()) change([&](ConvertSpec& c) { set(c, vals[r]); });
+        }, [ci, vals, set, change](int n) {
+            int r = std::clamp((ci < 0 ? 0 : ci) - n, 0, (int)vals.size() - 1);
+            change([&](ConvertSpec& c) { set(c, vals[r]); });
+        });
+    };
+    // "clear" at the end of a row puts that row's filters back to source / off.
+    auto clearButton = [&](std::function<void(ConvertSpec&)> reset) {
+        if (x + tw(L"clear") + S(20) > a.right) {
+            y += rh;
+            x = left;
+        }
+        button(x, y, L"clear", [change, reset] { change(reset); });
+        items_.back().tip = L"back to source / off";
+    };
+    if (encodesVideo) {
+        x = fieldLabel(a.left, y, L"PICTURE");
+        field(x, y, left, a.right, L"SIZE", sizeText(cs), [this, change] {
+            RECT at = anchor_;
+            ConvertSpec cur = settingsCopy().convert;
+            std::vector<std::wstring> o = {L"source", L"4320p (8K)", L"2160p (4K)", L"1440p", L"1080p", L"720p", L"576p", L"480p", L"360p", L"-", L"custom WxH..."};
+            const int hgt[] = {0, 4320, 2160, 1440, 1080, 720, 576, 480, 360};
+            int checked = cur.width ? 10 : -1;
+            for (int i = 0; i < 9; i++)
+                if (cur.width == 0 && cur.height == hgt[i]) checked = i;
+            int r = popup(o, checked);
+            if (r >= 0 && r <= 8) change([&](ConvertSpec& c) { c.height = hgt[r]; c.width = 0; });
+            else if (r == 10)
+                customValue(cur.width && cur.height ? std::to_wstring(cur.width) + L"x" + std::to_wstring(cur.height) : L"1920x1080", at, [change](const std::wstring& v) {
+                    int w2 = 0, h2 = 0;
+                    if (swscanf(v.c_str(), L"%dx%d", &w2, &h2) == 2 && w2 >= 16 && h2 >= 16 && w2 <= 16384 && h2 <= 16384)
+                        change([&](ConvertSpec& c) { c.width = w2 & ~1; c.height = h2 & ~1; });
+                });
+        });
+        field(x, y, left, a.right, L"FRAME RATE", cs.fps > 0 ? fmtFps(cs.fps) : L"source", [this, change] {
+            RECT at = anchor_;
+            std::vector<std::wstring> o = {L"source", L"23.976", L"24", L"25", L"29.97", L"30", L"48", L"50", L"59.94", L"60", L"120", L"-", L"custom..."};
+            const double fps[] = {0, 24000.0 / 1001, 24, 25, 30000.0 / 1001, 30, 48, 50, 60000.0 / 1001, 60, 120};
+            double cur = settingsCopy().convert.fps;
+            int checked = cur > 0 ? 12 : 0;
+            for (int i = 0; i < 11; i++)
+                if (std::fabs(cur - fps[i]) < 0.001) checked = i;
+            int r = popup(o, checked);
+            if (r >= 0 && r <= 10) change([&](ConvertSpec& c) { c.fps = fps[r]; });
+            else if (r == 12)
+                customValue(cur > 0 ? fmtFps(cur) : L"30", at, [change](const std::wstring& v) {
+                    double d = _wtof(v.c_str());
+                    if (d >= 1 && d <= 240) change([&](ConvertSpec& c) { c.fps = d; });
+                });
+        });
+        if (!isDnxhr(cs.vcodec)) {
+            std::vector<std::wstring> pn = {L"source", L"8-bit 4:2:0", L"10-bit 4:2:0", L"8-bit 4:2:2", L"10-bit 4:2:2", L"8-bit 4:4:4", L"10-bit 4:4:4"};
+            const char* pf[] = {"", "yuv420p", "yuv420p10le", "yuv422p", "yuv422p10le", "yuv444p", "yuv444p10le"};
+            int pi = -1;
+            for (int i = 0; i < 7; i++)
+                if (cs.pixFmt == pf[i]) pi = i;
+            field(x, y, left, a.right, L"PIXELS", pi >= 0 ? pn[pi] : widen(cs.pixFmt), [this, change, pn, pi] {
+                const char* pf2[] = {"", "yuv420p", "yuv420p10le", "yuv422p", "yuv422p10le", "yuv444p", "yuv444p10le"};
+                int r = popup(pn, pi);
+                if (r >= 0) change([&](ConvertSpec& c) { c.pixFmt = pf2[r]; });
+            });
+        }
+        // A second line for what processes the frames (the first one says what they become).
+        y += rh;
+        x = left;
+        pick(L"DEINTERLACE", {L"off", L"auto (interlaced frames)", L"every frame", L"double rate (every field)"}, {0, 1, 2, 3}, cs.deinterlace,
+             [](ConvertSpec& c, int v) { c.deinterlace = v; });
+        pick(L"ROTATE", {L"none", L"90° clockwise", L"90° counter-clockwise", L"180°", L"mirror (left-right)", L"flip (upside down)"}, {0, 1, 2, 3, 4, 5},
+             cs.rotate, [](ConvertSpec& c, int v) { c.rotate = v; });
+        pick(L"DENOISE", {L"off", L"light", L"medium", L"strong"}, {0, 1, 2, 3}, cs.denoise, [](ConvertSpec& c, int v) { c.denoise = v; });
+        pick(L"SHARPEN", {L"off", L"light", L"medium"}, {0, 1, 2}, cs.sharpen, [](ConvertSpec& c, int v) { c.sharpen = v; });
+        if (cs.hasVideoFilters())
+            clearButton([](ConvertSpec& c) {
+                c.width = c.height = 0;
+                c.fps = 0;
+                c.pixFmt.clear();
+                c.deinterlace = c.rotate = c.denoise = c.sharpen = 0;
+            });
+        y += rh;
+    }
+    x = fieldLabel(a.left, y, L"SOUND");
+    if (audioTarget) {
+        std::vector<std::wstring> rn = {L"source", L"44100 Hz", L"48000 Hz"};
+        std::vector<int> rv = {0, 44100, 48000};
+        if (cs.audio != AudioTarget::MP3) {
+            rn.insert(rn.end(), {L"88200 Hz", L"96000 Hz", L"192000 Hz"});
+            rv.insert(rv.end(), {88200, 96000, 192000});
+        }
+        pick(L"SAMPLE RATE", rn, rv, cs.sampleRate, [](ConvertSpec& c, int v) { c.sampleRate = v; });
+    }
+    pick(L"CHANNELS", {L"source", L"stereo", L"mono"}, {0, 2, 1}, cs.channels, [](ConvertSpec& c, int v) { c.channels = v; });
+    pick(L"LOUDNESS", {L"off", L"-23 LUFS (broadcast)", L"-16 LUFS (podcast)", L"-14 LUFS (streaming)"}, {0, 1, 2, 3}, cs.loudness,
+         [](ConvertSpec& c, int v) { c.loudness = v; });
+    if (cs.channels || cs.loudness || (audioTarget && cs.sampleRate))
+        clearButton([](ConvertSpec& c) { c.loudness = c.channels = c.sampleRate = 0; });
+    if (!audioTarget && a.right - x > S(200)) text(x, y, cs.acodec == ACodec::Copy && !cs.channels && !cs.loudness ? L"changes here re-encode the audio" : L"", S_Mid, a.right - x);
     y += rh;
     // SAVE TO, with the stream options on the same row (as on Download), and the encoder at the right.
     x = fieldLabel(a.left, y, L"SAVE TO");
@@ -890,9 +913,9 @@ void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
         relayout();
     });
     x = text(x, y, L"AUDIO", S_Mid) + S(10);
-    x = seg(x, y, {L"Original", L"Linear PCM"}, s.remuxPcm ? 1 : 0, [this](int i) {
-        updateSetting([i](Settings& st) { st.remuxPcm = i == 1; });
-        for (auto& f : remux_)
+    x = seg(x, y, {L"Original", L"Linear PCM", L"AAC"}, (int)s.remuxAudio, [this](int i) {
+        updateSetting([i](Settings& st) { st.remuxAudio = (RemuxAudio)i; });
+        for (auto& f : remux_)  // audio tracks follow the new mode; other choices stay
             for (auto it = f.remux.actions.begin(); it != f.remux.actions.end();) {
                 bool audioTrack = false;
                 for (auto& st : f.info.streams) audioTrack = audioTrack || (st.index == it->first && st.isAudio());
@@ -900,8 +923,10 @@ void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
             }
         relayout();
     });
-    std::wstring note = s.remuxPcm ? L"every audio track is decoded to PCM" : L"audio copied bit-for-bit; PCM only where the container cannot hold a track";
-    if (s.remuxPcm) {
+    std::wstring note = s.remuxAudio == RemuxAudio::PCM   ? L"every audio track is decoded to PCM"
+                        : s.remuxAudio == RemuxAudio::AAC ? L"AAC tracks are kept; other audio becomes AAC (lossy)"
+                                                          : L"audio copied bit-for-bit; PCM only where the container cannot hold a track";
+    if (s.remuxAudio == RemuxAudio::PCM) {
         field(x, y, a.left + labelW(), a.right, L"DEPTH", std::wstring(pcmBitsName(s.remuxPcmBits)) + (s.remuxPcmBits == 0 ? L" (lossless)" : L""), [this] {
             std::vector<std::wstring> o = {L"exact (lossless: source depth, float for lossy sources)", L"16-bit", L"24-bit", L"32-bit float"};
             const int b[] = {0, 16, 24, 32};
@@ -912,6 +937,19 @@ void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
             if (r >= 0) updateSetting([&](Settings& st) { st.remuxPcmBits = b[r]; });
             relayout();
         });
+    } else if (s.remuxAudio == RemuxAudio::AAC) {
+        static const int kq[] = {128, 192, 256, 320};
+        auto setQ = [this](int q) {
+            updateSetting([q](Settings& st) { st.remuxAacKbps = q; });
+            relayout();
+        };
+        int qi = 2;
+        for (int i = 0; i < 4; i++)
+            if (s.remuxAacKbps == kq[i]) qi = i;
+        field(x, y, a.left + labelW(), a.right, L"QUALITY", std::to_wstring(s.remuxAacKbps) + L"k", [this, qi, setQ] {
+            int r = popup({L"128k (compact)", L"192k (good)", L"256k (high)", L"320k (maximum)"}, qi);
+            if (r >= 0 && r < 4) setQ(kq[r]);
+        }, [qi, setQ](int n) { setQ(kq[std::clamp(qi - n, 0, 3)]); });
     }
     if (a.right - x > S(120)) text(x, y, note, S_Mid, a.right - x);
     y += rh;
@@ -932,7 +970,7 @@ void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
 
 int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool selected) {
     int rh = rowH();
-    int is = S(36), gap = S(2);
+    int is = S(40), gap = S(6);
     RowId id = r.id;
     auto act = [this, id](void (MainWindow::*fn)(const ListRow&)) {
         return [this, id, fn] { withRow(id, [this, fn](const ListRow& x) { (this->*fn)(x); }); };
@@ -940,7 +978,7 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
 
     if (r.type == ListRow::Head) {  // a playlist: its entries follow
         DlGroup& g = groups_[r.idx];
-        int h = rh + S(14);
+        int h = rh + S(22);
         Item& bg = add(K_Text, RECT{left, y, right, y + h - 1}, L"", S_Click | (selected ? S_Selected : 0));
         bg.click = [this, id] {
             select(0, sel_[0] == id ? RowId{} : id);
@@ -953,7 +991,7 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
         ix = rowIcon(ix, iy, is, I_Close, L"remove the playlist (started entries stay)", act(&MainWindow::removeRow)) - gap;
         ix = rowIcon(ix, iy, is, I_Folder, L"open the download folder", [this] { openFolder(settingsCopy().dlDir); }) - gap;
         ix = rowIcon(ix, iy, is, I_Open, L"open the playlist page", [this, u = g.url] { openUrl(u); }) - gap;
-        ix = rowIcon(ix, iy, is, I_Play, nSel ? L"start the checked entries" : L"", nSel ? std::function<void()>(act(&MainWindow::startRow)) : nullptr);
+        ix = rowIcon(ix, iy, is, I_Download, nSel ? L"download the checked entries" : L"", nSel ? std::function<void()>(act(&MainWindow::startRow)) : nullptr);
         int ty = y + (h - rh) / 2;
         int x = text(left + S(8), ty, L"PLAYLIST", S_Bold) + S(14);
         uint64_t key = g.key;
@@ -1052,6 +1090,7 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
                 status = classTag(t.cls);
                 statusSt = S_Mono | (t.cls == QualityClass::Lossy ? S_Bold : S_Mid);
                 sub = t.result.empty() ? fileName(t.output) : t.result;
+                if (size_t v = sub.find(L"verified:"); v != std::wstring::npos && v > 0) sub = sub.substr(v);  // results from 1.0.4 and earlier
                 break;
         }
         bool active = t.state == TaskState::Running || t.state == TaskState::Paused;
@@ -1095,10 +1134,10 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
             title = g.title;
             thumb = g.info.thumb;
             Selection sl = selectFormats(g.info, dlPrefs(view_));
-            sub = fmtDuration(g.info.duration) + L"  \u00b7  " + (sl.ok ? sl.summary : L"! " + sl.error) + segText(g.segA[0], g.segB[0]);
+            sub = fmtDuration(g.info.duration) + L"  \u00b7  " + (sl.ok ? sl.brief : L"! " + sl.error) + segText(g.segA[0], g.segB[0]);
             status = sl.ok && sl.estBytes > 0 ? L"~" + fmtBytes(sl.estBytes) : L"ready";
-            primaryIcon = I_Play;
-            primaryTip = L"start this download (Space)";
+            primaryIcon = I_Download;
+            primaryTip = L"download (Space)";
             primary = act(&MainWindow::startRow);
         } else {
             const YtEntry& e = g.entries[r.entry];
@@ -1118,8 +1157,8 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
             if (!checked) titleSt = 0;
             sub = std::to_wstring(e.index) + L".  " + fmtDuration(e.duration) + segText(g.segA[r.entry], g.segB[r.entry]);
             status = checked ? L"ready" : L"skipped";
-            primaryIcon = I_Play;
-            primaryTip = L"start this entry now";
+            primaryIcon = I_Download;
+            primaryTip = L"download this entry now";
             primary = act(&MainWindow::startRow);
         }
         openTip = L"open the link";
@@ -1139,11 +1178,11 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
             status = L"cannot read";
             statusSt = S_Bold | S_Mono;
         } else {
-            sub = shortMedia(f.info);
+            sub = briefMedia(f.info);
             status = ready ? L"ready" : L"see tracks";
         }
         if (ready) {
-            primaryIcon = I_Play;
+            primaryIcon = I_Go;
             primaryTip = tab_ == 1 ? L"convert this file (Space)" : L"remux this file (Space)";
             primary = act(&MainWindow::startRow);
         }
@@ -1168,14 +1207,14 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
     ix = rowIcon(ix, iy, is, I_Open, openTip, open) - gap;
     if (primaryIcon >= 0) rowIcon(ix, iy, is, primaryIcon, primaryTip, primary);
     ix -= is;  // the column stays even when there is nothing to start
-    int textRight = ix - S(16);
+    int textRight = ix - S(24);
     int x = left + S(8) + (r.sub > 0 ? S(24) : 0);  // playlist entries sit under their head
     if (checkbox) {
         check(x, y + (h - rh) / 2, checked, onCheck);
-        items_.back().tip = checked ? L"skip this entry in start all" : L"include this entry in start all";
+        items_.back().tip = checked ? L"skip this entry in download all" : L"include this entry in download all";
     }
     if (r.sub > 0) x += S(28);
-    int vw = S(96), vh = S(54);
+    int vw = S(112), vh = S(63);
     RECT vis{x, y + (h - vh) / 2, x + vw, y + (h - vh) / 2 + vh};
     if (tab_ == 0 && (!thumb.empty() || r.type != ListRow::Task)) {
         Item& th = add(K_Thumb, vis);
@@ -1183,14 +1222,14 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
     } else {
         add(K_Chip, vis, chip.empty() ? L"?" : chip);
     }
-    int tx = vis.right + S(14);
-    int line1 = y + (h - rh * 2) / 2 + S(1);
+    int tx = vis.right + S(18);
+    int line1 = y + (h - rh * 2) / 2;
     int sw = status.empty() ? 0 : tw(status, statusSt);
     add(K_Text, RECT{textRight - sw, line1, textRight, line1 + rh}, status, statusSt);
-    text(tx, line1, title, titleSt, textRight - sw - S(16) - tx);
-    add(K_Text, RECT{tx, line1 + rh - S(3), textRight, line1 + rh * 2 - S(3)}, sub, subSt);
+    text(tx, line1, title, titleSt, textRight - sw - S(20) - tx);
+    add(K_Text, RECT{tx, line1 + rh, textRight, line1 + rh * 2}, sub, subSt);
     if (prog > -2) {
-        Item& b = add(K_Progress, RECT{tx, y + h - S(7), textRight, y + h - S(7) + std::max(2, S(3))}, L"", S_Mid);
+        Item& b = add(K_Progress, RECT{tx, y + h - S(10), textRight, y + h - S(10) + std::max(2, S(3))}, L"", S_Mid);
         b.value = prog;
     }
     if (selected) h += buildRowDetail(r, tx, right - S(8), y + h);
@@ -1325,8 +1364,9 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
     // Remux: container advice, then every track with what happens to it.
     RemuxSpec rs = f.remux;
     rs.container = s.remuxContainer;
-    rs.audioPcm = s.remuxPcm;
+    rs.audio = s.remuxAudio;
     rs.pcmBits = s.remuxPcmBits;
+    rs.aacKbps = s.remuxAacKbps;
     ContainerAdvice adv = adviseContainer(s.remuxContainer, f.info);
     if (adv.best != s.remuxContainer) {
         std::wstring t = std::wstring(containerName(s.remuxContainer)) + L" cannot keep " + std::to_wstring(adv.convertible + adv.impossible) +
@@ -1349,9 +1389,9 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
     int boxW = S(220);
     for (auto& st : f.info.streams) {
         auto it = rs.actions.find(st.index);
-        TrackAction act = it != rs.actions.end() ? it->second : defaultAction(s.remuxContainer, st, s.remuxPcm);
+        TrackAction act = it != rs.actions.end() ? it->second : defaultAction(s.remuxContainer, st, s.remuxAudio);
         auto allowed = allowedActions(s.remuxContainer, st);
-        if (std::find(allowed.begin(), allowed.end(), act) == allowed.end()) act = defaultAction(s.remuxContainer, st, s.remuxPcm);
+        if (std::find(allowed.begin(), allowed.end(), act) == allowed.end()) act = defaultAction(s.remuxContainer, st, s.remuxAudio);
         int sid = st.index;
         int ax = right - boxW;
         text(left, y, describeStream(st), (act == TrackAction::Exclude ? S_Mid : 0) | S_Mono, ax - left - S(16));
@@ -1362,16 +1402,18 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
         }
         std::wstring label = trackActionName(act);
         if (act == TrackAction::ToPCM) label = std::wstring(L"PCM ") + pcmBitsName(s.remuxPcmBits);
+        if (act == TrackAction::ToAAC) label = L"AAC " + std::to_wstring(aacKbpsFor(s.remuxAacKbps, std::min(8, st.channels))) + L"k";
         if (fitStream(s.remuxContainer, st) == Fit::No && act == TrackAction::Exclude) label = L"EXCLUDED (cannot fit)";
         Item& ch = add(K_Box, RECT{ax, y + S(3), right, y + rh - S(3)}, label, S_Click | (act == TrackAction::Copy ? 0 : S_Bold));
-        int pcmBits = s.remuxPcmBits;
-        ch.click = [this, key, sid, allowed, act, pcmBits] {
+        int pcmBits = s.remuxPcmBits, aacK = aacKbpsFor(s.remuxAacKbps, std::min(8, st.channels));
+        ch.click = [this, key, sid, allowed, act, pcmBits, aacK] {
             std::vector<std::wstring> o;
             int cur = -1;
             for (size_t i = 0; i < allowed.size(); i++) {
                 std::wstring n = trackActionName(allowed[i]);
                 if (allowed[i] == TrackAction::Copy) n += L" (bit-for-bit)";
                 if (allowed[i] == TrackAction::ToPCM) n = std::wstring(L"PCM ") + pcmBitsName(pcmBits) + (pcmBits == 0 || pcmBits == 32 ? L" (lossless decode)" : L" (rounded)");
+                if (allowed[i] == TrackAction::ToAAC) n = L"AAC " + std::to_wstring(aacK) + L"k (lossy)";
                 if (allowed[i] == TrackAction::ToText) n += L" (mov_text, styling lost)";
                 if (allowed[i] == act) cur = (int)i;
                 o.push_back(n);

@@ -300,6 +300,22 @@ void Painter::icon(int k, const RECT& r, COLORREF c, int size) {
             line(cx, cy - q, cx, cy + q);
             break;
         }
+        case I_Download: {  // an arrow down onto a tray
+            float q = h * 0.82f;
+            float tray = snap(cy + q * 0.86f);
+            line(cx, cy - q, cx, cy + q * 0.42f);
+            PointF a[3] = {PointF(cx - q * 0.52f, cy - q * 0.1f), PointF(cx, cy + q * 0.42f), PointF(cx + q * 0.52f, cy - q * 0.1f)};
+            g.DrawLines(&pen, a, 3);
+            line(cx - q * 0.86f, tray, cx + q * 0.86f, tray);
+            break;
+        }
+        case I_Go: {  // an arrow to the right: start
+            float q = h * 0.78f;
+            line(cx - q, cy, cx + q * 0.9f, cy);
+            PointF a[3] = {PointF(cx + q * 0.28f, cy - q * 0.62f), PointF(cx + q * 0.9f, cy), PointF(cx + q * 0.28f, cy + q * 0.62f)};
+            g.DrawLines(&pen, a, 3);
+            break;
+        }
         // Window buttons: square glyphs of whole pixels, like Windows' own.
         case I_Min: line(cx - h, cy, cx + h, cy); break;
         case I_Max: g.DrawRectangle(&pen, cx - h, cy - h, 2 * h, 2 * h); break;

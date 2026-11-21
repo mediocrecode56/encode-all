@@ -17,6 +17,8 @@ void cleanTmp();
 
 // FFmpeg -progress parser: returns true when the line updated `outSec` or `speed`.
 bool parseFfProgress(const std::string& line, double& outSec, double& speed, bool& end);
+// Every output stream against the plan's expectations (type, codec, size, depth, chroma, channels, rate).
+bool checkExpect(const MediaInfo& out, const std::vector<OutExpect>& expect, std::wstring& err);
 // Hardware-encoder failures that a software retry fixes.
 bool isHwEncoderFailure(const std::string& stderrText);
 

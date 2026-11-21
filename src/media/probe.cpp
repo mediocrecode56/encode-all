@@ -35,6 +35,72 @@ int pixFmtDepth(const std::string& p) {
     return 8;
 }
 
+std::wstring codecLabel(const std::string& c) {
+    static const std::pair<const char*, const wchar_t*> t[] = {
+        {"h264", L"H.264"}, {"hevc", L"H.265"}, {"av1", L"AV1"}, {"vp9", L"VP9"}, {"vp8", L"VP8"}, {"mpeg2video", L"MPEG-2"}, {"mpeg1video", L"MPEG-1"},
+        {"mpeg4", L"MPEG-4"}, {"prores", L"ProRes"}, {"dnxhd", L"DNxHD/HR"}, {"mjpeg", L"MJPEG"}, {"png", L"PNG"}, {"ffv1", L"FFV1"}, {"rawvideo", L"raw"},
+        {"vc1", L"VC-1"}, {"aac", L"AAC"}, {"opus", L"Opus"}, {"mp3", L"MP3"}, {"mp2", L"MP2"}, {"flac", L"FLAC"}, {"alac", L"ALAC"}, {"ac3", L"AC-3"},
+        {"eac3", L"E-AC-3"}, {"dts", L"DTS"}, {"truehd", L"TrueHD"}, {"vorbis", L"Vorbis"}, {"subrip", L"SRT"}, {"mov_text", L"mov_text"},
+        {"ass", L"ASS"}, {"webvtt", L"WebVTT"}, {"hdmv_pgs_subtitle", L"PGS"}, {"dvd_subtitle", L"VobSub"}};
+    for (auto& kv : t)
+        if (c == kv.first) return kv.second;
+    if (startsWith(c, "pcm_")) {
+        if (contains(c, "f32") || contains(c, "f64")) return L"PCM float";
+        int bits = contains(c, "s16") ? 16 : contains(c, "s24") ? 24 : contains(c, "s32") ? 32 : contains(c, "8") ? 8 : 0;
+        return bits ? L"PCM " + std::to_wstring(bits) + L"-bit" : L"PCM";
+    }
+    std::wstring r = widen(c);
+    for (auto& ch : r) ch = (wchar_t)towupper(ch);
+    return r;
+}
+
+std::wstring resolutionLabel(int w, int h, double fps) {
+    static const int std_[] = {4320, 2160, 1440, 1080, 720, 576, 480, 360, 240, 144};
+    int shortSide = std::min(w, h);
+    bool named = false;
+    for (int v : std_) named = named || v == shortSide;
+    std::wstring r = named ? std::to_wstring(shortSide) + L"p" : std::to_wstring(w) + L"x" + std::to_wstring(h);
+    if (fps > 0) {
+        bool whole = std::fabs(fps - std::round(fps)) < 0.01;
+        r += named && whole ? std::to_wstring((int)std::lround(fps)) : L" " + fmtFps(fps) + (named ? L"" : L" fps");
+    }
+    return r;
+}
+
+std::wstring channelsLabel(int ch, const std::string& layout) {
+    if (ch == 1) return L"mono";
+    if (ch == 2) return L"stereo";
+    if (!layout.empty() && layout != "unknown") {
+        std::string l = layout.substr(0, layout.find('('));
+        return widen(l);
+    }
+    return std::to_wstring(ch) + L" ch";
+}
+
+std::wstring briefMedia(const MediaInfo& m) {
+    std::vector<std::wstring> parts;
+    if (const StreamInfo* v = m.video()) {
+        std::wstring s = codecLabel(v->codec) + L" " + resolutionLabel(v->width, v->height, v->fps);
+        if (v->bitDepth > 8) s += L" " + std::to_wstring(v->bitDepth) + L"-bit";
+        if (v->hdr()) s += v->colorTransfer == "arib-std-b67" ? L" HLG" : L" HDR";
+        parts.push_back(s);
+    }
+    int na = m.count("audio");
+    if (const StreamInfo* a = m.audio()) {
+        std::wstring s = codecLabel(a->codec) + L" " + channelsLabel(a->channels, a->layout);
+        if (!m.video() && a->sampleRate && a->sampleRate != 44100 && a->sampleRate != 48000) s += L" " + fmtFixed(a->sampleRate / 1000.0, a->sampleRate % 1000 ? 1 : 0) + L" kHz";
+        if (na > 1) s += L" +" + std::to_wstring(na - 1);
+        parts.push_back(s);
+    }
+    int ns = m.count("subtitle");
+    if (ns) parts.push_back(std::to_wstring(ns) + (ns == 1 ? L" subtitle" : L" subtitles"));
+    if (m.duration > 0) parts.push_back(fmtDuration(m.duration));
+    if (m.size) parts.push_back(fmtBytes((double)m.size));
+    std::wstring r;
+    for (auto& p : parts) r += (r.empty() ? L"" : L"  \u00b7  ") + p;
+    return r;
+}
+
 std::string pixFmtChroma(const std::string& p) {
     if (startsWith(p, "yuv420") || startsWith(p, "yuvj420") || p == "nv12" || p == "p010le" || p == "p016le" || p == "nv21") return "420";
     if (startsWith(p, "yuv422") || startsWith(p, "yuvj422") || p == "y210le" || p == "nv16" || p == "uyvy422" || p == "yuyv422" || p == "v210") return "422";

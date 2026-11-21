@@ -2,6 +2,7 @@
 // first run (tools install into build\data, portable). Run: build\integration_tests.exe [--no-net]
 #include <windows.h>
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -107,6 +108,450 @@ static json::Value remuxSpec(const std::wstring& in, Container c) {
     v.set("outDir", joinPath(gWork, L"out"));
     v.set("remux", r.toJson());
     return v;
+}
+
+// ---------- the conversion matrix ----------
+// Edge-case sources (odd sizes, rotation tags, 10-bit 4:2:2, interlaced, surround, 192 kHz, several
+// audio and subtitle tracks, covers) through every Convert target, audio mode and filter, and every
+// Remux mode. Each output must finish through the app's own verification, decode from start to end
+// without a single error, and match the requested parameters in an independent probe.
+
+static bool decodesClean(const std::wstring& f, std::string& err) {
+    auto c = runCapture(gDeps.ffmpeg(), {L"-v", L"error", L"-i", f, L"-map", L"0:v?", L"-map", L"0:a?", L"-f", L"null", L"-"}, {}, 600000);
+    err = trim(c.err);
+    return c.code == 0 && err.empty();
+}
+
+static const StreamInfo* nth(const MediaInfo& m, const char* type, int n) {
+    for (auto& s : m.streams)
+        if (s.type == type && !s.attachedPic && n-- == 0) return &s;
+    return nullptr;
+}
+
+struct Want {
+    std::wstring ext;
+    std::string vcodec;
+    int w = 0, h = 0, depth = 0;
+    std::string chroma;
+    double fps = 0;
+    std::vector<std::string> acodecs;  // every audio track, in order
+    int ach = 0, asr = 0;              // first audio track
+    int subs = -1, chapters = -1, covers = -1;
+    QualityClass cls = QualityClass::Copy;
+    bool anyClass = false;
+    bool rotationKept = false;
+};
+
+static int gMatrixRun = 0, gMatrixOk = 0;
+
+static void matrixCheck(Queue& q, const std::string& name, TaskKind k, const json::Value& spec, const Want& w) {
+    gMatrixRun++;
+    TaskView t;
+    bool done = runTask(q, k, spec, t);
+    std::vector<std::string> bad;
+    MediaInfo m;
+    if (done) {
+        if (!probeFile(gDeps.ffprobe(), t.output, m)) bad.push_back("does not probe");
+        std::string derr;
+        if (!decodesClean(t.output, derr)) bad.push_back("decode errors: " + derr.substr(0, 200));
+        if (!w.ext.empty() && lower(extension(t.output)) != w.ext) bad.push_back("extension " + narrow(extension(t.output)));
+        if (!w.anyClass && t.cls != w.cls) bad.push_back(std::string("class ") + narrow(className(t.cls)));
+        const StreamInfo* v = m.video();
+        if (!w.vcodec.empty()) {
+            if (!v) bad.push_back("no video");
+            else {
+                if (v->codec != w.vcodec) bad.push_back("video codec " + v->codec);
+                if (w.w && (v->width != w.w || v->height != w.h)) bad.push_back("size " + std::to_string(v->width) + "x" + std::to_string(v->height));
+                if (w.depth && pixFmtDepth(v->pixFmt) != w.depth) bad.push_back("pix " + v->pixFmt);
+                if (!w.chroma.empty() && pixFmtChroma(v->pixFmt) != w.chroma) bad.push_back("chroma " + v->pixFmt);
+                if (w.fps > 0 && std::fabs(v->fps - w.fps) > 0.05) bad.push_back("fps " + std::to_string(v->fps));
+                if (v->rotation && !w.rotationKept) bad.push_back("rotation tag left: " + std::to_string(v->rotation));
+            }
+        } else if (v) {
+            bad.push_back("unexpected video " + v->codec);
+        }
+        int na = m.count("audio");
+        if ((int)w.acodecs.size() != na) bad.push_back("audio tracks " + std::to_string(na));
+        for (int i = 0; i < na && i < (int)w.acodecs.size(); i++) {
+            const StreamInfo* a = nth(m, "audio", i);
+            if (a->codec != w.acodecs[i] && !(startsWith(a->codec, "pcm_") && startsWith(w.acodecs[i], "pcm_") &&
+                                              a->codec.substr(0, a->codec.size() - 2) == w.acodecs[i].substr(0, w.acodecs[i].size() - 2)))
+                bad.push_back("audio " + std::to_string(i) + " codec " + a->codec);
+        }
+        if (const StreamInfo* a = nth(m, "audio", 0)) {
+            if (w.ach && a->channels != w.ach) bad.push_back("channels " + std::to_string(a->channels));
+            if (w.asr && a->sampleRate != w.asr) bad.push_back("rate " + std::to_string(a->sampleRate));
+        }
+        if (w.subs >= 0 && m.count("subtitle") != w.subs) bad.push_back("subtitles " + std::to_string(m.count("subtitle")));
+        if (w.chapters >= 0 && m.chapters != w.chapters) bad.push_back("chapters " + std::to_string(m.chapters));
+        int covers = 0;
+        for (auto& s : m.streams) covers += s.attachedPic;
+        if (w.covers >= 0 && covers != w.covers) bad.push_back("covers " + std::to_string(covers));
+        // Every stream lasts as long as the source (no truncated track, no drift).
+        for (auto& s : m.streams)
+            if ((s.isVideo() || s.isAudio()) && s.duration > 0 && m.duration > 0 && std::fabs(s.duration - m.duration) > 0.25)
+                bad.push_back(s.type + " lasts " + std::to_string(s.duration) + " of " + std::to_string(m.duration));
+    } else {
+        bad.push_back("task failed: " + narrow(t.error));
+    }
+    if (bad.empty()) gMatrixOk++;
+    std::string what = "matrix: " + name;
+    if (!bad.empty()) {
+        what += "  [";
+        for (size_t i = 0; i < bad.size(); i++) what += (i ? "; " : "") + bad[i];
+        what += "]";
+    }
+    CHECK(bad.empty(), what.c_str());
+}
+
+static void convertCase(Queue& q, const std::string& name, const std::wstring& in, const ConvertSpec& cs, const Want& w) {
+    matrixCheck(q, name, TaskKind::Convert, convertSpec(in, cs), w);
+}
+
+static void remuxCase(Queue& q, const std::string& name, const std::wstring& in, Container c, RemuxAudio audio, int bitsOrKbps, const Want& w) {
+    RemuxSpec r;
+    r.container = c;
+    r.audio = audio;
+    if (audio == RemuxAudio::PCM) r.pcmBits = bitsOrKbps;
+    if (audio == RemuxAudio::AAC) r.aacKbps = bitsOrKbps;
+    json::Value v = json::Value::object();
+    v.set("input", in);
+    v.set("outDir", joinPath(gWork, L"out"));
+    v.set("remux", r.toJson());
+    matrixCheck(q, name, TaskKind::Remux, v, w);
+}
+
+static ConvertSpec video(VCodec c, Container k = Container::MP4) {
+    ConvertSpec s;
+    s.vcodec = c;
+    s.container = k;
+    s.quality = 26;
+    s.speed = "veryfast";
+    return s;
+}
+
+static Want vw(const wchar_t* ext, const char* vc, int w, int h, int depth, const char* chroma, std::vector<std::string> ac, QualityClass cls = QualityClass::Lossy) {
+    Want x;
+    x.ext = ext;
+    x.vcodec = vc;
+    x.w = w;
+    x.h = h;
+    x.depth = depth;
+    x.chroma = chroma;
+    x.acodecs = std::move(ac);
+    x.cls = cls;
+    return x;
+}
+
+static void runMatrix(Queue& q) {
+    printf("[matrix: fixtures]\n");
+    std::wstring dir = joinPath(gWork, L"mx");
+    makeDirs(dir);
+    auto F = [&](const wchar_t* n) { return joinPath(dir, n); };
+    std::wstring odd = F(L"odd 321x241.mkv"), rotTmp = F(L"rot-tmp.mp4"), rot = F(L"rotated.mp4"), p422 = F(L"10bit 422 pcm96k 5.1.mov"),
+                 inter = F(L"interlaced.mkv"), multi = F(L"hevc10 multi.mkv"), vp9 = F(L"vp9.webm"), hiFlac = F(L"192k 5.1.flac"), mono = F(L"mono 22k.mp3"),
+                 alac = F(L"alac cover.m4a"), cover = F(L"cover.png"), ass = F(L"s.ass"), srt2 = F(L"s2.srt"), chap = F(L"chap2.txt");
+    writeFileAtomic(ass, "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+                         "MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,28,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n"
+                         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+                         "Dialogue: 0,0:00:00.50,0:00:01.50,Default,,0,0,0,,{\\b1}styled{\\b0} line\n");
+    writeFileAtomic(srt2, "1\n00:00:00,200 --> 00:00:01,800\nsecond track\n");
+    writeFileAtomic(chap, ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1500\ntitle=A\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=1500\nEND=3000\ntitle=B\n");
+    const wchar_t* six = L"aevalsrc=exprs=0.3*sin(440*2*PI*t)|0.3*sin(550*2*PI*t)|0.3*sin(660*2*PI*t)|0.2*sin(60*2*PI*t)|0.3*sin(770*2*PI*t)|0.3*sin(880*2*PI*t)";
+    int code = 0;
+    auto mk = [&](const char* what, std::vector<std::wstring> args) {
+        std::vector<std::wstring> a = {L"-v", L"error", L"-y"};
+        a.insert(a.end(), args.begin(), args.end());
+        ff(a, &code);
+        CHECK(code == 0, what);
+    };
+    mk("odd 321x241 FFV1 4:2:0 + MP3 stereo 44.1 kHz in MKV",
+       {L"-f", L"lavfi", L"-i", L"testsrc=s=321x241:r=25:d=3", L"-f", L"lavfi", L"-i", L"sine=f=440:d=3:sample_rate=44100", L"-ac", L"2", L"-c:v", L"ffv1",
+        L"-pix_fmt", L"yuv420p", L"-c:a", L"libmp3lame", L"-b:a", L"192k", L"-shortest", odd});
+    mk("640x360 H.264 + AAC with a 90 degree rotation tag",
+       {L"-f", L"lavfi", L"-i", L"testsrc2=s=640x360:r=30:d=3", L"-f", L"lavfi", L"-i", L"sine=f=440:d=3:sample_rate=48000", L"-c:v", L"libx264", L"-preset",
+        L"veryfast", L"-pix_fmt", L"yuv420p", L"-c:a", L"aac", L"-shortest", rotTmp});
+    mk("rotation tag applied", {L"-display_rotation", L"90", L"-i", rotTmp, L"-c", L"copy", rot});
+    mk("10-bit 4:2:2 H.264 + PCM 24-bit 96 kHz 5.1(side) in MOV",
+       {L"-f", L"lavfi", L"-i", L"testsrc2=s=640x360:r=24000/1001:d=3", L"-f", L"lavfi", L"-i", std::wstring(six) + L":s=96000:c=5.1(side):d=3", L"-c:v", L"libx264",
+        L"-preset", L"veryfast", L"-pix_fmt", L"yuv422p10le", L"-c:a", L"pcm_s24le", L"-shortest", p422});
+    mk("interlaced MPEG-2 720x576 TFF + AC-3 5.1 in MKV",
+       {L"-f", L"lavfi", L"-i", L"testsrc2=s=720x576:r=25:d=3", L"-f", L"lavfi", L"-i", std::wstring(six) + L":s=48000:c=5.1(side):d=3", L"-c:v", L"mpeg2video",
+        L"-vf", L"setfield=tff", L"-flags", L"+ilme+ildct", L"-field_order", L"tt", L"-b:v", L"4M", L"-c:a", L"ac3", L"-b:a", L"384k", L"-shortest", inter});
+    mk("10-bit HEVC + Opus 5.1 + FLAC 192 kHz + ASS + SRT + chapters in MKV",
+       {L"-f", L"lavfi", L"-i", L"testsrc2=s=640x360:r=30:d=3", L"-f", L"lavfi", L"-i", std::wstring(six) + L":s=48000:c=5.1:d=3", L"-f", L"lavfi", L"-i",
+        L"sine=f=300:d=3:sample_rate=192000", L"-i", ass, L"-i", srt2, L"-f", L"ffmetadata", L"-i", chap, L"-map", L"0", L"-map", L"1", L"-map", L"2", L"-map", L"3",
+        L"-map", L"4", L"-map_chapters", L"5", L"-c:v", L"libx265", L"-preset", L"ultrafast", L"-pix_fmt", L"yuv420p10le", L"-x265-params", L"log-level=error",
+        L"-c:a:0", L"libopus", L"-b:a:0", L"256k", L"-c:a:1", L"flac", L"-ac:a:1", L"2", L"-sample_fmt:a:1", L"s32", L"-bits_per_raw_sample:a:1", L"24",
+        L"-c:s:0", L"ass", L"-c:s:1", L"srt", L"-shortest", multi});
+    mk("VP9 + Vorbis in WebM",
+       {L"-f", L"lavfi", L"-i", L"testsrc2=s=426x240:r=30:d=3", L"-f", L"lavfi", L"-i", L"sine=f=500:d=3:sample_rate=48000", L"-ac", L"2", L"-c:v", L"libvpx-vp9",
+        L"-deadline", L"realtime", L"-cpu-used", L"8", L"-b:v", L"400k", L"-c:a", L"libvorbis", L"-shortest", vp9});
+    mk("FLAC 24-bit 192 kHz 5.1",
+       {L"-f", L"lavfi", L"-i", std::wstring(six) + L":s=192000:c=5.1(side):d=3", L"-c:a", L"flac", L"-sample_fmt", L"s32", L"-bits_per_raw_sample", L"24", hiFlac});
+    mk("MP3 mono 22.05 kHz", {L"-f", L"lavfi", L"-i", L"sine=f=700:d=3:sample_rate=22050", L"-c:a", L"libmp3lame", L"-b:a", L"64k", mono});
+    mk("cover PNG", {L"-f", L"lavfi", L"-i", L"testsrc2=s=300x300:d=1", L"-frames:v", L"1", cover});
+    mk("ALAC stereo with a PNG cover in M4A",
+       {L"-f", L"lavfi", L"-i", L"sine=f=600:d=3:sample_rate=44100", L"-i", cover, L"-map", L"0", L"-map", L"1", L"-ac", L"2", L"-c:a", L"alac", L"-c:v", L"copy",
+        L"-disposition:v", L"attached_pic", alac});
+    MediaInfo pm;
+    probeFile(gDeps.ffprobe(), odd, pm);
+    CHECK(pm.video() && pm.video()->width == 321 && pm.video()->height == 241, "odd fixture really is 321x241");
+    probeFile(gDeps.ffprobe(), inter, pm);
+    CHECK(pm.video() && (pm.video()->fieldOrder == "tt" || pm.video()->fieldOrder == "tb"), "interlaced fixture probes as top field first");
+    probeFile(gDeps.ffprobe(), rot, pm);
+    CHECK(pm.video() && std::abs(pm.video()->rotation) == 90, "rotated fixture carries the tag");
+
+    printf("[matrix: convert]\n");
+    using QC = QualityClass;
+    // Odd sizes: 4:2:0 encoders crop to even; 4:2:2 crops the width only; MP3 audio fits MP4.
+    convertCase(q, "odd FFV1 -> H.264 MP4 (cropped to 320x240, MP3 copied)", odd, video(VCodec::H264), vw(L".mp4", "h264", 320, 240, 8, "420", {"mp3"}));
+    {
+        ConvertSpec s = video(VCodec::H265);
+        s.rate = RateMode::Lossless;
+        convertCase(q, "odd FFV1 -> H.265 lossless (crop makes it LOSSY)", odd, s, vw(L".mp4", "hevc", 320, 240, 8, "420", {"mp3"}));
+    }
+    convertCase(q, "odd FFV1 -> DNxHR HQ MOV (DNxHR needs even sides: cropped)", odd, video(VCodec::DNxHR_HQ, Container::MOV), vw(L".mov", "dnxhd", 320, 240, 8, "422", {"mp3"}));
+    {
+        ConvertSpec s = video(VCodec::H264);
+        s.pixFmt = "yuv422p";
+        convertCase(q, "odd FFV1 -> H.264 8-bit 4:2:2 (cropped to even sides)", odd, s, vw(L".mp4", "h264", 320, 240, 8, "422", {"mp3"}));
+        s.pixFmt = "yuv444p";
+        convertCase(q, "odd FFV1 -> H.264 4:4:4 (odd size kept)", odd, s, vw(L".mp4", "h264", 321, 241, 8, "444", {"mp3"}));
+    }
+    {
+        ConvertSpec s = video(VCodec::H264, Container::MOV);
+        s.acodec = ACodec::PCM;
+        s.pcmBits = 16;
+        Want w = vw(L".mov", "h264", 320, 240, 8, "420", {"pcm_s16le"});
+        w.asr = 44100;
+        convertCase(q, "odd FFV1 -> H.264 MOV + PCM 16-bit", odd, s, w);
+        s.vcodec = VCodec::Copy;
+        s.container = Container::MP4;
+        Plan p;
+        MediaInfo om;
+        probeFile(gDeps.ffprobe(), odd, om);
+        p = planConvert(om, s, EncoderCaps());
+        CHECK(!p.ok && p.error.find(L"cannot be copied") != std::wstring::npos, "matrix: FFV1 copy into MP4 is refused before it starts");
+    }
+    // Rotation: the tag is applied; sizes follow the turned picture.
+    {
+        ConvertSpec s = video(VCodec::H264);
+        s.height = 720;
+        convertCase(q, "rotated -> H.264 720p (upright 406x720)", rot, s, vw(L".mp4", "h264", 406, 720, 8, "420", {"aac"}));
+        s = video(VCodec::H265);
+        s.rotate = 1;
+        convertCase(q, "rotated -> H.265 + rotate 90 cw (back to 640x360)", rot, s, vw(L".mp4", "hevc", 640, 360, 8, "420", {"aac"}));
+    }
+    // 10-bit 4:2:2 with 96 kHz 5.1 PCM.
+    {
+        Want w = vw(L".mp4", "hevc", 640, 360, 10, "422", {"pcm_s24le"});
+        w.ach = 6;
+        w.asr = 96000;
+        convertCase(q, "10-bit 4:2:2 -> H.265 MP4 (4:2:2 10-bit kept, PCM copied)", p422, video(VCodec::H265), w);
+        ConvertSpec s = video(VCodec::H264);
+        s.acodec = ACodec::AAC;
+        s.aacKbps = 256;
+        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"aac"});
+        w.ach = 6;
+        w.asr = 96000;
+        convertCase(q, "10-bit 4:2:2 -> H.264 MP4 + AAC 256 (5.1 at 96 kHz)", p422, s, w);
+        convertCase(q, "10-bit 4:2:2 -> DNxHR HQX MOV", p422, video(VCodec::DNxHR_HQX, Container::MOV), vw(L".mov", "dnxhd", 640, 360, 10, "422", {"pcm_s24le"}));
+        convertCase(q, "10-bit 4:2:2 -> DNxHR 444 MOV", p422, video(VCodec::DNxHR_444, Container::MOV), vw(L".mov", "dnxhd", 640, 360, 10, "444", {"pcm_s24le"}));
+        convertCase(q, "10-bit 4:2:2 -> DNxHR LB MOV (8-bit 4:2:2)", p422, video(VCodec::DNxHR_LB, Container::MOV), vw(L".mov", "dnxhd", 640, 360, 8, "422", {"pcm_s24le"}));
+        s = video(VCodec::H264, Container::MOV);
+        s.rate = RateMode::Lossless;
+        TaskView t;
+        CHECK(runTask(q, TaskKind::Convert, convertSpec(p422, s), t) && t.cls == QC::Lossless && decodedVideo(t.output) == decodedVideo(p422) &&
+                  decodedAudio(t.output) == decodedAudio(p422),
+              "matrix: 10-bit 4:2:2 -> H.264 lossless MOV: frames and samples identical");
+        s = video(VCodec::H265);
+        s.pixFmt = "yuv420p";
+        s.width = 1280;
+        s.height = 720;
+        s.fps = 30;
+        w = vw(L".mp4", "hevc", 1280, 720, 8, "420", {"pcm_s24le"});
+        w.fps = 30;
+        convertCase(q, "10-bit 4:2:2 -> H.265 8-bit 4:2:0 720p 30 fps", p422, s, w);
+        s = video(VCodec::H264);
+        s.channels = 2;
+        s.loudness = 1;
+        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"aac"});
+        w.ach = 2;
+        w.asr = 96000;
+        convertCase(q, "10-bit 4:2:2 -> H.264 + stereo downmix + loudness -23 (AAC)", p422, s, w);
+    }
+    // Interlaced MPEG-2 with AC-3 5.1.
+    {
+        ConvertSpec s = video(VCodec::H264);
+        s.deinterlace = 1;
+        Want w = vw(L".mp4", "h264", 720, 576, 8, "420", {"ac3"});
+        w.fps = 25;
+        w.ach = 6;
+        convertCase(q, "interlaced -> H.264 + deinterlace auto (AC-3 copied)", inter, s, w);
+        s.deinterlace = 3;
+        s.vcodec = VCodec::H265;
+        w.vcodec = "hevc";
+        w.fps = 50;
+        convertCase(q, "interlaced -> H.265 + deinterlace double rate (50 fps)", inter, s, w);
+        s = video(VCodec::H264);
+        s.denoise = 2;
+        s.sharpen = 1;
+        s.rotate = 3;
+        s.channels = 2;
+        w = vw(L".mp4", "h264", 720, 576, 8, "420", {"aac"});
+        w.ach = 2;
+        w.asr = 48000;
+        convertCase(q, "interlaced -> H.264 + denoise + sharpen + 180 + stereo", inter, s, w);
+    }
+    // Several tracks: Opus 5.1, FLAC 192 kHz, ASS, SRT, chapters.
+    {
+        Want w = vw(L".mp4", "h264", 640, 360, 10, "420", {"opus", "flac"});
+        w.subs = 2;
+        w.chapters = 2;
+        convertCase(q, "multi -> H.264 MP4 (Opus and FLAC copied, ASS and SRT as mov_text, chapters)", multi, video(VCodec::H264), w);
+        ConvertSpec s = video(VCodec::H265, Container::MOV);
+        w = vw(L".mov", "hevc", 640, 360, 10, "420", {"pcm_f32le", "pcm_s24le"});
+        w.subs = 2;
+        w.ach = 6;
+        convertCase(q, "multi -> H.265 MOV (Opus and FLAC to exact PCM)", multi, s, w);
+        s = video(VCodec::Copy);
+        s.acodec = ACodec::AAC;
+        s.aacKbps = 192;
+        s.keepSubs = false;
+        w = vw(L".mp4", "hevc", 640, 360, 10, "420", {"aac", "aac"});
+        w.ach = 6;
+        w.subs = 0;
+        convertCase(q, "multi -> copy video MP4 + AAC 192 (5.1 and 192 kHz stereo), no subtitles", multi, s, w);
+    }
+    // VP9 + Vorbis.
+    {
+        Want w = vw(L".mp4", "h264", 426, 240, 8, "420", {"pcm_f32le"});
+        convertCase(q, "VP9 -> H.264 MP4 (Vorbis cannot be copied: exact PCM)", vp9, video(VCodec::H264), w);
+        ConvertSpec s = video(VCodec::Copy);
+        s.acodec = ACodec::AAC;
+        s.aacKbps = 128;
+        w = vw(L".mp4", "vp9", 426, 240, 8, "420", {"aac"});
+        w.ach = 2;
+        convertCase(q, "VP9 -> copy video MP4 + AAC 128", vp9, s, w);
+        s = video(VCodec::H265);
+        s.rate = RateMode::Bitrate;
+        s.mbps = 1;
+        w = vw(L".mp4", "hevc", 426, 240, 8, "420", {"pcm_f32le"});
+        convertCase(q, "VP9 -> H.265 1 Mb/s", vp9, s, w);
+    }
+    // Audio targets.
+    {
+        auto aw = [](const wchar_t* ext, const char* c, int ch, int sr, QualityClass cls, int covers = 0) {
+            Want w;
+            w.ext = ext;
+            w.acodecs = {c};
+            w.ach = ch;
+            w.asr = sr;
+            w.cls = cls;
+            w.covers = covers;
+            return w;
+        };
+        ConvertSpec a;
+        a.audio = AudioTarget::MP3;
+        convertCase(q, "192 kHz 5.1 FLAC -> MP3 320 (stereo, 48 kHz)", hiFlac, a, aw(L".mp3", "mp3", 2, 48000, QC::Lossy));
+        a.mp3Vbr = true;
+        a.mp3Quality = 2;
+        convertCase(q, "192 kHz 5.1 FLAC -> MP3 VBR V2", hiFlac, a, aw(L".mp3", "mp3", 2, 48000, QC::Lossy));
+        a = ConvertSpec();
+        a.audio = AudioTarget::WAV;
+        TaskView t;
+        CHECK(runTask(q, TaskKind::Convert, convertSpec(hiFlac, a), t) && t.cls == QC::Lossless && decodedAudio(t.output) == decodedAudio(hiFlac),
+              "matrix: 192 kHz 5.1 FLAC -> WAV: samples identical");
+        a.audio = AudioTarget::FLAC;
+        a.flacLevel = 5;
+        convertCase(q, "192 kHz 5.1 FLAC -> FLAC 5 (exact)", hiFlac, a, aw(L".flac", "flac", 6, 192000, QC::Lossless));
+        a.audio = AudioTarget::WAV;
+        a.loudness = 3;
+        convertCase(q, "192 kHz 5.1 FLAC -> WAV + loudness -14 (keeps 192 kHz)", hiFlac, a, aw(L".wav", "pcm_s24le", 6, 192000, QC::Lossy));
+        a = ConvertSpec();
+        a.audio = AudioTarget::MP3;
+        convertCase(q, "mono MP3 -> MP3 (copied)", mono, a, aw(L".mp3", "mp3", 1, 22050, QC::Copy));
+        a.audio = AudioTarget::FLAC;
+        a.sampleRate = 48000;
+        convertCase(q, "mono MP3 -> FLAC 48 kHz (resampled)", mono, a, aw(L".flac", "flac", 1, 48000, QC::Lossy));
+        a = ConvertSpec();
+        a.audio = AudioTarget::MP3;
+        convertCase(q, "ALAC with cover -> MP3 (cover kept)", alac, a, aw(L".mp3", "mp3", 2, 44100, QC::Lossy, 1));
+        a.audio = AudioTarget::FLAC;
+        convertCase(q, "ALAC with cover -> FLAC (exact, cover kept)", alac, a, aw(L".flac", "flac", 2, 44100, QC::Lossless, 1));
+        a.audio = AudioTarget::WAV;
+        convertCase(q, "ALAC with cover -> WAV (cover dropped)", alac, a, aw(L".wav", "pcm_s16le", 2, 44100, QC::Lossless, 0));
+        a = ConvertSpec();
+        a.audio = AudioTarget::WAV;
+        convertCase(q, "multi -> WAV (default track: Opus 5.1 as float)", multi, a, aw(L".wav", "pcm_f32le", 6, 48000, QC::Lossless));
+    }
+
+    printf("[matrix: fastest encoder]\n");
+    {
+        // Auto takes the graphics encoder when there is one: sizes and codecs must hold there too.
+        gSettings.encoder = Accel::Auto;
+        auto any = [](const char* vc, int w, int h, std::vector<std::string> ac) {
+            Want x = vw(L".mp4", vc, w, h, 0, "", std::move(ac));
+            x.anyClass = true;
+            return x;
+        };
+        convertCase(q, "fastest: 10-bit 4:2:2 -> H.265", p422, video(VCodec::H265), any("hevc", 640, 360, {"pcm_s24le"}));
+        convertCase(q, "fastest: odd FFV1 -> H.264 (cropped)", odd, video(VCodec::H264), any("h264", 320, 240, {"mp3"}));
+        ConvertSpec s = video(VCodec::H265);
+        s.height = 720;
+        convertCase(q, "fastest: rotated -> H.265 720p", rot, s, any("hevc", 406, 720, {"aac"}));
+        s = video(VCodec::H264);
+        s.deinterlace = 1;
+        s.rate = RateMode::Bitrate;
+        s.mbps = 3;
+        convertCase(q, "fastest: interlaced -> H.264 3 Mb/s, deinterlaced", inter, s, any("h264", 720, 576, {"ac3"}));
+        gSettings.encoder = Accel::Software;
+    }
+
+    printf("[matrix: remux]\n");
+    {
+        Want w = vw(L".mp4", "hevc", 640, 360, 10, "420", {"opus", "flac"}, QC::Copy);
+        w.subs = 2;
+        w.chapters = 2;
+        w.anyClass = true;  // the subtitles become mov_text (text conversion), the streams are copied
+        remuxCase(q, "multi -> MP4 original", multi, Container::MP4, RemuxAudio::Original, 0, w);
+        w = vw(L".mov", "hevc", 640, 360, 10, "420", {"pcm_f32le", "pcm_s24le"}, QC::Lossless);
+        w.subs = 2;
+        w.chapters = 2;
+        remuxCase(q, "multi -> MOV original (Opus, FLAC to exact PCM)", multi, Container::MOV, RemuxAudio::Original, 0, w);
+        w = vw(L".mp4", "hevc", 640, 360, 10, "420", {"aac", "aac"});
+        w.ach = 6;
+        w.subs = 2;
+        remuxCase(q, "multi -> MP4 AAC 192 (Opus 5.1 and FLAC 192 kHz)", multi, Container::MP4, RemuxAudio::AAC, 192, w);
+        w = vw(L".mp4", "hevc", 640, 360, 10, "420", {"pcm_s16le", "pcm_s16le"});
+        w.subs = 2;
+        remuxCase(q, "multi -> MP4 PCM 16-bit", multi, Container::MP4, RemuxAudio::PCM, 16, w);
+        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"pcm_s24le"}, QC::Copy);
+        w.ach = 6;
+        w.asr = 96000;
+        remuxCase(q, "10-bit 4:2:2 MOV -> MP4 original (PCM copied)", p422, Container::MP4, RemuxAudio::Original, 0, w);
+        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"aac"});
+        w.ach = 6;
+        w.asr = 96000;
+        remuxCase(q, "10-bit 4:2:2 MOV -> MP4 AAC 320 (5.1)", p422, Container::MP4, RemuxAudio::AAC, 320, w);
+        w = vw(L".mp4", "mpeg2video", 720, 576, 8, "420", {"ac3"}, QC::Copy);
+        w.ach = 6;
+        remuxCase(q, "interlaced MKV -> MP4 original", inter, Container::MP4, RemuxAudio::Original, 0, w);
+        w = vw(L".mov", "mpeg2video", 720, 576, 8, "420", {"aac"});
+        remuxCase(q, "interlaced MKV -> MOV AAC 256 (AC-3 to AAC)", inter, Container::MOV, RemuxAudio::AAC, 256, w);
+        w = vw(L".mp4", "h264", 0, 0, 8, "420", {"aac"}, QC::Copy);
+        w.rotationKept = true;  // copied: the stored 640x360 keeps its rotation tag
+        remuxCase(q, "rotated -> MP4 AAC (AAC already: copied, rotation tag kept)", rot, Container::MP4, RemuxAudio::AAC, 256, w);
+        Want a;
+        a.ext = L".mp4";
+        a.acodecs = {"aac"};
+        a.covers = 1;
+        a.cls = QC::Lossy;
+        remuxCase(q, "ALAC with cover -> MP4 AAC (cover kept)", alac, Container::MP4, RemuxAudio::AAC, 256, a);
+    }
+    printf("  matrix: %d of %d outputs correct\n", gMatrixOk, gMatrixRun);
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -259,6 +704,8 @@ int wmain(int argc, wchar_t** argv) {
     au.audio = AudioTarget::WAV;
     CHECK(runTask(q, TaskKind::Convert, convertSpec(b, au), t), "MKV FLAC track -> WAV finished");
     CHECK(decodedAudio(t.output) == decodedAudio(b), "MKV FLAC -> WAV identical");
+
+    runMatrix(q);
 
     printf("[queue control]\n");
     {

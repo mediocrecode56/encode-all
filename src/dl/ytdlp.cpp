@@ -292,6 +292,10 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
                     (prefs.out == DlOut::AudioOriginal ? s.ext.substr(1) + L" (as it comes, bit-for-bit)"
                      : prefs.out == DlOut::AudioMP3   ? std::wstring(L"MP3 320 kb/s (lossy)")
                                                       : std::wstring(L"WAV (exact decode)"));
+        s.brief = codecLabel(ac) + L" \u2192 " +
+                  (prefs.out == DlOut::AudioOriginal ? std::wstring(containerName(s.container)) + L" copy"
+                   : prefs.out == DlOut::AudioMP3    ? std::wstring(L"MP3 320k")
+                                                     : std::wstring(L"WAV"));
         s.estBytes = s.a.bytes(info.duration);
         s.ok = true;
         return s;
@@ -330,6 +334,8 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
     if (useCombo && ve != "mp4" && ve != "webm") s.ext = L"." + W(ve);
     if (s.ext.empty()) s.ext = containerExt(s.container);
     std::wstring streams = describeV(s.v) + (s.audioId.empty() ? L"" : L" + " + describeA(s.a));
+    s.brief = (s.v.height ? resolutionLabel(s.v.width ? s.v.width : s.v.height * 16 / 9, s.v.height, s.v.fps) + L" " : L"") + codecLabel(vc) +
+              (hdr(s.v) ? L" HDR" : L"") + (ac.empty() ? L"" : L" + " + codecLabel(ac));
     if (prefs.out == DlOut::MP4 || prefs.out == DlOut::MOV) {
         bool mov = prefs.out == DlOut::MOV;
         s.finalExt = mov ? L".mov" : L".mp4";
@@ -341,6 +347,8 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
         std::wstring aTo = mov ? L"PCM exact" : L"AAC 320k";
         std::wstring what = (vCopy ? codec + L" copied" : crf) + (ac.empty() ? L"" : aCopy ? L" + " + W(ac) + L" copied" : L" + " + aTo);
         s.summary = streams + (mov ? L" -> MOV (" : L" -> MP4 (") + what + L")";
+        std::wstring to = (vCopy ? std::wstring() : crf) + (ac.empty() || aCopy ? L"" : (vCopy ? L"" : L" + ") + (mov ? std::wstring(L"PCM") : std::wstring(L"AAC")));
+        s.brief += (mov ? L" \u2192 MOV " : L" \u2192 MP4 ") + (to.empty() ? std::wstring(L"copy") : to);
         if (!vCopy || !aCopy)
             s.notes.push_back(L"Converted after download: " + std::wstring(vCopy ? L"" : L"video " + W(vc) + L" -> " + crf) + (!vCopy && !aCopy ? L", " : L"") +
                               (aCopy ? L"" : L"audio " + W(ac) + L" -> " + aTo) + L". Original keeps the source bit-for-bit.");
@@ -349,6 +357,7 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
     } else {
         s.finalExt = s.ext;
         s.summary = streams + L" -> " + std::wstring(containerName(s.container)) + L" (as it comes, bit-for-bit)";
+        s.brief += L" \u2192 " + std::wstring(containerName(s.container)) + L" copy";
     }
     if (useCombo && bestV && bestA) s.notes.push_back(L"A combined stream has the highest resolution here.");
     s.estBytes = s.v.bytes(info.duration) + (s.audioId.empty() ? 0 : s.a.bytes(info.duration));

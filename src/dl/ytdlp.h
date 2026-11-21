@@ -69,7 +69,8 @@ struct Selection {
     std::wstring ext;              // extension of the bit-exact download (".mkv", ".m4a")
     std::wstring finalExt;         // extension after the optional MP4/MOV conversion
     bool needsConvert = false;
-    std::wstring summary;          // "1080p60 HDR10 av1 + opus 160 kb/s -> MP4 (copy)"
+    std::wstring summary;          // "1080p60 HDR10 av1 + opus 160 kb/s -> MP4 (copy)" (log)
+    std::wstring brief;            // "1080p60 VP9 + Opus \u2192 MP4 H.264 CRF 16 + AAC" (list row)
     std::vector<std::wstring> notes;
     double estBytes = 0;
     std::string formatSpec() const;  // "399+251"

@@ -137,9 +137,87 @@ static void deleteDownloadLeftovers(const std::wstring& dir, const std::wstring&
     FindClose(h);
 }
 
+static std::wstring lastLines(const std::string& text, int n) {
+    auto lines = split(text, '\n');
+    std::string r;
+    int start = std::max(0, (int)lines.size() - n);
+    for (int i = start; i < (int)lines.size(); i++)
+        if (!trim(lines[i]).empty()) r += trim(lines[i]) + " ";
+    return widen(trim(r));
+}
+
+static std::string hex32(unsigned v) {
+    char b[16];
+    snprintf(b, sizeof b, "%08X", v);
+    return b;
+}
+
+// PCM codecs match whatever byte order the container stores (MP4 lpcm can read back as either).
+static bool sameCodec(const std::string& a, const std::string& b) {
+    if (a == b) return true;
+    if (startsWith(a, "pcm_") && startsWith(b, "pcm_") && a.size() == b.size() && a.size() > 2) return a.substr(0, a.size() - 2) == b.substr(0, b.size() - 2);
+    return false;
+}
+
+// Every output stream is what the plan asked for: type, codec, size, depth, chroma, channels, rate.
+bool checkExpect(const MediaInfo& out, const std::vector<OutExpect>& ex, std::wstring& err) {
+    err.clear();
+    std::vector<const StreamInfo*> got;
+    for (auto& s : out.streams)
+        if (s.type != "data") got.push_back(&s);
+    if (got.size() != ex.size()) {
+        err = L"Output has " + std::to_wstring(got.size()) + L" streams, the plan wrote " + std::to_wstring(ex.size());
+        return false;
+    }
+    for (size_t i = 0; i < ex.size(); i++) {
+        const OutExpect& e = ex[i];
+        const StreamInfo& s = *got[i];
+        std::wstring at = L"stream " + std::to_wstring(i) + L" (" + widen(s.type) + L" " + widen(s.codec) + L")";
+        if (s.type != e.type) err = at + L" should be " + widen(e.type);
+        else if (!e.codec.empty() && !sameCodec(s.codec, e.codec)) err = at + L" should be " + widen(e.codec);
+        else if (e.width && (s.width != e.width || s.height != e.height))
+            err = at + L" is " + std::to_wstring(s.width) + L"x" + std::to_wstring(s.height) + L", planned " + std::to_wstring(e.width) + L"x" + std::to_wstring(e.height);
+        else if (e.depth && pixFmtDepth(s.pixFmt) != e.depth) err = at + L" is " + widen(s.pixFmt) + L", planned " + std::to_wstring(e.depth) + L"-bit";
+        else if (!e.chroma.empty() && pixFmtChroma(s.pixFmt) != e.chroma) err = at + L" is " + widen(s.pixFmt) + L", planned 4:" + widen(e.chroma.substr(1));
+        else if (e.channels && s.channels != e.channels) err = at + L" has " + std::to_wstring(s.channels) + L" channels, planned " + std::to_wstring(e.channels);
+        else if (e.sampleRate && s.sampleRate != e.sampleRate) err = at + L" is " + std::to_wstring(s.sampleRate) + L" Hz, planned " + std::to_wstring(e.sampleRate);
+        if (!err.empty()) return false;
+    }
+    return true;
+}
+
+// The start and the end of every video and audio stream decode (a file that opens can still be unplayable).
+// A decoder that crashes (an exception status, not an FFmpeg error) runs once more: on an unstable PC a
+// good file must not be thrown away, and a broken one fails again.
+static bool decodeCheck(RunCtx& c, const std::wstring& path, double dur, std::wstring& err) {
+    for (int pass = 0; pass < (dur > 12 ? 2 : 1); pass++) {
+        std::vector<std::wstring> a = {L"-hide_banner", L"-nostdin", L"-v", L"error"};
+        if (pass == 1) a.insert(a.end(), {L"-sseof", L"-5"});
+        a.insert(a.end(), {L"-i", path, L"-map", L"0:v?", L"-map", L"0:a?", L"-t", L"5", L"-f", L"null", L"-"});
+        for (int attempt = 0; attempt < 2; attempt++) {
+            Capture r = runCapture(c.deps.ffmpeg(), a, {}, 300000, &c.t.cancel);
+            if (c.canceled()) {
+                err = L"Canceled";
+                return false;
+            }
+            if (r.started && r.code == 0) break;
+            bool crashed = r.started && (unsigned)r.code >= 0xC0000000u;
+            if (crashed && attempt == 0) {
+                c.log(L"the decoder crashed (exit 0x" + widen(hex32((unsigned)r.code)) + L"); checking again");
+                continue;
+            }
+            std::wstring why = r.started ? lastLines(r.err, 2) : r.startError;
+            if (why.empty()) why = L"FFmpeg exit code 0x" + widen(hex32((unsigned)r.code));
+            err = L"Output does not decode: " + why;
+            return false;
+        }
+    }
+    return true;
+}
+
 // Checks the written file against the plan; fills `summary` with what was confirmed.
 static bool verify(RunCtx& c, const std::wstring& path, int expectStreams, double expectDur, const std::vector<std::string>& expectCodecs,
-                   MediaInfo& out, std::wstring& summary, std::wstring& err) {
+                   MediaInfo& out, std::wstring& summary, std::wstring& err, const std::vector<OutExpect>* expect = nullptr) {
     if (!probeFile(c.deps.ffprobe(), path, out, &c.t.cancel)) {
         err = L"Output does not open: " + out.error;
         return false;
@@ -151,6 +229,7 @@ static bool verify(RunCtx& c, const std::wstring& path, int expectStreams, doubl
         err = L"Output has " + std::to_wstring(n) + L" streams, expected " + std::to_wstring(expectStreams);
         return false;
     }
+    if (expect && !expect->empty() && !checkExpect(out, *expect, err)) return false;
     for (auto& codec : expectCodecs) {
         bool found = false;
         for (auto& s : out.streams) found = found || s.codec == codec;
@@ -166,6 +245,7 @@ static bool verify(RunCtx& c, const std::wstring& path, int expectStreams, doubl
             return false;
         }
     }
+    if (!decodeCheck(c, path, out.duration, err)) return false;
     summary = L"verified: " + std::to_wstring(n) + L" streams, " + fmtDuration(out.duration) + L", " + fmtBytes((double)fileSize(path));
     return true;
 }
@@ -177,15 +257,6 @@ static bool finalizeTmp(const std::wstring& tmp, std::wstring& finalPath) {
         finalPath = uniquePath(finalPath);
     }
     return false;
-}
-
-static std::wstring lastLines(const std::string& text, int n) {
-    auto lines = split(text, '\n');
-    std::string r;
-    int start = std::max(0, (int)lines.size() - n);
-    for (int i = start; i < (int)lines.size(); i++)
-        if (!trim(lines[i]).empty()) r += trim(lines[i]) + " ";
-    return widen(trim(r));
 }
 
 // Runs FFmpeg for a planned job: progress, cancel, verification and the final rename.
@@ -252,7 +323,12 @@ static RunResult runFfmpegPlan(RunCtx& c, const std::wstring& input, const Media
         for (auto& s : src.streams)
             if (s.index == idx) codecs.push_back(s.codec);
     std::wstring summary, verr;
-    if (!verify(c, tmp, plan.outStreams, dur, codecs, outInfo, summary, verr)) {
+    c.log(L"verifying " + std::to_wstring(plan.expect.size()) + L" streams against the plan, then decoding the start and the end");
+    if (!verify(c, tmp, plan.outStreams, dur, codecs, outInfo, summary, verr, &plan.expect)) {
+        if (c.canceled()) {
+            DeleteFileW(tmp.c_str());
+            return fail(L"Canceled");
+        }
         DeleteFileW(tmp.c_str());
         return fail(L"Verification failed: " + verr, L"Nothing was kept. Open the log, then Retry.");
     }
@@ -262,9 +338,10 @@ static RunResult runFfmpegPlan(RunCtx& c, const std::wstring& input, const Media
         return fail(L"Could not rename the finished file into place.");
     }
     double secs = (GetTickCount64() - t0) / 1000.0;
+    c.log(summary + L" in " + fmtDuration(secs));
     RunResult r;
     r.ok = true;
-    r.result = summary + L" in " + fmtDuration(secs);
+    r.result = briefMedia(outInfo) + L"  \u00b7  verified";
     return r;
 }
 
@@ -464,14 +541,18 @@ RunResult runDownload(RunCtx& c) {
     if ((o.audioExtract || !sel.audioId.empty()) && !ac.empty() && ac != "unknown") codecs.push_back(ac);
     double expDur = (secA.empty() && secB.empty()) ? yr.info.duration : 0;
     std::wstring summary, verr;
-    if (!verify(c, got, (int)codecs.size(), expDur, codecs, mi, summary, verr)) return fail(L"Verification failed: " + verr, L"The file was kept for inspection: " + got);
+    if (!verify(c, got, (int)codecs.size(), expDur, codecs, mi, summary, verr)) {
+        if (c.canceled()) return fail(L"Canceled");
+        return fail(L"Verification failed: " + verr, L"The file was kept for inspection: " + got);
+    }
+    c.log(L"download " + summary);
     if (!o.audioExtract && sel.v.width && mi.video() && (mi.video()->width != sel.v.width || mi.video()->height != sel.v.height))
         c.log(L"note: stream is " + std::to_wstring(mi.video()->width) + L"x" + std::to_wstring(mi.video()->height) + L", listed as " +
               std::to_wstring(sel.v.width) + L"x" + std::to_wstring(sel.v.height));
     std::wstring finalPath = got;
     RunResult r;
     r.ok = true;
-    r.result = L"bit-for-bit " + sel.summary + L"; " + summary;
+    r.result = briefMedia(mi) + L"  \u00b7  verified";
 
     // 6a. MP4 (H.264 CRF 16 + AAC, copying what already fits) or MOV (truly lossless).
     if (out == DlOut::MP4 || out == DlOut::MOV) {
@@ -488,8 +569,7 @@ RunResult runDownload(RunCtx& c) {
         cs.accel = c.t.triedSoftware ? Accel::Software : c.settings.encoder;  // fastest encoder unless Settings says otherwise
         if (out == DlOut::MP4) {
             cs.acodec = !au || au->codec == "aac" ? ACodec::Copy : ACodec::AAC;
-            int ch = au ? std::max(2, au->channels) : 2;
-            cs.aacKbps = std::min(512, ch <= 2 ? 320 : ch * 80);
+            cs.aacKbps = 320;  // stereo 320k, mono 160k, surround 80k per channel (aacKbpsFor)
         } else {
             cs.acodec = ACodec::Copy;  // planConvert decodes to exact PCM what MOV cannot copy
         }
@@ -506,8 +586,7 @@ RunResult runDownload(RunCtx& c) {
         if (!rr.ok) return rr;
         if (!sp["keepAudioSource"].boolean(false)) DeleteFileW(got.c_str());
         c.setOutput(finalPath);
-        std::wstring cls = className(plan.cls);
-        r.result = cls.substr(0, cls.find(L" -")) + L": " + sel.summary + L"; " + rr.result;
+        r.result = rr.result;
     }
 
     // 6b. Optional audio conversion (MP3 is a labelled lossy step; WAV is an exact decode).
@@ -528,8 +607,7 @@ RunResult runDownload(RunCtx& c) {
         if (!rr.ok) return rr;
         if (!sp["keepAudioSource"].boolean(false)) DeleteFileW(got.c_str());
         c.setOutput(finalPath);
-        r.result = (plan.cls == QualityClass::Copy ? L"copied " : out == DlOut::AudioMP3 ? L"MP3 320 kb/s CBR (lossy) from " : L"WAV exact decode of ") +
-                   sel.summary + L"; " + rr.result;
+        r.result = rr.result;
     }
     if (!infoFile.empty()) DeleteFileW(infoFile.c_str());
     appendHistory({nowStamp(), widen(yr.info.title), url, finalPath});
@@ -568,10 +646,7 @@ static RunResult runEncodeTask(RunCtx& c, bool remux) {
     std::wstring finalPath;
     MediaInfo outInfo;
     RunResult r = runFfmpegPlan(c, input, mi, plan, outPath, mi.duration, finalPath, outInfo);
-    if (r.ok) {
-        c.setOutput(finalPath);
-        r.result = std::wstring(className(plan.cls)).substr(0, std::wstring(className(plan.cls)).find(L" -")) + L"; " + r.result;
-    }
+    if (r.ok) c.setOutput(finalPath);
     return r;
 }
 

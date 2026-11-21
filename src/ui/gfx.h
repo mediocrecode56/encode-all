@@ -20,7 +20,7 @@ void allowDarkMenus(bool dark);  // uxtheme preferred app mode, so native scroll
 // Line icons in the ink colour (no bitmaps, no colours).
 // Anti-aliased (GDI+); the window glyphs (I_Min and after) keep whole-pixel strokes so they stay sharp.
 enum Icon { I_History, I_Log, I_Settings, I_Close, I_Check, I_Chevron, I_Up, I_Down, I_Play, I_Pause, I_Retry, I_Folder, I_Open, I_Link, I_Plus,
-            I_Min, I_Max, I_Restore, I_WinClose };
+            I_Download, I_Go, I_Min, I_Max, I_Restore, I_WinClose };
 
 struct Fonts {
     // Segoe UI for labels and controls; Consolas for technical lines (streams, plans, logs, numbers).

@@ -23,6 +23,19 @@ namespace {
 
 const wchar_t* kClass = L"EncodeAllMain";
 std::counting_semaphore<4> gAnalyzeSlots(4);
+std::counting_semaphore<4> gProbeSlots(4);  // a dropped folder probes four files at a time, not all at once
+
+// What a dropped folder contributes: media files only (a single file is always taken and probed).
+bool mediaExtension(const std::wstring& path) {
+    static const wchar_t* ext[] = {L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi", L".wmv", L".asf", L".flv", L".ts", L".m2ts", L".mts", L".mpg",
+                                   L".mpeg", L".vob", L".3gp", L".ogv", L".mxf", L".dv", L".y4m", L".m4a", L".mp3", L".flac", L".wav", L".aac", L".ac3",
+                                   L".eac3", L".dts", L".opus", L".ogg", L".oga", L".wma", L".aiff", L".aif", L".alac", L".ape", L".wv", L".mka", L".thd",
+                                   L".caf", L".w64", L".rf64"};
+    std::wstring e = lower(extension(path));
+    for (auto x : ext)
+        if (e == x) return true;
+    return false;
+}
 
 // OLE drop target: files go to Convert/Remux, links to Download.
 class DropTarget : public IDropTarget {
@@ -390,6 +403,14 @@ int MainWindow::button(int x, int y, const std::wstring& label, std::function<vo
     return x + w + S(8);
 }
 
+int MainWindow::iconButtonText(int right, int y, const std::wstring& label, int icon, std::function<void()> fn, unsigned style) {
+    int w = S(14) + tw(label, style) + S(10) + iconW() + S(10);
+    Item& it = add(K_Button, RECT{right - w, y + S(3), right, y + rowH() - S(3)}, label, style | (style & S_Disabled ? 0u : S_Click));
+    it.value = icon + 1;
+    if (!(style & S_Disabled)) it.click = std::move(fn);
+    return right - w;
+}
+
 int MainWindow::toggle(int x, int y, const std::wstring& label, bool on, std::function<void()> fn) {
     int w = checkBox() + S(7) + tw(label);
     Item& it = add(K_Check, RECT{x, y, x + w, y + rowH()}, label, S_Click);
@@ -642,7 +663,13 @@ void MainWindow::onPaint() {
                 else if (hov) p.fill(it.r, theme_.hover);
                 if (it.kind == K_Button) p.frame(it.r, (it.style & S_Disabled) ? theme_.line : (hov || filled) ? theme_.ink : theme_.mid);
                 COLORREF c = filled ? theme_.bg : (it.style & S_Disabled) ? theme_.mid : theme_.ink;
-                p.text(it.r, it.text, c, f, DT_CENTER);
+                if (it.kind == K_Button && it.value > 0) {  // value: icon + 1, drawn right of the label
+                    int iw = iconW();
+                    p.text(RECT{it.r.left + S(14), it.r.top, it.r.right - iw - S(4), it.r.bottom}, it.text, c, f, DT_LEFT);
+                    p.icon((int)it.value - 1, RECT{it.r.right - iw - S(10), it.r.top, it.r.right - S(10), it.r.bottom}, c, iw);
+                } else {
+                    p.text(it.r, it.text, c, f, DT_CENTER);
+                }
                 break;
             }
             case K_Check: {
@@ -1305,13 +1332,17 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
             HANDLE h = FindFirstFileW(joinPath(f, L"*").c_str(), &fd);
             if (h != INVALID_HANDLE_VALUE) {
                 do
-                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(joinPath(f, fd.cFileName));
+                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && mediaExtension(fd.cFileName)) files.push_back(joinPath(f, fd.cFileName));
                 while (FindNextFileW(h, &fd));
                 FindClose(h);
             }
         } else if (fileExists(f)) {
             files.push_back(f);
         }
+    }
+    if (files.empty()) {
+        flash(L"No media files there", 3000);
+        return;
     }
     tab_ = tab;
     overlay_ = Overlay::None;
@@ -1331,7 +1362,11 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
             r.type = 2;
             r.key = key;
             if (!deps_.waitReady(Dep::FFmpeg, stop_)) return;
+            gProbeSlots.acquire();
+            deps_.acquire(Dep::FFmpeg);  // an update never swaps FFprobe under a running probe
             if (!probeFile(deps_.ffprobe(), f, r.media, &stop_)) r.error = r.media.error;
+            deps_.release(Dep::FFmpeg);
+            gProbeSlots.release();
             {
                 std::lock_guard<std::mutex> lk(resMu_);
                 results_.push_back(std::move(r));
@@ -1511,8 +1546,9 @@ bool MainWindow::fileReady(int tab, const FileRow& f, const Settings& s) {
     if (tab != 2) return true;
     RemuxSpec rs = f.remux;
     rs.container = s.remuxContainer;
-    rs.audioPcm = s.remuxPcm;
+    rs.audio = s.remuxAudio;
     rs.pcmBits = s.remuxPcmBits;
+    rs.aacKbps = s.remuxAacKbps;
     return planRemux(f.info, rs).ok;
 }
 
@@ -1524,8 +1560,9 @@ uint64_t MainWindow::queueFile(int tab, const FileRow& f, const Settings& s) {
     if (tab == 2) {
         RemuxSpec rs = f.remux;
         rs.container = s.remuxContainer;
-        rs.audioPcm = s.remuxPcm;
+        rs.audio = s.remuxAudio;
         rs.pcmBits = s.remuxPcmBits;
+        rs.aacKbps = s.remuxAacKbps;
         spec.set("outDir", s.remuxDir);
         spec.set("remux", rs.toJson());
         return queue_.add(TaskKind::Remux, fileName(f.path), spec);

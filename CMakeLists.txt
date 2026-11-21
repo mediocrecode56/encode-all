@@ -30,7 +30,17 @@ add_executable(EncodeAll WIN32
 # windres does not report header dependencies: rebuild the resources when the version, icon or manifest changes.
 set_source_files_properties(src/app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/src/version.h;${CMAKE_SOURCE_DIR}/src/app.manifest;${CMAKE_SOURCE_DIR}/assets/encodeall.ico")
 target_link_libraries(EncodeAll PRIVATE eacore windowscodecs comctl32 uxtheme dwmapi comdlg32 imm32 gdiplus)
-target_link_options(EncodeAll PRIVATE -municode -mwindows -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -s)
+# GCC links default-manifest.o when it finds one; WinLibs 16's has longPathAware, so ld no longer drops it
+# and the exe carried two RT_MANIFEST #1 entries. An empty object of that name, found first (-B, relative to the
+# build folder where the link runs: GCC passes the path to ld unquoted, and this project path has a space), keeps only ours.
+set(NOMANIFEST_DIR "${CMAKE_BINARY_DIR}/nomanifest")
+add_custom_command(OUTPUT "${NOMANIFEST_DIR}/default-manifest.o"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${NOMANIFEST_DIR}"
+  COMMAND ${CMAKE_CXX_COMPILER} -c -x c++ "${CMAKE_SOURCE_DIR}/src/empty.cpp" -o "${NOMANIFEST_DIR}/default-manifest.o"
+  DEPENDS "${CMAKE_SOURCE_DIR}/src/empty.cpp")
+add_custom_target(nomanifest DEPENDS "${NOMANIFEST_DIR}/default-manifest.o")
+add_dependencies(EncodeAll nomanifest)
+target_link_options(EncodeAll PRIVATE -Bnomanifest/ -municode -mwindows -static -static-libgcc -static-libstdc++ -Wl,--gc-sections -s)
 
 add_executable(unit_tests tests/unit.cpp)
 target_link_libraries(unit_tests PRIVATE eacore)

@@ -58,7 +58,8 @@ json::Value Settings::toJson() const {
     v.set("convert", convert.toJson());
     v.set("convertPreset", (int)convertPreset);
     v.set("remuxContainer", (int)remuxContainer);
-    v.set("remuxPcm", remuxPcm);
+    v.set("remuxAudio", (int)remuxAudio);
+    v.set("remuxAacKbps", remuxAacKbps);
     v.set("remuxPcmBits", remuxPcmBits);
     v.set("encoder", (int)encoder);
     v.set("winX", winX);
@@ -100,7 +101,10 @@ void Settings::fromJson(const json::Value& v) {
     if (v["convert"].isObj()) convert = ConvertSpec::fromJson(v["convert"]);
     convertPreset = (Preset)std::clamp((int)v["convertPreset"].num(2), 0, 4);
     remuxContainer = (Container)std::clamp((int)v["remuxContainer"].num(0), 0, 1);  // MP4 or MOV (an old MKV choice becomes MP4)
-    remuxPcm = v["remuxPcm"].boolean(false);
+    // 1.0.4 and earlier stored a PCM switch.
+    remuxAudio = v.has("remuxAudio") ? (RemuxAudio)std::clamp((int)v["remuxAudio"].num(0), 0, 2)
+                                     : v["remuxPcm"].boolean(false) ? RemuxAudio::PCM : RemuxAudio::Original;
+    remuxAacKbps = std::clamp((int)v["remuxAacKbps"].num(256), 64, 512);
     remuxPcmBits = (int)v["remuxPcmBits"].num(0);
     if (remuxPcmBits != 16 && remuxPcmBits != 24 && remuxPcmBits != 32) remuxPcmBits = 0;
     encoder = (Accel)std::clamp((int)v["encoder"].num(0), 0, (int)Accel::AMF);

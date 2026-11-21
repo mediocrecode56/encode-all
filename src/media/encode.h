@@ -43,7 +43,16 @@ struct ConvertSpec {
     int channels = 0;    // 0 = source
     bool keepSubs = true;
     bool faststart = true;
+    // filters (0 = off); video ones apply only when the video is encoded
+    int deinterlace = 0;  // 1 auto (interlaced frames only), 2 every frame, 3 every field (double rate)
+    int rotate = 0;       // 1 90 clockwise, 2 90 counter-clockwise, 3 180, 4 mirror, 5 flip
+    int denoise = 0;      // 1 light, 2 medium, 3 strong (hqdn3d)
+    int sharpen = 0;      // 1 light, 2 medium (unsharp)
+    int loudness = 0;     // 1 -23 LUFS (EBU R128), 2 -16 LUFS, 3 -14 LUFS (loudnorm); audio is re-encoded
+    // channels (above) also downmixes the audio of a video target
 
+    bool hasVideoFilters() const;
+    bool hasAudioFilters() const { return loudness > 0 || channels > 0; }
     json::Value toJson() const;
     static ConvertSpec fromJson(const json::Value& v);
 };
@@ -66,6 +75,15 @@ struct EncoderCaps {
 
 enum class QualityClass { Copy, Lossless, Lossy };
 
+// What one output stream must be after the job (checked with FFprobe before the file gets its name).
+struct OutExpect {
+    std::string type, codec;  // empty codec: not checked (attachments)
+    int width = 0, height = 0;  // 0: not checked
+    int depth = 0;              // video bit depth, 0: not checked
+    std::string chroma;         // "420", "422", "444", empty: not checked
+    int channels = 0, sampleRate = 0;
+};
+
 struct Plan {
     bool ok = false;
     std::wstring error;
@@ -80,6 +98,7 @@ struct Plan {
     std::wstring estText;
     int outStreams = 0;
     std::vector<int> copiedSourceStreams;  // for verification
+    std::vector<OutExpect> expect;         // every output stream, in order
 };
 
 const wchar_t* className(QualityClass c);  // "STREAM COPY (bit-for-bit)", ...
@@ -87,23 +106,31 @@ const wchar_t* className(QualityClass c);  // "STREAM COPY (bit-for-bit)", ...
 // Auto takes the fastest encoder that works here: NVENC, then Quick Sync, then AMF, then x264/x265.
 std::string pickEncoder(VCodec c, Accel a, RateMode r, const EncoderCaps& caps, std::wstring* why = nullptr);
 const wchar_t* pcmBitsName(int bits);  // exact, 16-bit, 24-bit, 32-bit float
+// AAC quality is named by its stereo bitrate; mono gets half, surround a quarter per channel (max 512k).
+int aacKbpsFor(int quality, int channels);
+int aacSampleRate(int sourceRate);  // the source rate when AAC takes it, else 48000 or 44100
 Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& caps);
 
 enum class TrackAction { Copy, ToAAC, ToPCM, ToText, Exclude };
 const wchar_t* trackActionName(TrackAction a);
 
+enum class RemuxAudio { Original, PCM, AAC };
+
 struct RemuxSpec {
     Container container = Container::MP4;
     std::map<int, TrackAction> actions;  // by source stream index; missing = default
-    bool audioPcm = false;  // false keeps the original audio (PCM only where the container needs it); true decodes every track to PCM
+    // Original keeps the audio (PCM only where the container needs it); PCM decodes every track;
+    // AAC encodes every track that is not AAC already (lossy, labelled).
+    RemuxAudio audio = RemuxAudio::Original;
     int pcmBits = 0;        // 0 = exact (source depth, 32-bit float for lossy sources), 16, 24, 32 (float)
+    int aacKbps = 256;      // AAC quality (stereo bitrate, see aacKbpsFor)
     bool chapters = true;
     bool faststart = true;
     json::Value toJson() const;
     static RemuxSpec fromJson(const json::Value& v);
 };
 
-TrackAction defaultAction(Container c, const StreamInfo& s, bool audioPcm = false);
+TrackAction defaultAction(Container c, const StreamInfo& s, RemuxAudio audio = RemuxAudio::Original);
 std::vector<TrackAction> allowedActions(Container c, const StreamInfo& s);
 Plan planRemux(const MediaInfo& m, const RemuxSpec& s);
 

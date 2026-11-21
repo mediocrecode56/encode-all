@@ -58,6 +58,11 @@ bool probeFile(const std::wstring& ffprobe, const std::wstring& path, MediaInfo&
 // One line per stream for the UI: "#0 video h264 High 10 1920x1080 23.976 fps 10-bit 8.2 Mb/s"
 std::wstring describeStream(const StreamInfo& s);
 std::wstring describeMedia(const MediaInfo& m);  // "mkv · 00:10:12 · 612 MiB · 8.4 Mb/s"
+// The short line a list row shows: "H.264 1080p60 · AAC stereo · 3:21 · 183 MiB".
+std::wstring briefMedia(const MediaInfo& m);
+std::wstring codecLabel(const std::string& codec);  // "h264" -> "H.264", "pcm_s24le" -> "PCM 24-bit"
+std::wstring resolutionLabel(int w, int h, double fps);  // "1080p60", "1080p 23.976", "1000x750"
+std::wstring channelsLabel(int channels, const std::string& layout = "");  // "stereo", "5.1"
 int pixFmtDepth(const std::string& pixFmt);
 std::string pixFmtChroma(const std::string& pixFmt);  // "420", "422", "444", "" if unknown
 

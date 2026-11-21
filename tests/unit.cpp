@@ -339,19 +339,33 @@ static void testPlans() {
     CHECK(anyContains(p.warnings, L"cannot hold it") && !anyContains(p.warnings, L"MKV"));
     CHECK(hasPair(p.args, L"-c:2", L"copy"));  // AAC kept as it is (audio: original)
     // Audio as linear PCM: every audio track decodes exactly; a fixed depth below the source rounds.
-    r.audioPcm = true;
+    r.audio = RemuxAudio::PCM;
     p = planRemux(m, r);
     CHECK(p.cls == QualityClass::Lossless && hasPair(p.args, L"-c:1", L"pcm_s24le") && hasPair(p.args, L"-c:2", L"pcm_f32le"));
     r.pcmBits = 16;
     p = planRemux(m, r);
     CHECK(p.cls == QualityClass::Lossy && hasPair(p.args, L"-c:1", L"pcm_s16le") && anyContains(p.warnings, L"rounds the samples"));
     r.pcmBits = 0;
-    r.audioPcm = false;
-    // AAC is not a Remux choice any more: an old saved ToAAC falls back to the default.
-    r.actions[1] = TrackAction::ToAAC;
-    p = planRemux(m, r);
-    CHECK(p.cls == QualityClass::Lossless && hasPair(p.args, L"-c:1", L"pcm_s24le"));
+    r.audio = RemuxAudio::Original;
     CHECK(RemuxSpec::fromJson(r.toJson()).pcmBits == 0);
+    // Remux to AAC: other codecs are encoded (lossy, labelled), AAC stays bit-for-bit.
+    r.audio = RemuxAudio::AAC;
+    r.aacKbps = 256;
+    p = planRemux(m, r);
+    CHECK(p.ok && p.cls == QualityClass::Lossy && hasPair(p.args, L"-c:1", L"aac") && hasPair(p.args, L"-c:2", L"copy"));
+    CHECK(p.expect.size() == (size_t)p.outStreams && p.expect[1].codec == "aac" && p.expect[2].codec == "aac");
+    CHECK(anyContains(p.lines, L"AAC"));
+    // A per-track choice still wins over the mode.
+    r.actions[1] = TrackAction::ToPCM;
+    p = planRemux(m, r);
+    CHECK(hasPair(p.args, L"-c:1", L"pcm_s24le"));
+    r.actions.clear();
+    // Old saved specs (1.0.4) carried a PCM switch.
+    json::Value old = json::Value::object();
+    old.set("audioPcm", true);
+    CHECK(RemuxSpec::fromJson(old).audio == RemuxAudio::PCM);
+    CHECK(RemuxSpec::fromJson(r.toJson()).audio == RemuxAudio::AAC && RemuxSpec::fromJson(r.toJson()).aacKbps == 256);
+    r.audio = RemuxAudio::Original;
     // Auto takes the fastest encoder that works; lossless stays on x264/x265 unless NVENC is chosen.
     EncoderCaps hw;
     hw.works["h264_nvenc"] = true;
@@ -375,6 +389,171 @@ static void testPlans() {
     // Spec round trip.
     ConvertSpec back = ConvertSpec::fromJson(s.toJson());
     CHECK(back.vcodec == s.vcodec && back.mbps == s.mbps && back.rate == s.rate);
+}
+
+// A small synthetic file for the planner edge cases.
+static MediaInfo fakeMedia(int w, int h, const char* pix, int rotation, const char* acodec, int ch, int sr, const char* sampleFmt = "fltp") {
+    MediaInfo m;
+    m.ok = true;
+    m.duration = 10;
+    m.size = 1000000;
+    StreamInfo v;
+    v.index = 0;
+    v.type = "video";
+    v.codec = "h264";
+    v.width = w;
+    v.height = h;
+    v.fps = 25;
+    v.pixFmt = pix;
+    v.bitDepth = pixFmtDepth(pix);
+    v.rotation = rotation;
+    v.fieldOrder = "progressive";
+    m.streams.push_back(v);
+    StreamInfo a;
+    a.index = 1;
+    a.type = "audio";
+    a.codec = acodec;
+    a.channels = ch;
+    a.sampleRate = sr;
+    a.sampleFmt = sampleFmt;
+    m.streams.push_back(a);
+    return m;
+}
+
+static void testEdges() {
+    EncoderCaps caps;
+    // AAC bitrate per channel count, and the rates AAC can store.
+    CHECK(aacKbpsFor(320, 2) == 320 && aacKbpsFor(320, 1) == 160 && aacKbpsFor(320, 6) == 480 && aacKbpsFor(320, 8) == 512 && aacKbpsFor(128, 6) == 192);
+    CHECK(aacSampleRate(48000) == 48000 && aacSampleRate(96000) == 96000 && aacSampleRate(192000) == 48000 && aacSampleRate(176400) == 44100);
+    // Odd frame sizes are cropped to even sides for 4:2:0 encoders, and said so.
+    MediaInfo odd = fakeMedia(321, 241, "yuv420p", 0, "aac", 2, 48000);
+    ConvertSpec s;
+    s.vcodec = VCodec::H264;
+    Plan p = planConvert(odd, s, caps);
+    CHECK(p.ok && anyContains(p.args, L"crop=320:240:0:0") && anyContains(p.warnings, L"Odd frame size"));
+    CHECK(p.expect.size() == 2 && p.expect[0].width == 320 && p.expect[0].height == 240 && p.expect[0].codec == "h264");
+    CHECK(p.expect[1].codec == "aac");  // AAC copied
+    // Lossless with a crop is no longer identical: labelled lossy.
+    s.rate = RateMode::Lossless;
+    p = planConvert(odd, s, caps);
+    CHECK(p.cls == QualityClass::Lossy);
+    // 4:4:4 keeps odd sizes.
+    MediaInfo odd444 = fakeMedia(321, 241, "yuv444p", 0, "aac", 2, 48000);
+    p = planConvert(odd444, s, caps);
+    CHECK(!anyContains(p.args, L"crop=") && p.cls == QualityClass::Lossless);
+    // A rotation tag swaps the sides FFmpeg encodes (autorotate); 720p of a portrait clip is 720 wide.
+    MediaInfo rot = fakeMedia(1920, 1080, "yuv420p", -90, "aac", 2, 48000);
+    s = ConvertSpec();
+    s.vcodec = VCodec::H264;
+    s.height = 720;
+    p = planConvert(rot, s, caps);
+    CHECK(anyContains(p.args, L"scale=406:720") && p.expect[0].width == 406 && p.expect[0].height == 720);
+    // Filters: chain order and the rotate filter swapping sides.
+    MediaInfo hd = fakeMedia(1920, 1080, "yuv420p", 0, "opus", 6, 48000);
+    s = ConvertSpec();
+    s.vcodec = VCodec::H265;
+    s.deinterlace = 2;
+    s.denoise = 1;
+    s.rotate = 1;
+    s.sharpen = 1;
+    s.fps = 30;
+    p = planConvert(hd, s, caps);
+    std::wstring chain;
+    for (size_t i = 0; i + 1 < p.args.size(); i++)
+        if (p.args[i] == L"-filter:0") chain = p.args[i + 1];
+    CHECK(chain.find(L"bwdif") == 0 && chain.find(L"hqdn3d") < chain.find(L"transpose=clock") && chain.find(L"unsharp") < chain.find(L"fps=30"));
+    CHECK(p.expect[0].width == 1080 && p.expect[0].height == 1920);
+    // Opus in MP4 copies; loudness forces an AAC encode that goes back to the source rate.
+    s = ConvertSpec();
+    s.vcodec = VCodec::H264;
+    s.loudness = 2;
+    p = planConvert(hd, s, caps);
+    CHECK(hasPair(p.args, L"-c:1", L"aac") && anyContains(p.args, L"loudnorm=I=-16") && anyContains(p.args, L"aresample=48000"));
+    CHECK(hasPair(p.args, L"-b:1", L"" + std::to_wstring(aacKbpsFor(s.aacKbps, 6)) + L"k"));
+    // Downmix to stereo for a video target; never an upmix.
+    s.loudness = 0;
+    s.channels = 2;
+    s.container = Container::MOV;
+    p = planConvert(hd, s, caps);
+    CHECK(hasPair(p.args, L"-ac:1", L"2") && p.expect[1].channels == 2 && startsWith(p.expect[1].codec, "pcm_"));
+    MediaInfo mono = fakeMedia(640, 360, "yuv420p", 0, "aac", 1, 44100);
+    p = planConvert(mono, s, caps);
+    CHECK(hasPair(p.args, L"-c:1", L"copy"));
+    // MP3 holds stereo at most and up to 48 kHz.
+    MediaInfo hi = fakeMedia(640, 360, "yuv420p", 0, "flac", 6, 192000, "s32");
+    hi.streams[1].bitsPerSample = 24;
+    ConvertSpec a;
+    a.audio = AudioTarget::MP3;
+    p = planConvert(hi, a, caps);
+    CHECK(hasPair(p.args, L"-ac:0", L"2") && hasPair(p.args, L"-ar:0", L"48000") && p.expect[0].channels == 2 && p.expect[0].sampleRate == 48000);
+    // AAC from 192 kHz FLAC is resampled to a rate AAC stores.
+    s = ConvertSpec();
+    s.vcodec = VCodec::Copy;
+    s.acodec = ACodec::AAC;
+    p = planConvert(hi, s, caps);
+    CHECK(hasPair(p.args, L"-ar:1", L"48000") && p.expect[1].sampleRate == 48000 && p.expect[1].channels == 6);
+    // FLAC and WAV keep the source exactly.
+    a.audio = AudioTarget::FLAC;
+    p = planConvert(hi, a, caps);
+    CHECK(p.cls == QualityClass::Lossless && !hasArg(p.args, L"-ar:0") && p.expect[0].sampleRate == 192000);
+    a.audio = AudioTarget::WAV;
+    a.bitDepth = 32;
+    p = planConvert(hi, a, caps);
+    CHECK(p.cls == QualityClass::Lossless);  // 24-bit integers fit 32-bit float exactly
+    // Every plan describes each output stream.
+    MediaInfo full;
+    parseProbeJson(kProbe, full);
+    ConvertSpec b;
+    applyPreset(b, Preset::Balanced);
+    p = planConvert(full, b, caps);
+    CHECK(p.expect.size() == (size_t)p.outStreams);
+    RemuxSpec r;
+    p = planRemux(full, r);
+    CHECK(p.expect.size() == (size_t)p.outStreams);
+    // The verifier: right streams pass, a wrong codec or size fails.
+    MediaInfo out = fakeMedia(320, 240, "yuv420p", 0, "aac", 2, 48000);
+    std::vector<OutExpect> ex(2);
+    ex[0].type = "video";
+    ex[0].codec = "h264";
+    ex[0].width = 320;
+    ex[0].height = 240;
+    ex[0].depth = 8;
+    ex[0].chroma = "420";
+    ex[1].type = "audio";
+    ex[1].codec = "aac";
+    ex[1].channels = 2;
+    std::wstring err;
+    CHECK(checkExpect(out, ex, err));
+    ex[0].codec = "hevc";
+    CHECK(!checkExpect(out, ex, err) && err.find(L"hevc") != std::wstring::npos);
+    ex[0].codec = "h264";
+    ex[0].width = 322;
+    CHECK(!checkExpect(out, ex, err));
+    ex[0].width = 320;
+    ex[1].channels = 6;
+    CHECK(!checkExpect(out, ex, err));
+    ex.pop_back();
+    CHECK(!checkExpect(out, ex, err));  // a stream the plan did not write
+    out.streams[1].codec = "pcm_s24be";
+    ex.push_back(OutExpect{"audio", "pcm_s24le"});
+    CHECK(checkExpect(out, ex, err));  // byte order is the container's business
+    // Filter spec round trip; the lossless preset clears every filter.
+    ConvertSpec f;
+    f.rotate = 2;
+    f.denoise = 3;
+    f.loudness = 1;
+    f.deinterlace = 3;
+    f.sharpen = 2;
+    ConvertSpec g = ConvertSpec::fromJson(f.toJson());
+    CHECK(g.rotate == 2 && g.denoise == 3 && g.loudness == 1 && g.deinterlace == 3 && g.sharpen == 2);
+    applyPreset(g, Preset::Lossless);
+    CHECK(!g.hasVideoFilters() && !g.hasAudioFilters());
+    // Labels for list rows.
+    CHECK(codecLabel("hevc") == L"H.265" && codecLabel("pcm_s24le") == L"PCM 24-bit" && codecLabel("opus") == L"Opus");
+    CHECK(resolutionLabel(1920, 1080, 60) == L"1080p60" && resolutionLabel(1080, 1920, 30) == L"1080p30" && resolutionLabel(1000, 750, 0) == L"1000x750");
+    CHECK(resolutionLabel(1920, 1080, 24000.0 / 1001) == L"1080p 23.976");
+    std::wstring b2 = briefMedia(out);
+    CHECK(b2.find(L"H.264 240p25") == 0 && b2.find(L"00:10") != std::wstring::npos);
 }
 
 static void testMisc() {
@@ -410,6 +589,7 @@ int wmain() {
     testFormats();
     testYtArgs();
     testPlans();
+    testEdges();
     testMisc();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

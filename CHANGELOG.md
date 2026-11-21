@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.5 - 2026-11-21
+- Output integrity: before a file gets its name, every stream is checked against the plan (type, codec, size, bit depth, chroma, channels, sample rate) and the start and end of the file must decode. A mismatch fails the task and keeps nothing. Found and fixed with this:
+  - odd frame sizes (321x241): x264 and x265 refused them at 4:2:0 and silently rounded them at 4:2:2, and DNxHR silently dropped a row. 4:2:0, 4:2:2 and DNxHR now crop to even sides and say so; 4:4:4 keeps odd sizes;
+  - rotated phone clips: resizing used the stored sides, so "720p" of a portrait clip came out distorted. The rotation is applied first;
+  - MP3 from 5.1 or 96/192 kHz sources failed: MP3 is now stereo at most and 48 kHz at most, resampled and downmixed with a note;
+  - AAC from 192 kHz sources failed: it now uses a rate AAC stores (48 or 44.1 kHz). AAC bitrates follow the channel count (mono half, 5.1 a quarter per channel), so mono no longer asks for more than AAC can carry;
+  - a lossless encode with a resize, frame rate, crop, bit depth or chroma change was labelled LOSSLESS; it is LOSSY now;
+  - FLAC, MP3 and WAV outputs were never labelled lossless or lossy (always COPY); a 32-bit float WAV of a 24-bit source is exact and labelled so.
+  - a decoder crash during that check (seen on this unstable test PC: a good 4K file crashed one decode in five) gets one more try, so a good file is never thrown away; a real decode error still fails.
+- Remux: audio can now be converted to AAC, 128, 192, 256 or 320k (labelled lossy; AAC tracks stay copied). Each track's menu has it too.
+- Convert filters, each in its own dropdown: PICTURE (size up to 8K or custom, frame rate up to 120 or custom, 8/10-bit 4:2:0/4:2:2/4:4:4, deinterlace, rotate or mirror, denoise, sharpen) and SOUND (stereo or mono downmix, loudness -23/-16/-14 LUFS, sample rate for audio files), with "clear" per row. Audio filters re-encode only the tracks they change; loudness keeps the source sample rate.
+- "start all" is now "download all" (convert all, remux all) with its icon; downloads start with a download icon, files with an arrow (play only resumes).
+- Rows: more room above, below and between the icons, larger thumbnails, and a short second line ("H.264 1080p60 · AAC stereo · 03:21 · 183 MiB"; for links "1080p60 VP9 + Opus → MP4 H.264 CRF 16 + AAC"). The full plan and log stay in the row's details.
+- Fixes: dropping a big folder started one FFprobe per file at once (now four at a time) and listed non-media files (now skipped; an empty drop says so); a probe could see FFmpeg swapped by an update mid-way; the exe carried two manifests (WinLibs' default and ours), now only ours.
+- Tests: an integration matrix of edge-case sources (odd sizes, rotation, 10-bit 4:2:2, interlaced, 5.1, 192 kHz, Opus/FLAC/ASS/SRT/chapters, VP9, ALAC with cover) through every Convert target, audio mode and filter, the fastest encoder and every Remux mode; each output is probed independently and decoded end to end.
+
 ## 1.0.4 - 2026-11-21
 - Readability: text is 13 px Segoe UI and 12 px Consolas (was 12 and 11), the title 17 px; icons are about a third larger (row actions, header, bar), with bigger checkboxes, dropdown marks and window buttons. Thumbnails are larger. Spacing keeps the compact scale, so the window stays as small as 1.0.3.
 - Labels no longer cut off: the label column fits "AUDIO ONLY", the download toggles (metadata, chapters...) measure their own checkbox, and Settings gives its labels and notes more room.

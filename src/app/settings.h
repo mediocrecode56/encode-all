@@ -30,8 +30,9 @@ struct Settings {
     ConvertSpec convert;
     Preset convertPreset = Preset::Balanced;
     Container remuxContainer = Container::MP4;  // MP4 or MOV
-    bool remuxPcm = false;   // Remux audio: original, or every track decoded to linear PCM
+    RemuxAudio remuxAudio = RemuxAudio::Original;  // Remux audio: original, every track to linear PCM, or to AAC
     int remuxPcmBits = 0;    // 0 exact, 16, 24, 32 (float)
+    int remuxAacKbps = 256;  // AAC quality (stereo bitrate; aacKbpsFor scales it per channel)
     Accel encoder = Accel::Auto;  // every encode: Auto = fastest available (GPU first); set only in Settings
     int winX = INT32_MIN, winY = INT32_MIN, winW = 0, winH = 0;
     bool winMax = false;

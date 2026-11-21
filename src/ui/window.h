@@ -145,6 +145,9 @@ private:
     int text(int x, int y, const std::wstring& s, unsigned style = 0, int maxW = 0);
     int button(int x, int y, const std::wstring& label, std::function<void()> fn, unsigned style = 0);
     int toggle(int x, int y, const std::wstring& label, bool on, std::function<void()> fn);
+    // A labelled button with an icon right of the label, laid out right to left; returns its left edge.
+    int iconButtonText(int right, int y, const std::wstring& label, int icon, std::function<void()> fn, unsigned style = 0);
+    int iconW() const { return S(19); }  // the glyph in a labelled button
     int check(int x, int y, bool on, std::function<void()> fn);  // a box without a label (list rows)
     HFONT fontFor(unsigned style) const;
     int choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel = nullptr,
@@ -171,7 +174,7 @@ private:
     int popup(const std::vector<std::wstring>& items, const std::vector<int>& checked);  // sectioned: one check per section
     int rowH() const { return fonts_.lineH; }
     int barH() const { return S(40); }  // the top bar: drag area, title, window buttons (Weekly-style chrome)
-    int itemH() const { return rowH() * 2 + S(8); }  // a list row: two lines beside its thumbnail
+    int itemH() const { return rowH() * 2 + S(30); }  // a list row: two lines beside its thumbnail, with room above and below
     int denseH() const { return fonts_.denseH; }
 
     // actions

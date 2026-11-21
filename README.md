@@ -5,14 +5,14 @@ remux video and audio with yt-dlp, FFmpeg and FFprobe. Paste a link or drop a fi
 best source quality and tells you exactly what will happen before anything runs.
 
 ```
-ENCODE ALL v1.0.3                                                        tools ready   _  []  X
+ENCODE ALL v1.0.5                                                        tools ready   _  []  X
 [DOWNLOAD 2]  CONVERT   REMUX                                           (history) (log) (settings)
 [ (link)  Paste links, or type one and press Enter                                     paste ]
 VIDEO       [MP4|MOV|Original]  [H.264|H.265]  QUALITY [extreme|high|normal]
 AUDIO ONLY  [MP3 320|WAV|Original]
-LINKS  1 ready (~812 MiB)  .  1 running                    [pause all]  [START ALL 1]
-[thumb]  A video title                                  ~812 MiB    (>) (open) (folder) (x)
-         03:12  .  2160p60 av1 + opus -> MP4 (H.264 CRF 16 + AAC 320k)
+LINKS  1 ready (~812 MiB)  .  1 running            [pause all]  [download all 1 (v)]
+[thumb]  A video title                                  ~812 MiB    (v) (open) (folder) (x)
+         03:12  .  2160p60 AV1 + Opus -> MP4 H.264 CRF 16 + AAC
 [thumb]  Another title                          48%  12 MB/s  00:41  (||) (open) (folder) (x)
          downloading  ________________
 ```
@@ -31,24 +31,27 @@ LINKS  1 ready (~812 MiB)  .  1 running                    [pause all]  [START A
 ## Convert
 - Any input FFmpeg reads. Targets: H.264, H.265 (MP4 or MOV), DNxHR LB, SQ, HQ, HQX, 444 (MOV), copy video, FLAC, MP3, WAV.
 - Encoder: automatically the fastest that works on your PC: NVENC, then Quick Sync, then AMF (each tested with a real encode), then software x264/x265. Settings can pin one; lossless stays on x264/x265.
-- CRF/CQ, bitrate, lossless; resolution, frame rate, pixel format; AAC, exact PCM or copied audio; FLAC level, MP3 CBR/VBR, bit depth, sample rate, channels.
+- CRF/CQ, bitrate, lossless; AAC, exact PCM or copied audio; FLAC level, MP3 CBR/VBR, bit depth.
+- Filters, each its own dropdown: PICTURE size (up to 8K or custom), frame rate, pixel format (8/10-bit, 4:2:0/4:2:2/4:4:4), deinterlace (auto, every frame, double rate), rotate or mirror, denoise, sharpen; SOUND channels (stereo or mono downmix), loudness (-23, -16 or -14 LUFS), sample rate for audio files.
+- Odd frame sizes, rotated phone clips, 192 kHz or surround audio are handled: the plan says what is cropped, turned, resampled or downmixed so the output always plays.
 - Presets: lossless, max quality, balanced, compact, plus your own saved presets.
 - Every plan is labelled **STREAM COPY**, **LOSSLESS ENCODE** or **LOSSY ENCODE**, lists what happens to each stream, estimates the size (variable-bitrate estimates are marked), warns about bitrates above what the source needs, upscaling, bit-depth or chroma loss, and recommends Remux when the codec already matches.
 - Metadata, chapters, colour tags and HDR10 mastering data are carried over.
 
 ## Remux
 - Change container without re-encoding: MP4 or MOV.
-- Audio: **Original** (copied bit-for-bit; exact PCM only where the container cannot hold a track) or **Linear PCM** for every track (exact, 16-bit, 24-bit or 32-bit float).
-- Every track can be copied, decoded to PCM, converted to text subtitles, or excluded. Incompatibilities are listed before you start (with MOV or MP4 one click away when it keeps everything). Nothing is dropped silently.
+- Audio: **Original** (copied bit-for-bit; exact PCM only where the container cannot hold a track), **Linear PCM** for every track (exact, 16-bit, 24-bit or 32-bit float), or **AAC** 128/192/256/320k (labelled lossy; AAC tracks stay copied; surround gets a rate per channel).
+- Every track can be copied, decoded to PCM, encoded to AAC, converted to text subtitles, or excluded. Incompatibilities are listed before you start (with MOV or MP4 one click away when it keeps everything). Nothing is dropped silently.
 
 ## One list per section
 Each section has one list: what you added and what is running or finished, newest first. Every row
 starts, pauses (the process tree is suspended), resumes, retries, cancels or removes itself, opens its
-link or file and shows its folder; "start all" starts everything that is ready. A click on a row shows
+link or file and shows its folder; "download all" (convert all, remux all) starts everything that is ready. A click on a row shows
 its details (plan, tracks, segment, result, log). Concurrency is per kind (Settings); tasks survive
 restarts and updates.
-Outputs are written under a temporary name, verified with FFprobe and only then renamed; existing
-files are never overwritten.
+Outputs are written under a temporary name and renamed only after every stream is checked against
+the plan (codec, size, bit depth, chroma, channels, sample rate, duration) and the start and end decode;
+existing files are never overwritten.
 
 ## Install and updates
 - Run `EncodeAll-Setup-<version>.exe` (per user, no admin). First start downloads yt-dlp, FFmpeg and Deno from their official releases and verifies them; no Python, PATH or manual steps.
@@ -57,11 +60,11 @@ files are never overwritten.
 - Portable mode: put an empty file named `portable` next to `EncodeAll.exe`.
 
 ## Keys
-`Ctrl+1/2/3` sections, `Enter` read the typed link, `Ctrl+Enter` start all, `Ctrl+O` add files, `Ctrl+V` paste links,
+`Ctrl+1/2/3` sections, `Enter` read the typed link, `Ctrl+Enter` download / convert / remux all, `Ctrl+O` add files, `Ctrl+V` paste links,
 `Ctrl+L` log, `Ctrl+,` settings, `Up/Down` select a row, `Space` start/pause/resume, `F5` retry, `Del` remove (cancel when running), `Esc` close panel.
 
 ## Build
 Windows with MinGW-w64 GCC 13+, CMake and Ninja: `.\build.ps1 -Test`. `.\build.ps1 -Release` also needs Inno Setup 6.
-Tests: `build\unit_tests.exe` (logic, under a second), `build\integration_tests.exe` (real media and real downloads) and `tests\update-test.ps1` (self-update and rollback).
+Tests: `build\unit_tests.exe` (logic, under a second), `build\integration_tests.exe` (real media through every target and mode, and real downloads) and `tests\update-test.ps1` (self-update and rollback).
 
 License: MIT. Third-party programs: see [THIRD_PARTY.md](THIRD_PARTY.md).

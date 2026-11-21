@@ -68,9 +68,10 @@ void applyPreset(ConvertSpec& s, Preset p) {
         return;
     }
     switch (p) {
-        case Preset::Lossless:
+        case Preset::Lossless:  // nothing that changes a pixel or a sample
             s.vcodec = VCodec::H264; s.rate = RateMode::Lossless; s.speed = "veryfast";
             s.acodec = ACodec::Copy; s.width = s.height = 0; s.fps = 0; s.pixFmt.clear();
+            s.deinterlace = s.rotate = s.denoise = s.sharpen = s.loudness = s.channels = 0;
             break;
         case Preset::MaxQuality:
             s.vcodec = VCodec::H265; s.rate = RateMode::Quality; s.quality = 16; s.speed = "slow";
@@ -114,8 +115,15 @@ json::Value ConvertSpec::toJson() const {
     v.set("channels", channels);
     v.set("keepSubs", keepSubs);
     v.set("faststart", faststart);
+    v.set("deinterlace", deinterlace);
+    v.set("rotate", rotate);
+    v.set("denoise", denoise);
+    v.set("sharpen", sharpen);
+    v.set("loudness", loudness);
     return v;
 }
+
+bool ConvertSpec::hasVideoFilters() const { return width || height || fps > 0 || !pixFmt.empty() || deinterlace || rotate || denoise || sharpen; }
 
 ConvertSpec ConvertSpec::fromJson(const json::Value& v) {
     ConvertSpec s;
@@ -136,23 +144,31 @@ ConvertSpec ConvertSpec::fromJson(const json::Value& v) {
     s.acodec = (ACodec)clampEnum(v["acodec"].num(0), 2);
     s.aacKbps = std::clamp((int)v["aacKbps"].num(256), 32, 512);
     s.pcmBits = (int)v["pcmBits"].num(0);
+    if (s.pcmBits != 16 && s.pcmBits != 24 && s.pcmBits != 32) s.pcmBits = 0;
     s.flacLevel = std::clamp((int)v["flacLevel"].num(8), 0, 12);
     s.mp3Vbr = v["mp3Vbr"].boolean(false);
     s.mp3Kbps = std::clamp((int)v["mp3Kbps"].num(320), 32, 320);
     s.mp3Quality = std::clamp((int)v["mp3Quality"].num(0), 0, 9);
     s.bitDepth = (int)v["bitDepth"].num(0);
-    s.sampleRate = (int)v["sampleRate"].num(0);
-    s.channels = (int)v["channels"].num(0);
+    if (s.bitDepth != 16 && s.bitDepth != 24 && s.bitDepth != 32) s.bitDepth = 0;
+    s.sampleRate = std::clamp((int)v["sampleRate"].num(0), 0, 384000);
+    s.channels = std::clamp((int)v["channels"].num(0), 0, 8);
     s.keepSubs = v["keepSubs"].boolean(true);
     s.faststart = v["faststart"].boolean(true);
+    s.deinterlace = clampEnum(v["deinterlace"].num(0), 3);
+    s.rotate = clampEnum(v["rotate"].num(0), 5);
+    s.denoise = clampEnum(v["denoise"].num(0), 3);
+    s.sharpen = clampEnum(v["sharpen"].num(0), 2);
+    s.loudness = clampEnum(v["loudness"].num(0), 3);
     return s;
 }
 
 json::Value RemuxSpec::toJson() const {
     json::Value v = json::Value::object();
     v.set("container", (int)container);
-    v.set("audioPcm", audioPcm);
+    v.set("audio", (int)audio);
     v.set("pcmBits", pcmBits);
+    v.set("aacKbps", aacKbps);
     v.set("chapters", chapters);
     v.set("faststart", faststart);
     json::Value a = json::Value::object();
@@ -164,9 +180,11 @@ json::Value RemuxSpec::toJson() const {
 RemuxSpec RemuxSpec::fromJson(const json::Value& v) {
     RemuxSpec s;
     s.container = (Container)std::clamp((int)v["container"].num(0), 0, (int)Container::WEBM);
-    s.audioPcm = v["audioPcm"].boolean(false);
+    // 1.0.4 and earlier stored a PCM switch.
+    s.audio = v.has("audio") ? (RemuxAudio)std::clamp((int)v["audio"].num(0), 0, 2) : v["audioPcm"].boolean(false) ? RemuxAudio::PCM : RemuxAudio::Original;
     s.pcmBits = (int)v["pcmBits"].num(0);
     if (s.pcmBits != 16 && s.pcmBits != 24 && s.pcmBits != 32) s.pcmBits = 0;
+    s.aacKbps = std::clamp((int)v["aacKbps"].num(256), 64, 512);
     s.chapters = v["chapters"].boolean(true);
     s.faststart = v["faststart"].boolean(true);
     for (auto& kv : v["actions"].o) s.actions[atoi(kv.first.c_str())] = (TrackAction)std::clamp((int)kv.second.num(0), 0, 4);
@@ -330,12 +348,14 @@ static const char* dnxhrProfile(VCodec c) {
 static std::wstring W(const std::string& s) { return widen(s); }
 static std::wstring I(int n) { return std::to_wstring(n); }
 
+static bool floatAudio(const StreamInfo& a);
+
 static std::string pcmCodecFor(const StreamInfo& a, int bits) {
     if (bits == 16) return "pcm_s16le";
     if (bits == 24) return "pcm_s24le";
     if (bits == 32) return "pcm_f32le";
     // Exact: integer sources keep their depth; float decoders (every lossy codec) keep float.
-    if (a.lossyAudio() || a.sampleFmt == "flt" || a.sampleFmt == "fltp" || a.sampleFmt == "dbl" || a.sampleFmt == "dblp") return "pcm_f32le";
+    if (floatAudio(a)) return "pcm_f32le";
     int d = a.bitsPerSample;
     if (d == 0) d = (a.sampleFmt == "s16" || a.sampleFmt == "s16p") ? 16 : 24;
     if (d <= 16) return "pcm_s16le";
@@ -370,6 +390,87 @@ static std::string nvencPreset(const std::string& s) {
     return "p1";
 }
 
+// ---------- audio helpers ----------
+
+static bool floatAudio(const StreamInfo& a) {
+    return a.lossyAudio() || a.sampleFmt == "flt" || a.sampleFmt == "fltp" || a.sampleFmt == "dbl" || a.sampleFmt == "dblp";
+}
+
+// PCM at `bits` keeps every decoded sample (0 = exact: the source depth, float for float decoders).
+static bool pcmExact(const StreamInfo& a, int bits) {
+    if (bits == 0) return true;
+    if (floatAudio(a)) return bits == 32;
+    if (bits == 32) return a.bitsPerSample > 0 && a.bitsPerSample <= 24;  // float holds 24-bit integers exactly
+    return a.bitsPerSample > 0 && bits >= a.bitsPerSample;
+}
+
+int aacKbpsFor(int quality, int channels) {
+    if (channels <= 1) return std::max(64, quality / 2);
+    if (channels == 2) return quality;
+    return std::min(512, quality * channels / 4);
+}
+
+int aacSampleRate(int sr) {
+    static const int ok[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000};
+    for (int r : ok)
+        if (r == sr) return sr;
+    return sr > 0 && sr % 11025 == 0 ? 44100 : 48000;
+}
+
+static int mp3SampleRate(int sr) {
+    static const int ok[] = {48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000};
+    for (int r : ok)
+        if (r == sr) return sr;
+    return sr > 0 && sr % 11025 == 0 ? 44100 : 48000;
+}
+
+static std::wstring chName(int ch) { return ch == 1 ? L"mono" : ch == 2 ? L"stereo" : I(ch) + L" channels"; }
+
+// Loudness normalisation (loudnorm resamples to 192 kHz inside; the output goes back to `rate`).
+static std::string audioFilter(const ConvertSpec& s, int rate) {
+    if (!s.loudness) return "";
+    const char* target[] = {"", "-23", "-16", "-14"};
+    std::string f = std::string("loudnorm=I=") + target[s.loudness] + ":TP=-1.5:LRA=11";
+    f += ",aresample=" + std::to_string(rate > 0 ? rate : 48000);
+    return f;
+}
+
+static std::wstring loudnessName(int l) { return l == 1 ? L"-23 LUFS" : l == 2 ? L"-16 LUFS" : l == 3 ? L"-14 LUFS" : L""; }
+
+// AAC for one stream: the rate and channels the encoder takes, the bitrate for those channels.
+// Returns the output bitrate; `what` says what was done.
+static double addAac(Plan& p, const StreamInfo& st, const std::wstring& idx, int quality, int wantCh, const std::string& filter, std::wstring& what) {
+    int ch = wantCh ? wantCh : st.channels > 0 ? st.channels : 2;
+    if (ch > 8) {
+        ch = 8;
+        p.warnings.push_back(describeStream(st) + L": AAC holds at most 8 channels; downmixed to 8.");
+    }
+    int sr = st.sampleRate > 0 ? aacSampleRate(st.sampleRate) : 0;
+    int kbps = aacKbpsFor(quality, ch);
+    p.args.insert(p.args.end(), {L"-c:" + idx, L"aac", L"-b:" + idx, I(kbps) + L"k"});
+    if (ch != st.channels) p.args.insert(p.args.end(), {L"-ac:" + idx, I(ch)});
+    if (sr && sr != st.sampleRate) {
+        p.args.insert(p.args.end(), {L"-ar:" + idx, I(sr)});
+        p.warnings.push_back(describeStream(st) + L": AAC cannot store " + I(st.sampleRate) + L" Hz; resampled to " + I(sr) + L" Hz.");
+    }
+    if (!filter.empty()) p.args.insert(p.args.end(), {L"-filter:" + idx, W(filter)});
+    what = L"AAC " + I(kbps) + L" kb/s" + (ch != st.channels ? L" " + chName(ch) : L"") + (sr && sr != st.sampleRate ? L" " + I(sr) + L" Hz" : L"");
+    OutExpect e;
+    e.type = "audio";
+    e.codec = "aac";
+    e.channels = ch;
+    e.sampleRate = sr;
+    p.expect.push_back(e);
+    return kbps * 1000.0;
+}
+
+static OutExpect copyExpect(const StreamInfo& st) {
+    OutExpect e;
+    e.type = st.type;
+    if (st.type != "attachment") e.codec = st.codec;
+    return e;
+}
+
 // ---------- convert ----------
 
 static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
@@ -390,18 +491,40 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
     Container c = s.audio == AudioTarget::FLAC ? Container::FLAC : s.audio == AudioTarget::MP3 ? Container::MP3 : Container::WAV;
     p.ext = containerExt(c);
     p.args = {L"-map", L"0:" + I(a.index)};
-    int o = 0;
-    bool resample = s.sampleRate && s.sampleRate != a.sampleRate;
-    bool remix = s.channels && s.channels != a.channels;
+    // Output rate and channels: the user's choice, else the source, within what the format holds.
+    int sr = s.sampleRate ? s.sampleRate : a.sampleRate;
+    int ch = s.channels ? s.channels : a.channels;
+    if (s.audio == AudioTarget::MP3) {
+        if (ch > 2) {
+            ch = 2;
+            if (!s.channels) p.warnings.push_back(L"MP3 holds mono or stereo: the " + I(a.channels) + L" channels are downmixed to stereo.");
+        }
+        int ok = mp3SampleRate(sr);
+        if (sr && ok != sr) {
+            p.warnings.push_back(L"MP3 cannot store " + I(sr) + L" Hz: resampled to " + I(ok) + L" Hz.");
+            sr = ok;
+        }
+    } else if (s.audio == AudioTarget::FLAC && ch > 8) {
+        ch = 8;
+        p.warnings.push_back(L"FLAC holds at most 8 channels: downmixed to 8.");
+    }
+    bool resample = sr && a.sampleRate && sr != a.sampleRate;
+    bool remix = ch && a.channels && ch != a.channels;
+    std::string filter = audioFilter(s, sr);
     double dur = m.duration > 0 ? m.duration : a.duration;
     double bps = 0;
-    bool lossless = !resample && !remix;
+    bool lossless = !resample && !remix && filter.empty();
+    bool copied = false;
     std::wstring line;
+    OutExpect ex;
+    ex.type = "audio";
+    ex.channels = ch;
+    ex.sampleRate = sr;
     if (s.audio == AudioTarget::MP3) {
-        if (a.codec == "mp3" && !resample && !remix) {
+        if (a.codec == "mp3" && !resample && !remix && filter.empty()) {
             p.args.insert(p.args.end(), {L"-c:0", L"copy"});
             line = L"audio: MP3 copied bit-for-bit (already MP3)";
-            p.cls = QualityClass::Copy;
+            copied = true;
             bps = a.bitrate;
             p.copiedSourceStreams.push_back(a.index);
         } else {
@@ -418,26 +541,25 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
                 bps = s.mp3Kbps * 1000.0;
                 line = L"audio: MP3 CBR " + I(s.mp3Kbps) + L" kb/s";
             }
-            p.cls = QualityClass::Lossy;
+            lossless = false;
             p.warnings.push_back(L"MP3 is always lossy: no bitrate makes it bit-exact. 320 kb/s CBR is the MP3 maximum. Pick WAV or FLAC for a lossless copy.");
             if (a.lossyAudio() && a.bitrate > 0 && bps > a.bitrate * 1.6)
                 p.warnings.push_back(L"The source is lossy at " + fmtBitrate(a.bitrate) + L"; a higher MP3 bitrate cannot restore what it removed.");
             p.args.insert(p.args.end(), {L"-id3v2_version", L"3"});
         }
+        ex.codec = "mp3";
     } else if (s.audio == AudioTarget::FLAC) {
         p.encoder = L"flac";
-        bool srcFloat = a.lossyAudio() || a.sampleFmt == "flt" || a.sampleFmt == "fltp" || a.sampleFmt == "dbl" || a.sampleFmt == "dblp";
+        bool srcFloat = floatAudio(a);
         int depth = s.bitDepth ? s.bitDepth : (srcFloat ? 24 : (a.bitsPerSample ? a.bitsPerSample : 16));
         if (depth > 24) depth = 24;
         p.args.insert(p.args.end(), {L"-c:0", L"flac", L"-compression_level:0", I(s.flacLevel)});
         if (depth <= 16) p.args.insert(p.args.end(), {L"-sample_fmt:0", L"s16"});
         else p.args.insert(p.args.end(), {L"-sample_fmt:0", L"s32", L"-bits_per_raw_sample:0", I(depth)});
-        bps = (double)(s.sampleRate ? s.sampleRate : a.sampleRate) * (s.channels ? s.channels : a.channels) * depth * 0.6;
+        bps = (double)(sr ? sr : 48000) * (ch ? ch : 2) * depth * 0.6;
         p.estVariable = true;
         line = L"audio: FLAC level " + I(s.flacLevel) + L", " + I(depth) + L"-bit";
-        if (a.codec == "flac" && !s.bitDepth && !resample && !remix) {
-            line += L" (re-packed losslessly; Copy via Remux is identical and faster)";
-        }
+        if (a.codec == "flac" && !s.bitDepth && lossless) line += L" (re-packed losslessly; Copy via Remux is identical and faster)";
         if (srcFloat) {
             lossless = false;
             p.warnings.push_back(L"The source is lossy (decoded as floating point). FLAC stores integers, so samples are rounded to " + I(depth) +
@@ -446,42 +568,47 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
             lossless = false;
             p.warnings.push_back(L"Bit depth reduced from " + I(a.bitsPerSample) + L" to " + I(depth) + L" bits.");
         }
-        p.cls = lossless ? QualityClass::Lossless : QualityClass::Lossy;
+        ex.codec = "flac";
     } else {
         std::string codec = pcmCodecFor(a, s.bitDepth);
         p.encoder = W(codec);
         p.args.insert(p.args.end(), {L"-c:0", W(codec)});
-        bps = pcmBitrate(a, codec, s.sampleRate, s.channels);
+        bps = pcmBitrate(a, codec, sr, ch);
         line = L"audio: WAV " + W(codec);
-        bool srcFloat = a.lossyAudio() || a.sampleFmt == "flt" || a.sampleFmt == "fltp";
-        if (s.bitDepth && s.bitDepth != 32 && (srcFloat || (a.bitsPerSample && s.bitDepth < a.bitsPerSample))) {
+        if (!pcmExact(a, s.bitDepth)) {
             lossless = false;
             p.warnings.push_back(L"Requested " + I(s.bitDepth) + L"-bit rounds the source samples; leave bit depth on 'source' for an exact decode.");
         }
         if (a.lossyAudio()) p.warnings.push_back(L"The source is lossy: WAV is an exact decode, larger than the source, with no quality gain.");
         if (bps * dur / 8 > 4.0e9) p.warnings.push_back(L"WAV is limited to 4 GiB; FFmpeg writes RF64 beyond that, which some players reject.");
-        p.cls = lossless ? QualityClass::Lossless : QualityClass::Lossy;
         p.args.insert(p.args.end(), {L"-rf64", L"auto"});
+        ex.codec = codec;
     }
+    p.cls = copied ? QualityClass::Copy : lossless ? QualityClass::Lossless : QualityClass::Lossy;
     if (resample) {
-        p.args.insert(p.args.end(), {L"-ar:0", I(s.sampleRate)});
-        line += L", resampled to " + I(s.sampleRate) + L" Hz";
-        p.warnings.push_back(L"Resampling changes every sample (not lossless).");
+        p.args.insert(p.args.end(), {L"-ar:0", I(sr)});
+        line += L", resampled to " + I(sr) + L" Hz";
+        if (s.sampleRate) p.warnings.push_back(L"Resampling changes every sample (not lossless).");
     }
     if (remix) {
-        p.args.insert(p.args.end(), {L"-ac:0", I(s.channels)});
-        line += L", " + I(s.channels) + L" channels";
-        p.warnings.push_back(L"Channel downmix/upmix is not lossless.");
+        p.args.insert(p.args.end(), {L"-ac:0", I(ch)});
+        line += L", " + chName(ch);
+        if (s.channels) p.warnings.push_back(L"Channel downmix/upmix is not lossless.");
     }
-    if (p.cls == QualityClass::Lossless && !lossless) p.cls = QualityClass::Lossy;
+    if (!filter.empty()) {
+        p.args.insert(p.args.end(), {L"-filter:0", W(filter)});
+        line += L", loudness " + loudnessName(s.loudness);
+    }
     p.lines.push_back(line);
-    o = 1;
+    p.expect.push_back(ex);
+    int o = 1;
     // Cover art: MP3 and FLAC hold one picture.
     for (auto& st : m.streams) {
         if (st.type == "video" && st.attachedPic) {
             if (c != Container::WAV && fitStream(c, st) == Fit::Copy) {
                 p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index), L"-c:" + I(o), L"copy", L"-disposition:" + I(o), L"attached_pic"});
                 p.lines.push_back(L"cover: copied");
+                p.expect.push_back(copyExpect(st));
                 o++;
             } else {
                 p.lines.push_back(L"cover: dropped (" + std::wstring(containerName(c)) + L" cannot hold this picture)");
@@ -497,6 +624,13 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
     p.ok = true;
     return p;
 }
+
+// The video filter chain, in processing order. tw/th/tfps follow the frames through it.
+struct VideoChain {
+    std::vector<std::string> f;
+    std::vector<std::wstring> said;  // what the plan line says
+    bool altered = false;            // pixels change (a lossless encode is no longer identical)
+};
 
 Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& caps) {
     if (!m.ok) {
@@ -520,6 +654,8 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
     bool anyLossy = false, anyEncode = false;
     int o = 0;
     bool haveVideo = false;
+    if (s.vcodec == VCodec::Copy && s.hasVideoFilters())
+        p.warnings.push_back(L"Video filters need an encode: they are ignored while the video is copied.");
     for (const auto& st : m.streams) {
         std::wstring idx = I(o);
         if (st.isVideo()) {
@@ -533,6 +669,7 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
                 if (st.codec == "hevc" && (c == Container::MP4 || c == Container::MOV)) p.args.insert(p.args.end(), {L"-tag:" + idx, L"hvc1"});
                 p.lines.push_back(L"video #" + I(st.index) + L": copied bit-for-bit (" + W(st.codec) + L")");
                 p.copiedSourceStreams.push_back(st.index);
+                p.expect.push_back(copyExpect(st));
                 bps += st.bitrate > 0 ? st.bitrate : m.videoBitrate();
                 o++;
                 continue;
@@ -540,37 +677,66 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             anyEncode = true;
             p.encoder = W(enc);
             p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index), L"-c:" + idx, W(enc)});
-            // Target size and rate.
+            // Frames as FFmpeg decodes them: a rotation tag is applied (autorotate), so 90 degrees swaps the sides.
             int tw = st.width, th = st.height;
-            std::vector<std::string> filters;
+            if (std::abs(st.rotation) % 180 == 90) std::swap(tw, th);
+            double tfps = st.fps;
+            VideoChain vc;
+            if (s.deinterlace) {
+                bool inter = st.fieldOrder == "tt" || st.fieldOrder == "bb" || st.fieldOrder == "tb" || st.fieldOrder == "bt";
+                const char* mode = s.deinterlace == 3 ? "send_field" : "send_frame";
+                const char* which = s.deinterlace == 1 ? "interlaced" : "all";
+                vc.f.push_back(std::string("bwdif=mode=") + mode + ":deint=" + which);
+                vc.said.push_back(s.deinterlace == 3 ? L"deinterlaced (double rate)" : L"deinterlaced");
+                vc.altered = vc.altered || s.deinterlace > 1 || inter;
+                if (s.deinterlace == 3 && tfps > 0) tfps *= 2;
+                if (s.deinterlace == 1 && !inter && st.fieldOrder == "progressive")
+                    p.warnings.push_back(L"Deinterlace (auto) does nothing here: the source is progressive.");
+            }
+            if (s.denoise) {
+                const char* d[] = {"", "hqdn3d=2:1.5:3:2.25", "hqdn3d=4:3:6:4.5", "hqdn3d=8:6:12:9"};
+                vc.f.push_back(d[s.denoise]);
+                vc.said.push_back(s.denoise == 1 ? L"denoise light" : s.denoise == 2 ? L"denoise medium" : L"denoise strong");
+                vc.altered = true;
+            }
+            if (s.rotate) {
+                const char* r[] = {"", "transpose=clock", "transpose=cclock", "hflip,vflip", "hflip", "vflip"};
+                const wchar_t* n[] = {L"", L"rotated 90 cw", L"rotated 90 ccw", L"rotated 180", L"mirrored", L"flipped"};
+                vc.f.push_back(r[s.rotate]);
+                vc.said.push_back(n[s.rotate]);
+                if (s.rotate <= 2) std::swap(tw, th);
+                vc.altered = true;
+            }
             if (s.width || s.height) {
                 int w2 = s.width, h2 = s.height;
-                if (!w2) w2 = st.height ? (int)std::lround(st.width * (double)h2 / st.height / 2) * 2 : -2;
-                if (!h2) h2 = st.width ? (int)std::lround(st.height * (double)w2 / st.width / 2) * 2 : -2;
-                if (w2 != st.width || h2 != st.height) {
-                    filters.push_back("scale=" + std::to_string(w2) + ":" + std::to_string(h2) + ":flags=lanczos");
-                    if (w2 > st.width || h2 > st.height) p.warnings.push_back(L"Upscaling adds pixels, not detail; the file grows with no quality gain.");
+                if (!w2) w2 = th ? (int)std::lround(tw * (double)h2 / th / 2) * 2 : 0;
+                if (!h2) h2 = tw ? (int)std::lround(th * (double)w2 / tw / 2) * 2 : 0;
+                if (w2 > 0 && h2 > 0 && (w2 != tw || h2 != th)) {
+                    vc.f.push_back("scale=" + std::to_string(w2) + ":" + std::to_string(h2) + ":flags=lanczos");
+                    vc.said.push_back(L"scaled");
+                    if (w2 > tw || h2 > th) p.warnings.push_back(L"Upscaling adds pixels, not detail; the file grows with no quality gain.");
                     tw = w2;
                     th = h2;
+                    vc.altered = true;
                 }
             }
-            double tfps = st.fps;
-            if (s.fps > 0 && std::fabs(s.fps - st.fps) > 0.01) {
+            if (s.sharpen) {
+                vc.f.push_back(s.sharpen == 1 ? "unsharp=5:5:0.5:5:5:0" : "unsharp=5:5:1.0:5:5:0");
+                vc.said.push_back(s.sharpen == 1 ? L"sharpen light" : L"sharpen medium");
+                vc.altered = true;
+            }
+            if (s.fps > 0 && std::fabs(s.fps - tfps) > 0.01) {
                 char b[32];
                 snprintf(b, sizeof b, "fps=%.6g", s.fps);
-                filters.push_back(b);
-                tfps = s.fps;
-                if (s.fps > st.fps) p.warnings.push_back(L"Raising the frame rate duplicates frames; motion does not get smoother.");
+                vc.f.push_back(b);
+                if (s.fps > tfps) p.warnings.push_back(L"Raising the frame rate duplicates frames; motion does not get smoother.");
                 else p.warnings.push_back(L"Lowering the frame rate drops frames.");
-            }
-            if (!filters.empty()) {
-                std::string f;
-                for (auto& x : filters) f += (f.empty() ? "" : ",") + x;
-                p.args.insert(p.args.end(), {L"-filter:" + idx, W(f)});
+                tfps = s.fps;
+                vc.altered = true;
             }
             // Pixel format.
             std::string wantPix = s.pixFmt.empty() ? st.pixFmt : s.pixFmt;
-            if (s.vcodec == VCodec::DNxHR_HQX) wantPix = pixFmtChroma(st.pixFmt) == "444" && s.pixFmt.empty() ? "yuv422p10le" : (s.pixFmt.empty() ? "yuv422p10le" : s.pixFmt);
+            if (s.vcodec == VCodec::DNxHR_HQX) wantPix = s.pixFmt.empty() || pixFmtDepth(s.pixFmt) < 10 ? "yuv422p10le" : s.pixFmt;
             else if (s.vcodec == VCodec::DNxHR_444) wantPix = "yuv444p10le";
             else if (isDnxhr(s.vcodec)) wantPix = "yuv422p";
             std::string pix = nearestPix(enc, wantPix, caps);
@@ -584,9 +750,28 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             auto chRank = [](const std::string& ch) { return ch == "444" ? 3 : ch == "422" ? 2 : ch == "420" ? 1 : 0; };
             if (chRank(srcCh) > chRank(outCh) && chRank(outCh) > 0)
                 p.warnings.push_back(L"Chroma is subsampled from 4:" + W(srcCh.substr(1)) + L" to 4:" + W(outCh.substr(1)) + L".");
+            if (srcDepth > outDepth || (chRank(srcCh) > chRank(outCh) && chRank(outCh) > 0) || startsWith(st.pixFmt, "yuvj") != startsWith(pix, "yuvj"))
+                vc.altered = true;
+            // 4:2:0, 4:2:2 and DNxHR need even sides (the encoders round silently otherwise, measured): an odd
+            // source loses its last column or row, said in the plan. 4:4:4 keeps odd sizes.
+            bool even = outCh == "420" || outCh == "422" || isDnxhr(s.vcodec);
+            int ew = even ? tw & ~1 : tw, eh = even ? th & ~1 : th;
+            if ((ew != tw || eh != th) && ew > 0 && eh > 0) {
+                vc.f.push_back("crop=" + std::to_string(ew) + ":" + std::to_string(eh) + ":0:0");
+                p.warnings.push_back(L"Odd frame size " + I(tw) + L"x" + I(th) + L": the encoder needs even sides, so the last " +
+                                     (ew != tw && eh != th ? L"column and row are" : ew != tw ? L"column is" : L"row is") + L" cropped.");
+                tw = ew;
+                th = eh;
+                vc.altered = true;
+            }
             if (st.hdr() && outDepth < 10) p.warnings.push_back(L"HDR needs 10-bit: this output will look wrong. Use H.265 10-bit.");
             if (st.hdr() && s.vcodec == VCodec::H264) p.warnings.push_back(L"H.264 HDR plays on very few devices; H.265 is the HDR codec.");
-            if (pix != st.pixFmt || !filters.empty()) p.args.insert(p.args.end(), {L"-pix_fmt:" + idx, W(pix)});
+            if (!vc.f.empty()) {
+                std::string f;
+                for (auto& x : vc.f) f += (f.empty() ? "" : ",") + x;
+                p.args.insert(p.args.end(), {L"-filter:" + idx, W(f)});
+            }
+            if (pix != st.pixFmt || !vc.f.empty()) p.args.insert(p.args.end(), {L"-pix_fmt:" + idx, W(pix)});
             // Rate control.
             std::wstring rateText;
             double vbps = 0;
@@ -603,7 +788,8 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
                 else if (contains(enc, "nvenc")) p.args.insert(p.args.end(), {L"-preset:" + idx, L"p7", L"-tune:" + idx, L"lossless"});
                 double raw = (double)tw * th * (tfps > 0 ? tfps : 30) * outDepth * (outCh == "444" ? 3 : outCh == "422" ? 2 : 1.5);
                 vbps = raw / 3.0;  // lossless H.264/H.265 is typically 2-4x smaller than raw
-                rateText = L"lossless (qp 0)";
+                rateText = vc.altered ? L"lossless encode of the changed frames" : L"lossless (qp 0)";
+                if (vc.altered) anyLossy = true;  // the encode is exact, the frames are not the source's
                 if (st.codec != "rawvideo" && codecEfficiency(st.codec) < 3 && m.videoBitrate() > 0)
                     p.warnings.push_back(L"The source is already compressed (" + W(st.codec) +
                                          L"): lossless output keeps every decoded pixel exactly but is many times larger, with no quality gain. Remux copies it bit-for-bit instead.");
@@ -612,6 +798,8 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
                 std::wstring b = fmtFixed(s.mbps * 1000, 0) + L"k";
                 p.args.insert(p.args.end(), {L"-b:" + idx, b, L"-maxrate:" + idx, fmtFixed(s.mbps * 1500, 0) + L"k", L"-bufsize:" + idx, fmtFixed(s.mbps * 2000, 0) + L"k"});
                 if (contains(enc, "nvenc")) p.args.insert(p.args.end(), {L"-rc:" + idx, L"vbr"});
+                if (enc == "libx264" || enc == "libx265") p.args.insert(p.args.end(), {L"-preset:" + idx, W(s.speed)});
+                else if (contains(enc, "nvenc")) p.args.insert(p.args.end(), {L"-preset:" + idx, W(nvencPreset(s.speed))});
                 rateText = L"average " + fmtBitrate(vbps);
                 anyLossy = true;
                 double src = m.videoBitrate();
@@ -628,15 +816,17 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
                     p.args.insert(p.args.end(), {L"-preset:" + idx, W(s.speed), L"-crf:" + idx, I(q)});
                     rateText = L"CRF " + I(q);
                 } else if (contains(enc, "nvenc")) {
-                    p.args.insert(p.args.end(), {L"-preset:" + idx, W(nvencPreset(s.speed)), L"-tune:" + idx, L"hq", L"-rc:" + idx, L"vbr", L"-cq:" + idx, I(q + 1), L"-b:" + idx, L"0"});
-                    rateText = L"CQ " + I(q + 1);
+                    p.args.insert(p.args.end(), {L"-preset:" + idx, W(nvencPreset(s.speed)), L"-tune:" + idx, L"hq", L"-rc:" + idx, L"vbr", L"-cq:" + idx, I(std::clamp(q + 1, 1, 51)), L"-b:" + idx, L"0"});
+                    rateText = L"CQ " + I(std::clamp(q + 1, 1, 51));
                 } else if (contains(enc, "qsv")) {
-                    p.args.insert(p.args.end(), {L"-preset:" + idx, W(s.speed == "ultrafast" || s.speed == "superfast" ? std::string("veryfast") : s.speed), L"-global_quality:" + idx, I(q + 2)});
-                    rateText = L"ICQ " + I(q + 2);
+                    p.args.insert(p.args.end(), {L"-preset:" + idx, W(s.speed == "ultrafast" || s.speed == "superfast" ? std::string("veryfast") : s.speed == "placebo" ? std::string("veryslow") : s.speed),
+                                                 L"-global_quality:" + idx, I(std::clamp(q + 2, 1, 51))});
+                    rateText = L"ICQ " + I(std::clamp(q + 2, 1, 51));
                 } else if (contains(enc, "amf")) {
                     std::string qual = (s.speed == "slow" || s.speed == "slower" || s.speed == "veryslow") ? "quality" : (s.speed == "medium" ? "balanced" : "speed");
-                    p.args.insert(p.args.end(), {L"-quality:" + idx, W(qual), L"-rc:" + idx, L"cqp", L"-qp_i:" + idx, I(q + 2), L"-qp_p:" + idx, I(q + 2), L"-qp_b:" + idx, I(q + 4)});
-                    rateText = L"QP " + I(q + 2);
+                    p.args.insert(p.args.end(), {L"-quality:" + idx, W(qual), L"-rc:" + idx, L"cqp", L"-qp_i:" + idx, I(std::clamp(q + 2, 0, 51)), L"-qp_p:" + idx,
+                                                 I(std::clamp(q + 2, 0, 51)), L"-qp_b:" + idx, I(std::clamp(q + 4, 0, 51))});
+                    rateText = L"QP " + I(std::clamp(q + 2, 0, 51));
                 }
                 double bpp = 0.14 * std::pow(2.0, (18.0 - q) / 6.0) * (s.vcodec == VCodec::H265 ? 0.55 : 1.0);
                 if (outDepth > 8) bpp *= 1.1;
@@ -665,59 +855,88 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             }
             if (st.hdr() && isHw(enc)) p.warnings.push_back(L"HDR with a hardware encoder: colour tags are kept; mastering-display metadata depends on the driver. Software x265 writes it explicitly.");
             colorArgs(p.args, o, st);
-            if (st.fieldOrder == "tt" || st.fieldOrder == "bb" || st.fieldOrder == "tb" || st.fieldOrder == "bt")
-                p.warnings.push_back(L"Interlaced source: fields are kept as woven frames (no deinterlacing).");
+            if ((st.fieldOrder == "tt" || st.fieldOrder == "bb" || st.fieldOrder == "tb" || st.fieldOrder == "bt") && !s.deinterlace)
+                p.warnings.push_back(L"Interlaced source: fields are kept as woven frames. Pick DEINTERLACE to convert them to progressive frames.");
+            std::wstring said;
+            for (auto& x : vc.said) said += L", " + x;
             p.lines.push_back(L"video #" + I(st.index) + L": " + W(st.codec) + L" " + I(st.width) + L"x" + I(st.height) + L" -> " + vcodecName(s.vcodec) + L" (" + W(enc) +
-                              L") " + I(tw) + L"x" + I(th) + L" " + fmtFps(tfps) + L"fps " + W(pix) + L", " + rateText);
+                              L") " + I(tw) + L"x" + I(th) + L" " + fmtFps(tfps) + L"fps " + W(pix) + L", " + rateText + said);
+            OutExpect e;
+            e.type = "video";
+            e.codec = isDnxhr(s.vcodec) ? "dnxhd" : s.vcodec == VCodec::H265 ? "hevc" : "h264";
+            e.width = tw;
+            e.height = th;
+            e.depth = outDepth;
+            e.chroma = outCh;
+            p.expect.push_back(e);
             bps += vbps;
             o++;
         } else if (st.type == "video" && st.attachedPic) {
             if (fitStream(c, st) == Fit::Copy) {
                 p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index), L"-c:" + idx, L"copy", L"-disposition:" + idx, L"attached_pic"});
                 p.lines.push_back(L"cover #" + I(st.index) + L": copied");
+                p.expect.push_back(copyExpect(st));
                 o++;
             } else {
                 p.lines.push_back(L"cover #" + I(st.index) + L": not included (" + containerName(c) + L" cannot hold " + W(st.codec) + L" covers)");
             }
         } else if (st.isAudio()) {
+            p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
+            int ch = s.channels && st.channels && s.channels < st.channels ? s.channels : 0;  // downmix only, never upmix
+            bool fxNeeded = s.loudness || ch;
+            std::wstring fx;
+            if (s.loudness) fx += L", loudness " + loudnessName(s.loudness);
+            if (ch && ch != st.channels) fx += L", " + chName(ch);
             Fit fit = fitStream(c, st);
             ACodec act = s.acodec;
             std::wstring reason;
-            if (act == ACodec::Copy && fit != Fit::Copy) {
+            if (act == ACodec::Copy && fxNeeded) {
+                // Loudness and channel changes need decoded samples: AAC in MP4, exact PCM elsewhere.
+                act = c == Container::MP4 ? ACodec::AAC : ACodec::PCM;
+                reason = L" (the audio filters need a re-encode)";
+            } else if (act == ACodec::Copy && fit != Fit::Copy) {
                 act = ACodec::PCM;
                 reason = L" (" + std::wstring(containerName(c)) + L" cannot copy " + W(st.codec) + L"; PCM is the exact decode, AAC would be smaller but lossy)";
             }
-            if (act == ACodec::PCM && c == Container::MKV) {}  // MKV holds PCM too
-            p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
             if (act == ACodec::Copy) {
                 p.args.insert(p.args.end(), {L"-c:" + idx, L"copy"});
                 p.lines.push_back(L"audio #" + I(st.index) + L": copied bit-for-bit (" + W(st.codec) + L")");
                 p.copiedSourceStreams.push_back(st.index);
+                p.expect.push_back(copyExpect(st));
                 bps += st.bitrate > 0 ? st.bitrate : 192000;
             } else if (act == ACodec::AAC) {
-                int ch = st.channels > 8 ? 8 : st.channels;
-                p.args.insert(p.args.end(), {L"-c:" + idx, L"aac", L"-b:" + idx, I(s.aacKbps) + L"k"});
-                if (ch != st.channels) p.args.insert(p.args.end(), {L"-ac:" + idx, I(ch)});
-                p.lines.push_back(L"audio #" + I(st.index) + L": " + W(st.codec) + L" -> AAC " + I(s.aacKbps) + L" kb/s" + reason);
+                std::wstring what;
+                int sr = st.sampleRate > 0 ? aacSampleRate(st.sampleRate) : 0;
+                double ab = addAac(p, st, idx, s.aacKbps, ch, audioFilter(s, sr), what);
+                p.lines.push_back(L"audio #" + I(st.index) + L": " + W(st.codec) + L" -> " + what + fx + reason);
                 anyLossy = true;
                 anyEncode = true;
-                if (st.lossyAudio() && st.bitrate > 0 && s.aacKbps * 1000.0 > st.bitrate * 1.3 && st.codec != "ac3" && st.codec != "dts")
-                    p.warnings.push_back(L"Audio #" + I(st.index) + L": AAC " + I(s.aacKbps) + L" kb/s is above the lossy source's " + fmtBitrate(st.bitrate) +
-                                         L"; no quality gain." + (fit == Fit::Copy ? L" Copy keeps it bit-for-bit." : L""));
-                else if (st.lossyAudio() && fit == Fit::Copy)
+                if (st.lossyAudio() && st.bitrate > 0 && ab > st.bitrate * 1.3 && st.codec != "ac3" && st.codec != "dts")
+                    p.warnings.push_back(L"Audio #" + I(st.index) + L": AAC " + I((int)(ab / 1000)) + L" kb/s is above the lossy source's " + fmtBitrate(st.bitrate) +
+                                         L"; no quality gain." + (fit == Fit::Copy && !fxNeeded ? L" Copy keeps it bit-for-bit." : L""));
+                else if (st.lossyAudio() && fit == Fit::Copy && !fxNeeded)
                     p.warnings.push_back(L"Audio #" + I(st.index) + L" is already lossy (" + W(st.codec) + L"); AAC adds generation loss. Copy keeps it bit-for-bit.");
-                bps += s.aacKbps * 1000.0;
+                bps += ab;
             } else {
                 std::string pc = pcmCodecFor(st, s.pcmBits);
+                std::string filter = audioFilter(s, st.sampleRate);
                 p.args.insert(p.args.end(), {L"-c:" + idx, W(pc)});
-                p.lines.push_back(L"audio #" + I(st.index) + L": " + W(st.codec) + L" -> " + W(pc) + reason);
+                if (ch && ch != st.channels) p.args.insert(p.args.end(), {L"-ac:" + idx, I(ch)});
+                if (!filter.empty()) p.args.insert(p.args.end(), {L"-filter:" + idx, W(filter)});
+                p.lines.push_back(L"audio #" + I(st.index) + L": " + W(st.codec) + L" -> " + W(pc) + fx + reason);
                 anyEncode = true;
-                bool exact = s.pcmBits == 0 || s.pcmBits == 32 || (!st.lossyAudio() && st.bitsPerSample && s.pcmBits >= st.bitsPerSample);
-                if (!exact) {
+                if (!pcmExact(st, s.pcmBits)) {
                     anyLossy = true;
                     p.warnings.push_back(L"Audio #" + I(st.index) + L": " + I(s.pcmBits) + L"-bit PCM rounds the samples; 'exact' keeps them identical.");
                 }
-                bps += pcmBitrate(st, pc, 0, 0);
+                if (!filter.empty() || (ch && ch != st.channels)) anyLossy = true;
+                OutExpect e;
+                e.type = "audio";
+                e.codec = pc;
+                e.channels = ch ? ch : st.channels;
+                e.sampleRate = st.sampleRate;
+                p.expect.push_back(e);
+                bps += pcmBitrate(st, pc, 0, ch);
             }
             o++;
         } else if (st.isSub()) {
@@ -728,24 +947,29 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             Fit fit = fitStream(c, st);
             if (fit == Fit::No) {
                 p.lines.push_back(L"subtitle #" + I(st.index) + L": NOT included");
-                p.warnings.push_back(L"Subtitle #" + I(st.index) + L" (" + W(st.codec) + L", image-based) cannot go in " + containerName(c) +
-                                     L".");
+                p.warnings.push_back(L"Subtitle #" + I(st.index) + L" (" + W(st.codec) + L", image-based) cannot go in " + containerName(c) + L".");
                 continue;
             }
             p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
             if (fit == Fit::Copy) {
                 p.args.insert(p.args.end(), {L"-c:" + idx, L"copy"});
                 p.lines.push_back(L"subtitle #" + I(st.index) + L": copied (" + W(st.codec) + L")");
+                p.expect.push_back(copyExpect(st));
             } else {
-                const wchar_t* to = c == Container::MKV ? L"srt" : L"mov_text";
-                p.args.insert(p.args.end(), {L"-c:" + idx, to});
-                p.lines.push_back(L"subtitle #" + I(st.index) + L": " + W(st.codec) + L" -> " + to + L" (text kept, styling lost)");
+                bool mkv = c == Container::MKV;
+                p.args.insert(p.args.end(), {L"-c:" + idx, mkv ? L"srt" : L"mov_text"});
+                p.lines.push_back(L"subtitle #" + I(st.index) + L": " + W(st.codec) + L" -> " + (mkv ? L"srt" : L"mov_text") + L" (text kept, styling lost)");
+                OutExpect e;
+                e.type = "subtitle";
+                e.codec = mkv ? "subrip" : "mov_text";
+                p.expect.push_back(e);
             }
             o++;
         } else if (st.type == "attachment") {
             if (attachmentsFit(c)) {
                 p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
                 p.lines.push_back(L"attachment #" + I(st.index) + L": copied");
+                p.expect.push_back(copyExpect(st));
                 o++;
             } else {
                 p.lines.push_back(L"attachment #" + I(st.index) + L" (" + W(st.filename) + L"): NOT included (" + containerName(c) + L" has no attachments)");
@@ -803,9 +1027,12 @@ const wchar_t* pcmBitsName(int bits) {
     return bits == 16 ? L"16-bit" : bits == 24 ? L"24-bit" : bits == 32 ? L"32-bit float" : L"exact";
 }
 
-TrackAction defaultAction(Container c, const StreamInfo& s, bool audioPcm) {
-    if (audioPcm && s.isAudio()) return TrackAction::ToPCM;
+TrackAction defaultAction(Container c, const StreamInfo& s, RemuxAudio audio) {
     Fit f = fitStream(c, s);
+    if (s.isAudio()) {
+        if (audio == RemuxAudio::PCM) return TrackAction::ToPCM;
+        if (audio == RemuxAudio::AAC) return s.codec == "aac" && f == Fit::Copy ? TrackAction::Copy : TrackAction::ToAAC;  // AAC stays bit-for-bit
+    }
     if (f == Fit::Copy) return TrackAction::Copy;
     if (f == Fit::Convert) {
         if (s.isAudio()) return TrackAction::ToPCM;
@@ -817,7 +1044,10 @@ TrackAction defaultAction(Container c, const StreamInfo& s, bool audioPcm) {
 std::vector<TrackAction> allowedActions(Container c, const StreamInfo& s) {
     std::vector<TrackAction> r;
     if (fitStream(c, s) == Fit::Copy) r.push_back(TrackAction::Copy);
-    if (s.isAudio()) r.push_back(TrackAction::ToPCM);  // Remux stays lossless: no AAC here
+    if (s.isAudio()) {
+        r.push_back(TrackAction::ToPCM);
+        r.push_back(TrackAction::ToAAC);
+    }
     if (s.isSub() && s.textSub() && fitStream(c, s) != Fit::Copy) r.push_back(TrackAction::ToText);
     r.push_back(TrackAction::Exclude);
     return r;
@@ -836,9 +1066,9 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
     double bps = 0;
     for (const auto& st : m.streams) {
         auto it = s.actions.find(st.index);
-        TrackAction a = it != s.actions.end() ? it->second : defaultAction(c, st, s.audioPcm);
+        TrackAction a = it != s.actions.end() ? it->second : defaultAction(c, st, s.audio);
         auto allowed = allowedActions(c, st);
-        if (std::find(allowed.begin(), allowed.end(), a) == allowed.end()) a = defaultAction(c, st, s.audioPcm);
+        if (std::find(allowed.begin(), allowed.end(), a) == allowed.end()) a = defaultAction(c, st, s.audio);
         std::wstring idx = I(o), d = describeStream(st);
         if (a == TrackAction::Exclude && st.codec == "bin_data" && m.chapters) {
             p.lines.push_back(d + L"  ->  chapter text track (chapters are carried separately)");
@@ -858,26 +1088,47 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
                 if (st.type == "video" && st.attachedPic) p.args.insert(p.args.end(), {L"-disposition:" + idx, L"attached_pic"});
                 p.lines.push_back(d + L"  ->  COPY (bit-for-bit)");
                 if (st.isVideo() || st.isAudio()) p.copiedSourceStreams.push_back(st.index);
+                p.expect.push_back(copyExpect(st));
                 bps += st.bitrate > 0 ? st.bitrate : (st.isVideo() ? m.videoBitrate() : st.isAudio() ? 192000 : 0);
                 break;
             case TrackAction::ToPCM: {
                 std::string pc = pcmCodecFor(st, s.pcmBits);
                 p.args.insert(p.args.end(), {L"-c:" + idx, W(pc)});
-                bool exact = s.pcmBits == 0 || s.pcmBits == 32 || (!st.lossyAudio() && st.bitsPerSample && s.pcmBits >= st.bitsPerSample);
+                bool exact = pcmExact(st, s.pcmBits);
                 p.lines.push_back(d + L"  ->  " + W(pc) + (exact ? L" (exact decode, lossless)" : L" (samples rounded)"));
                 if (!exact) {
                     anyLossy = true;
                     p.warnings.push_back(d + L": " + I(s.pcmBits) + L"-bit PCM rounds the samples; 'exact' keeps them identical.");
                 }
                 anyEncode = true;
+                OutExpect e;
+                e.type = "audio";
+                e.codec = pc;
+                e.channels = st.channels;
+                e.sampleRate = st.sampleRate;
+                p.expect.push_back(e);
                 bps += pcmBitrate(st, pc, 0, 0);
                 break;
             }
+            case TrackAction::ToAAC: {
+                std::wstring what;
+                bps += addAac(p, st, idx, s.aacKbps, 0, "", what);
+                p.lines.push_back(d + L"  ->  " + what + L" (lossy)");
+                if (st.lossyAudio()) p.warnings.push_back(d + L" is already lossy: AAC adds a second generation of loss.");
+                anyLossy = true;
+                anyEncode = true;
+                break;
+            }
             case TrackAction::ToText: {
-                const wchar_t* to = c == Container::MKV ? L"srt" : L"mov_text";
+                bool mkv = c == Container::MKV;
+                const wchar_t* to = mkv ? L"srt" : L"mov_text";
                 p.args.insert(p.args.end(), {L"-c:" + idx, to});
                 p.lines.push_back(d + L"  ->  " + to + L" (text kept, styling lost)");
                 if (st.codec == "ass" || st.codec == "ssa") p.warnings.push_back(d + L": ASS styling, fonts and positions are lost in " + to + L".");
+                OutExpect e;
+                e.type = "subtitle";
+                e.codec = mkv ? "subrip" : "mov_text";
+                p.expect.push_back(e);
                 break;
             }
             default: break;
