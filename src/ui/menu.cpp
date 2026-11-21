@@ -96,7 +96,7 @@ struct Menu {
             bool hot = (int)i == hover;
             bool on = isChecked((int)i);
             if (hot) p.fill(row, (int)i == pressed ? theme->line : theme->hover);
-            if (on) p.icon(I_Check, RECT{1, y, padL, y + h}, theme->ink, S(12));
+            if (on) p.icon(I_Check, RECT{1, y, padL, y + h}, theme->ink, S(14));
             p.text(RECT{padL, y, right - S(8), y + h}, (*items)[i], theme->ink, on ? fonts->bold : fonts->normal);
         }
         if (scrollable) {

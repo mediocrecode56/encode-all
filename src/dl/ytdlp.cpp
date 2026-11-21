@@ -76,6 +76,7 @@ YtResult parseYtJson(const std::string& text) {
             if (e.isNull()) continue;  // deleted/private entries come back as null
             YtEntry en;
             en.index = (int)e["playlist_index"].num(i);
+            if (en.index < 1) en.index = i;  // rows, the range box and segments key on it
             en.id = e["id"].str();
             en.url = e["url"].str();
             if (en.url.empty()) en.url = e["webpage_url"].str();

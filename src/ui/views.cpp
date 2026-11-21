@@ -68,19 +68,6 @@ std::wstring qualityText(const ConvertSpec& s) {
     return L"CRF " + std::to_wstring(s.quality);
 }
 
-// Checked playlist entries as "1-3,7" (what the range box parses).
-std::wstring rangesText(const std::vector<char>& on) {
-    std::wstring r;
-    for (int i = 0; i < (int)on.size(); i++) {
-        if (!on[i]) continue;
-        int j = i;
-        while (j + 1 < (int)on.size() && on[j + 1]) j++;
-        r += (r.empty() ? L"" : L",") + std::to_wstring(i + 1) + (j > i ? L"-" + std::to_wstring(j + 1) : L"");
-        i = j;
-    }
-    return r;
-}
-
 // Size, frame rate and pixel format in a few words ("none" when all follow the source).
 std::wstring filtersText(const ConvertSpec& s) {
     std::wstring r;
@@ -158,6 +145,33 @@ std::wstring extTag(const std::wstring& path) {
 const wchar_t* classTag(QualityClass c) { return c == QualityClass::Copy ? L"COPY" : c == QualityClass::Lossless ? L"LOSSLESS" : L"LOSSY"; }
 
 }  // namespace
+
+// Checked playlist entries as "1-3,7", by their playlist numbers (what the rows show), so the text
+// stays right after entries are started or removed.
+std::wstring rangesText(const DlGroup& g) {
+    std::wstring r;
+    int n = (int)std::min(g.entries.size(), g.checked.size());
+    for (int i = 0; i < n; i++) {
+        if (!g.checked[i]) continue;
+        int j = i;
+        while (j + 1 < n && g.checked[j + 1] && g.entries[j + 1].index == g.entries[j].index + 1) j++;
+        r += (r.empty() ? L"" : L",") + std::to_wstring(g.entries[i].index) + (j > i ? L"-" + std::to_wstring(g.entries[j].index) : L"");
+        i = j;
+    }
+    return r;
+}
+
+// The range box's text back to checks; false (nothing changed) while it does not parse.
+bool applyRanges(DlGroup& g, const std::wstring& text) {
+    int maxIndex = 0;
+    for (auto& e : g.entries) maxIndex = std::max(maxIndex, e.index);
+    std::vector<int> idx;
+    if (!g.playlist || !parseRanges(text, maxIndex, idx)) return false;
+    std::vector<char> want(maxIndex + 1, 0);
+    for (int i : idx) want[i] = 1;
+    for (size_t e = 0; e < g.entries.size() && e < g.checked.size(); e++) g.checked[e] = g.entries[e].index > 0 && want[g.entries[e].index];
+    return true;
+}
 
 void MainWindow::build() {
     int pad = S(20);
@@ -271,7 +285,7 @@ void MainWindow::buildHeader(RECT& a) {
 void MainWindow::syncRange(uint64_t key) {
     if (key != rangeKey_) return;
     for (auto& g : groups_)
-        if (g.key == key) SetWindowTextW(edits_[E_RANGE], rangesText(g.checked).c_str());
+        if (g.key == key) SetWindowTextW(edits_[E_RANGE], rangesText(g).c_str());
 }
 
 std::vector<ListRow> MainWindow::collectRows(int tab) {
@@ -461,7 +475,7 @@ void MainWindow::buildSection(RECT a) {
         if (!found && first) {
             rangeKey_ = first;
             for (auto& g : groups_)
-                if (g.key == first) SetWindowTextW(edits_[E_RANGE], rangesText(g.checked).c_str());
+                if (g.key == first) SetWindowTextW(edits_[E_RANGE], rangesText(g).c_str());
         }
     }
     int rowRight = a.right - S(10);  // room for the scroll mark
@@ -548,7 +562,7 @@ void MainWindow::buildDownloadOptions(int& y, const RECT& a) {
         relayout();
     }, nullptr, pathMax);
     int togglesW = 0;
-    for (auto* l : {L"metadata", L"chapters", L"thumbnail", L"subtitles"}) togglesW += S(15) + S(7) + tw(l) + S(16);
+    for (auto* l : {L"metadata", L"chapters", L"thumbnail", L"subtitles"}) togglesW += checkBox() + S(7) + tw(l) + S(16);
     if (x + togglesW > a.right) {
         y += rh;
         x = a.left + labelW();
@@ -918,7 +932,7 @@ void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
 
 int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool selected) {
     int rh = rowH();
-    int is = S(30), gap = S(2);
+    int is = S(36), gap = S(2);
     RowId id = r.id;
     auto act = [this, id](void (MainWindow::*fn)(const ListRow&)) {
         return [this, id, fn] { withRow(id, [this, fn](const ListRow& x) { (this->*fn)(x); }); };
@@ -961,12 +975,12 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
         if (key == rangeKey_ && er.top >= listView_.top && er.bottom <= listView_.bottom) {
             placeEdit(E_RANGE, er);
         } else {
-            Item& it = add(K_Text, RECT{x, ty, x + cw, ty + rh}, rangesText(g.checked), S_Mid | S_Click);
+            Item& it = add(K_Text, RECT{x, ty, x + cw, ty + rh}, rangesText(g), S_Mid | S_Click);
             it.tip = L"type a range such as 1-5,8";
             it.click = [this, key] {
                 rangeKey_ = key;  // the one range box moves to this playlist and shows its own selection
                 for (auto& gg : groups_)
-                    if (gg.key == key) SetWindowTextW(edits_[E_RANGE], rangesText(gg.checked).c_str());
+                    if (gg.key == key) SetWindowTextW(edits_[E_RANGE], rangesText(gg).c_str());
                 relayout(true);
             };
         }
@@ -1161,7 +1175,7 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
         items_.back().tip = checked ? L"skip this entry in start all" : L"include this entry in start all";
     }
     if (r.sub > 0) x += S(28);
-    int vw = S(80), vh = S(45);
+    int vw = S(96), vh = S(54);
     RECT vis{x, y + (h - vh) / 2, x + vw, y + (h - vh) / 2 + vh};
     if (tab_ == 0 && (!thumb.empty() || r.type != ListRow::Task)) {
         Item& th = add(K_Thumb, vis);
@@ -1530,8 +1544,8 @@ void MainWindow::buildSettings(RECT a) {
     RECT view{a.left, y, a.right, a.bottom};
     // Two columns: what the setting is, and its control. Kept to a readable width on wide windows.
     int colL = a.left + S(4);
-    int colC = a.left + std::min<int>(S(230), (a.right - a.left) / 3);
-    int maxR = std::min<int>(a.right - S(12), colC + S(760));
+    int colC = a.left + std::min<int>(S(250), (a.right - a.left) / 3);
+    int maxR = std::min<int>(a.right - S(12), colC + S(900));
     int y0 = view.top - settingsScroll_;
     y = y0;
     beginClip(view);

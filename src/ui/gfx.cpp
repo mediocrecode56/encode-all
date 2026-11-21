@@ -63,12 +63,12 @@ void Fonts::create(int dpi) {
         return CreateFontW(-MulDiv(px, dpi, 96), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, pitch, face);
     };
-    // 12 px Segoe UI (Windows' own 9 pt) and 11 px Consolas: the compact scale (see scale()).
-    normal = mk(12, FW_NORMAL, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
-    bold = mk(12, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
-    big = mk(15, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
-    mono = mk(11, FW_NORMAL, L"Consolas", FIXED_PITCH | FF_MODERN);
-    monoBold = mk(11, FW_BOLD, L"Consolas", FIXED_PITCH | FF_MODERN);
+    // 13 px Segoe UI and 12 px Consolas: readable at the compact scale (see scale()), which sizes only space.
+    normal = mk(13, FW_NORMAL, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
+    bold = mk(13, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
+    big = mk(17, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
+    mono = mk(12, FW_NORMAL, L"Consolas", FIXED_PITCH | FF_MODERN);
+    monoBold = mk(12, FW_BOLD, L"Consolas", FIXED_PITCH | FF_MODERN);
     HDC dc = GetDC(nullptr);
     HGDIOBJ old = SelectObject(dc, normal);
     TEXTMETRICW tm;

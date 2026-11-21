@@ -391,7 +391,7 @@ int MainWindow::button(int x, int y, const std::wstring& label, std::function<vo
 }
 
 int MainWindow::toggle(int x, int y, const std::wstring& label, bool on, std::function<void()> fn) {
-    int w = S(15) + S(7) + tw(label);
+    int w = checkBox() + S(7) + tw(label);
     Item& it = add(K_Check, RECT{x, y, x + w, y + rowH()}, label, S_Click);
     it.value = on ? 1 : 0;
     it.click = std::move(fn);
@@ -646,7 +646,7 @@ void MainWindow::onPaint() {
                 break;
             }
             case K_Check: {
-                int b = S(15);
+                int b = checkBox();
                 int top = it.r.top + (it.r.bottom - it.r.top - b) / 2;
                 RECT box{it.r.left, top, it.r.left + b, top + b};
                 if (hov) p.fill(box, theme_.hover);
@@ -662,7 +662,7 @@ void MainWindow::onPaint() {
                 if (hov || press) p.fill(it.r, theme_.hover);
                 p.frame(it.r, hov ? theme_.ink : theme_.line);
                 p.text(RECT{it.r.left + S(9), it.r.top, it.r.right - S(22), it.r.bottom}, it.text, theme_.ink, f);
-                p.icon(I_Chevron, RECT{it.r.right - S(22), it.r.top, it.r.right - S(4), it.r.bottom}, hov ? theme_.ink : theme_.mid, S(12));
+                p.icon(I_Chevron, RECT{it.r.right - S(22), it.r.top, it.r.right - S(4), it.r.bottom}, hov ? theme_.ink : theme_.mid, S(14));
                 break;
             }
             case K_Icon: {
@@ -670,7 +670,7 @@ void MainWindow::onPaint() {
                 if (on) p.fill(it.r, theme_.ink);
                 else if (hov) p.fill(it.r, theme_.hover);
                 COLORREF c = on ? theme_.bg : (it.style & S_Disabled) ? theme_.line : (it.style & S_Mid) && !hov ? theme_.mid : theme_.ink;
-                p.icon((int)it.value, it.r, c, std::min<int>(S(17), (int)(it.r.bottom - it.r.top) - S(6)));
+                p.icon((int)it.value, it.r, c, std::min<int>(S(23), (int)(it.r.bottom - it.r.top) - S(8)));
                 break;
             }
             case K_Chip: {
@@ -688,7 +688,7 @@ void MainWindow::onPaint() {
                     c = theme_.bg;
                 }
                 const int glyph[] = {I_Min, I_Max, I_WinClose, I_Restore};
-                p.icon(glyph[std::clamp((int)it.value, 0, 3)], it.r, c, S(10));
+                p.icon(glyph[std::clamp((int)it.value, 0, 3)], it.r, c, S(13));
                 break;
             }
             case K_Fill: p.fill(it.r, (it.style & S_Invert) ? theme_.ink : theme_.off); break;
@@ -819,6 +819,7 @@ bool MainWindow::preTranslate(MSG& m) {
             } else if (r.type == ListRow::Task) {
                 if (r.task->state == TaskState::Paused) queue_.resume(r.task->id);
                 else if (r.task->state == TaskState::Running || r.task->state == TaskState::Waiting) queue_.pause(r.task->id);
+                else if (r.task->state == TaskState::Failed || r.task->state == TaskState::Canceled) queue_.retry(r.task->id);
             } else {
                 startRow(r);
             }
@@ -996,11 +997,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
                 for (auto& g : groups_) {
                     if (g.key != key) continue;
                     if (id == E_RANGE) {
-                        std::vector<int> idx;
-                        if (g.playlist && parseRanges(t, (int)g.entries.size(), idx)) {
-                            std::fill(g.checked.begin(), g.checked.end(), 0);
-                            for (int i : idx) g.checked[i - 1] = 1;
-                        }
+                        applyRanges(g, t);
                     } else {
                         int sub = sel_[0].sub;
                         for (size_t e = 0; e < g.segA.size(); e++)

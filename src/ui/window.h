@@ -63,6 +63,8 @@ struct DlGroup {
     std::vector<char> checked;
     std::vector<std::wstring> segA, segB;
 };
+std::wstring rangesText(const DlGroup& g);                 // checked entries by playlist number: "1-3,7"
+bool applyRanges(DlGroup& g, const std::wstring& text);  // the range box back to checks
 
 struct FileRow {
     uint64_t key = 0;
@@ -150,7 +152,8 @@ private:
     int seg(int x, int y, const std::vector<std::wstring>& opts, int sel, std::function<void(int)> fn);
     int iconButton(int x, int y, int icon, bool on, std::function<void()> fn);  // returns the left edge (laid out right to left)
     int fieldLabel(int x, int y, const std::wstring& label, unsigned style = S_Mid);  // fixed label column; returns the control x
-    int labelW() const { return S(112); }
+    int labelW() const { return S(130); }
+    int checkBox() const { return S(17); }  // a checkbox square; toggles measure their width with it
     void scrollbar(const RECT& view, int offset, int content);
     int sectionTitle(int x, int y, const std::wstring& title);  // bold title; returns its right edge
     void emptyState(const RECT& r, const std::wstring& line1, const std::wstring& line2 = L"");

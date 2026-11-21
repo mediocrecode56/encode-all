@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.4 - 2026-11-21
+- Readability: text is 13 px Segoe UI and 12 px Consolas (was 12 and 11), the title 17 px; icons are about a third larger (row actions, header, bar), with bigger checkboxes, dropdown marks and window buttons. Thumbnails are larger. Spacing keeps the compact scale, so the window stays as small as 1.0.3.
+- Labels no longer cut off: the label column fits "AUDIO ONLY", the download toggles (metadata, chapters...) measure their own checkbox, and Settings gives its labels and notes more room.
+- Fix: the playlist RANGE box counts by the playlist numbers the rows show. Before, after an entry was started or removed, "5-10" picked the wrong entries. Entries without a playlist number get their position.
+- Space on a failed or canceled task retries it (as its row's button does).
+
 ## 1.0.3 - 2026-11-21
 - No more queue panel: every section works the same way. A bar at the top takes links (Download; every link on the clipboard is read at once) or files (Convert, Remux: click or drop), the options sit under it, and one list holds each item before and after it starts, newest first. Each row has its own actions: start (or pause, resume, retry), open the link or play the file, show its folder, remove or cancel. "start all" at the top right starts everything that is ready (Ctrl+Enter); pause all, resume all and clear finished act on that section only. A started item stays where it was and keeps its thumbnail.
 - A click on a row unfolds its details under it: the segment boxes of a link, the plan and source streams of a conversion, the tracks of a remux, or the result, error, output, log and play/convert/remux of a task. Up/Down select rows, Space starts, pauses or resumes, Delete removes.
