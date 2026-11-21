@@ -25,14 +25,14 @@
 
 namespace ea::ui {
 
-enum : UINT { WM_APP_QUEUE = WM_APP + 1, WM_APP_DEPS, WM_APP_RESULT, WM_APP_THUMB, WM_APP_UPDATE, WM_APP_CAPS, WM_APP_EDITMENU };
+enum : UINT { WM_APP_QUEUE = WM_APP + 1, WM_APP_DEPS, WM_APP_RESULT, WM_APP_THUMB, WM_APP_UPDATE, WM_APP_CAPS, WM_APP_EDITMENU, WM_APP_PASTE };
 
 constexpr unsigned S_Bold = 1, S_Mid = 2, S_Invert = 4, S_Disabled = 8, S_Click = 16, S_Right = 32, S_Selected = 64, S_Big = 128, S_Center = 256,
                    S_Mono = 512;
-constexpr UINT_PTR T_QUEUE = 1, T_FLASH = 2, T_HEALTHY = 3, T_SAVE = 4, T_ANIM = 5;  // T_ANIM runs only while the queue slides
-enum Kind { K_Text, K_Fill, K_Clear, K_Line, K_Progress, K_Thumb, K_Region, K_Frame, K_Button, K_Check, K_Box, K_Cell, K_WinBtn, K_Icon, K_Bar };
-// K_Icon: a square icon button (value = Icon, S_Invert when its view is open). K_Bar: a scroll position mark.
-// K_Clear: background fill (the sliding queue covers what is under it).
+constexpr UINT_PTR T_QUEUE = 1, T_FLASH = 2, T_HEALTHY = 3, T_SAVE = 4;
+enum Kind { K_Text, K_Fill, K_Line, K_Progress, K_Thumb, K_Region, K_Frame, K_Button, K_Check, K_Box, K_Cell, K_WinBtn, K_Icon, K_Bar, K_Chip };
+// K_Icon: a square icon button (value = Icon, S_Invert when its view is open; without S_Click a plain glyph).
+// K_Bar: a scroll position mark. K_Chip: a framed tag (a file's extension where a download shows its thumbnail).
 
 struct Item {
     RECT r{};
@@ -41,6 +41,7 @@ struct Item {
     std::wstring text;
     std::function<void()> click, rclick;
     std::function<void(int)> wheel;
+    std::wstring tip;  // shown in the header's hint while the mouse is over the item (icon buttons)
     HBITMAP bmp = nullptr;
     double value = 0;
     RECT clip{};
@@ -52,6 +53,7 @@ enum class Overlay { None, Log, Settings, History };
 
 struct DlGroup {
     uint64_t key = 0;
+    int64_t order = 0;  // list position (newest first), carried into the tasks it starts
     std::wstring url;
     bool busy = true, playlist = false;
     std::wstring error, hint, title;
@@ -64,11 +66,32 @@ struct DlGroup {
 
 struct FileRow {
     uint64_t key = 0;
+    int64_t order = 0;
     std::wstring path;
     MediaInfo info;
-    bool busy = true, checked = true;
+    bool busy = true;
     std::wstring error;
     RemuxSpec remux;
+};
+
+// One row of a section's list: an item not started yet (a link, a playlist entry, a file) or a task.
+// Pending rows are keyed by their item (key, sub: -1 playlist head, 0 single, else the entry's playlist
+// index); started ones by task id. A started item keeps its order, so it stays where it was.
+struct RowId {
+    uint64_t task = 0, key = 0;
+    int sub = 0;
+    bool empty() const { return !task && !key; }
+    bool operator==(const RowId& o) const { return task == o.task && key == o.key && sub == o.sub; }
+};
+
+struct ListRow {
+    enum Type { Pending, Head, Task } type = Pending;
+    int idx = -1;    // group or file index (pending)
+    int entry = -1;  // playlist entry position (pending), -1 single
+    const TaskView* task = nullptr;
+    int64_t order = 0;
+    int sub = 0;
+    RowId id;
 };
 
 struct WorkResult {
@@ -100,10 +123,14 @@ private:
     void relayout(bool full = false);
     void build();
     void buildHeader(RECT& area);
-    void buildDownload(RECT area);
-    void buildConvert(RECT area);
-    void buildRemux(RECT area);
-    void buildQueue(RECT area);
+    void buildSection(RECT area);  // input bar, options, list head and the list of the current tab
+    void buildDownloadOptions(int& y, const RECT& a);
+    void buildConvertOptions(int& y, const RECT& a);
+    void buildRemuxOptions(int& y, const RECT& a);
+    int buildRow(const ListRow& r, int left, int right, int y, bool selected);  // returns its height
+    int buildRowDetail(const ListRow& r, int left, int right, int y);         // the selected row's extra lines
+    std::vector<ListRow> collectRows(int tab);
+    void withRow(const RowId& id, const std::function<void(const ListRow&)>& fn);  // runs fn on the row if it is still listed
     void buildLog(RECT area);
     void buildSettings(RECT area);
     void buildHistory(RECT area);
@@ -128,9 +155,9 @@ private:
     int sectionTitle(int x, int y, const std::wstring& title);  // bold title; returns its right edge
     void emptyState(const RECT& r, const std::wstring& line1, const std::wstring& line2 = L"");
     void hline(int x0, int x1, int y);
-    void progressBar(const RECT& r, double v);
     void region(const RECT& r, std::function<void(int)> wheel);
-    void placeEdit(Edit e, const RECT& r);
+    void placeEdit(Edit e, const RECT& r, bool frame = true);
+    int rowIcon(int right, int top, int size, int icon, const std::wstring& tip, std::function<void()> fn);  // right to left; returns the left edge
     void beginClip(const RECT& r) { clip_ = r; clipping_ = true; }
     void endClip() { clipping_ = false; }
     // field: an inline caption and a dropdown, flowing left to right and wrapping to the control column.
@@ -141,26 +168,34 @@ private:
     int popup(const std::vector<std::wstring>& items, const std::vector<int>& checked);  // sectioned: one check per section
     int rowH() const { return fonts_.lineH; }
     int barH() const { return S(40); }  // the top bar: drag area, title, window buttons (Weekly-style chrome)
+    int itemH() const { return rowH() * 2 + S(8); }  // a list row: two lines beside its thumbnail
     int denseH() const { return fonts_.denseH; }
 
     // actions
     void setTab(int t);
-    void setOverlay(Overlay o);  // switches views; the queue slides away under Settings and back
-    void animateQueue();
-    void stepQueueAnim();
+    void setOverlay(Overlay o);
     void flash(const std::wstring& msg, UINT ms = 4000);
+    void select(int tab, const RowId& id);  // also loads the segment boxes of a pending download
+    void removeRow(const ListRow& r);
     void removeGroup(int gi);
-    void removeFile(int tab, int i);
+    void syncRange(uint64_t key);  // the range box follows checks changed elsewhere
+    void startRow(const ListRow& r);  // starts one item (a playlist head starts its checked entries)
+    void startAll(int tab);
+    int queueGroup(DlGroup& g, int onlyEntry, const Settings& s, uint64_t* firstTask);  // queues and removes entries; returns the count
+    uint64_t queueFile(int tab, const FileRow& f, const Settings& s);  // 0 when the remux plan fails
+    bool fileReady(int tab, const FileRow& f, const Settings& s);
+    int64_t newOrder();
+    void openUrl(const std::wstring& url);
+    void openPath(const std::wstring& path);
     void spawn(std::function<void()> fn);  // a worker thread; finished ones are joined as new ones start
     void reapWorkers();
     void editMenu(HWND edit, LPARAM at);
-    void analyzeUrls();
-    void startDownloads();
+    void analyzeUrls();                     // the link box: Enter
+    void analyzeText(const std::wstring& t);  // pasted, dropped or passed on the command line
+    bool pasteLinks();                      // Ctrl+V into the link box: true when the clipboard held links
     void addFiles(const std::vector<std::wstring>& files, int tab);
     void pickFiles(int tab);
     std::vector<std::wstring> openFiles(const wchar_t* typeName, const wchar_t* spec, bool multi);
-    void startConvert();
-    void startRemux();
     // An inline text box over the clicked control (at least 160 px wide); Enter or leaving it commits, Esc cancels.
     void customValue(const std::wstring& initial, const RECT& at, std::function<void(const std::wstring&)> done);
     void commitCustom(bool ok);
@@ -193,8 +228,6 @@ private:
     std::vector<Item> items_, prev_;
     RECT clip_{};
     bool clipping_ = false;
-    RECT bound_{};  // outer clip for everything added (the sliding queue)
-    bool bounded_ = false;
     int hover_ = -1, pressed_ = -1;
     POINT mouse_{-1, -1};
     RECT anchor_{};  // the control whose click is running (client coordinates), for dropdown placement
@@ -209,23 +242,28 @@ private:
     AppUpdater updater_;
     EncoderCaps caps_;
     std::mutex capsMu_;
-    bool capsRunning_ = false;
+    std::atomic<bool> capsRunning_{false};
     Thumbs thumbs_;
     int tab_ = 0;
     Overlay overlay_ = Overlay::None;
     std::vector<DlGroup> groups_;
-    int selGroup_ = -1, selEntry_ = -1;
-    int dlScroll_ = 0;
     std::vector<FileRow> conv_, remux_;
-    int selConv_ = -1, selRemux_ = -1;
-    int convScroll_ = 0, remuxScroll_ = 0, detailScroll_ = 0;
-    bool advanced_ = false;
+    RowId sel_[3];
+    int listScroll_[3] = {};
+    bool reveal_ = false;            // scroll the selected row into view on the next layout
+    std::vector<RowId> rowIds_;      // the current tab's rows in order (keyboard)
+    uint64_t rangeKey_ = 0;          // the playlist whose head holds the range box
     std::vector<CustomPreset> presets_;
     int customPreset_ = -1;
     std::vector<TaskView> tasks_;
-    uint64_t selTask_ = 0;
-    bool revealTask_ = false;
-    int queueScroll_ = 0, logScroll_ = 0, settingsScroll_ = 0;
+    uint64_t selTask_ = 0;           // the selected row's task (log view)
+    int64_t lastOrder_ = 0;
+    std::wstring hoverTip_, hintDefault_;  // the header's hint: the hovered item's tip, else the last notice
+    size_t hintIdx_ = SIZE_MAX;
+    void setHint(const std::wstring& tip);
+    Settings view_;     // the settings the current layout was built from
+    RECT listView_{};   // the visible list (edits inside it are placed only when wholly visible)
+    int logScroll_ = 0, settingsScroll_ = 0;
     bool logApp_ = false;
     int historyScroll_ = 0;
     std::vector<HistoryItem> history_;
@@ -244,12 +282,10 @@ private:
     std::vector<Worker> workers_;
     std::thread updateThread_;
     std::atomic<bool> updateBusy_{false};
-    double queueOpen_ = 1, animFrom_ = 1, animTo_ = 1;  // 1 = queue shown
-    ULONGLONG animStart_ = 0;
-    bool animOn_ = false;
     uint64_t nextKey_ = 1;
     bool timerOn_ = false;
     bool healthy_ = false;
+    bool building_ = false;  // inside build(): relayout() is ignored
 };
 
 }  // namespace ea::ui

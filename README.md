@@ -5,18 +5,20 @@ remux video and audio with yt-dlp, FFmpeg and FFprobe. Paste a link or drop a fi
 best source quality and tells you exactly what will happen before anything runs.
 
 ```
-ENCODE ALL v1.0.1                                                        tools ready   _  []  X
-[DOWNLOAD]  CONVERT   REMUX                                             (history) (log) (settings)
+ENCODE ALL v1.0.3                                                        tools ready   _  []  X
+[DOWNLOAD 2]  CONVERT   REMUX                                           (history) (log) (settings)
+[ (link)  Paste links, or type one and press Enter                                     paste ]
 VIDEO       [MP4|MOV|Original]  [H.264|H.265]  QUALITY [extreme|high|normal]
 AUDIO ONLY  [MP3 320|WAV|Original]
-[x] [thumb] 03:12  A video title
-             2160p60 av1 + opus -> MP4 (H.264 CRF 16 + AAC 320k)  ~812 MiB
-QUEUE  1 running  2 waiting
-[=========          ]  48%  DL  LOSSY   A video title        encoding H.264 CRF 16   eta 00:41
+LINKS  1 ready (~812 MiB)  .  1 running                    [pause all]  [START ALL 1]
+[thumb]  A video title                                  ~812 MiB    (>) (open) (folder) (x)
+         03:12  .  2160p60 av1 + opus -> MP4 (H.264 CRF 16 + AAC 320k)
+[thumb]  Another title                          48%  12 MB/s  00:41  (||) (open) (folder) (x)
+         downloading  ________________
 ```
 
 ## Download
-- Videos, playlists (thumbnails, durations, checkboxes, ranges like `1-5,8`) and segments (start/end per item).
+- Videos, playlists (thumbnails, durations, checkboxes, ranges like `1-5,8`, start one entry or all checked) and segments (start/end per item).
 - The best source streams are always chosen and fetched bit-for-bit: highest resolution, then frame rate, then HDR, then codec (prefer H.264/AAC sources at equal quality if you like).
 - **VIDEO**
   - **MP4**: then H.264 or H.265 + AAC 320 kb/s. QUALITY extreme / high / normal = CRF 12 / 14 / 16, preset slow, on the fastest encoder here (see Convert). Streams already in that codec (and AAC audio) are copied untouched.
@@ -39,9 +41,12 @@ QUEUE  1 running  2 waiting
 - Audio: **Original** (copied bit-for-bit; exact PCM only where the container cannot hold a track) or **Linear PCM** for every track (exact, 16-bit, 24-bit or 32-bit float).
 - Every track can be copied, decoded to PCM, converted to text subtitles, or excluded. Incompatibilities are listed before you start (with MOV or MP4 one click away when it keeps everything). Nothing is dropped silently.
 
-## Queue
-Downloads, conversions and remuxes share one queue with progress, speed, ETA, pause and resume (the
-process tree is suspended), cancel, retry, and per-kind concurrency. It survives restarts and updates.
+## One list per section
+Each section has one list: what you added and what is running or finished, newest first. Every row
+starts, pauses (the process tree is suspended), resumes, retries, cancels or removes itself, opens its
+link or file and shows its folder; "start all" starts everything that is ready. A click on a row shows
+its details (plan, tracks, segment, result, log). Concurrency is per kind (Settings); tasks survive
+restarts and updates.
 Outputs are written under a temporary name, verified with FFprobe and only then renamed; existing
 files are never overwritten.
 
@@ -52,8 +57,8 @@ files are never overwritten.
 - Portable mode: put an empty file named `portable` next to `EncodeAll.exe`.
 
 ## Keys
-`Ctrl+1/2/3` sections, `Enter` analyse links, `Ctrl+Enter` start, `Ctrl+O` add files, `Ctrl+V` paste links,
-`Ctrl+L` log, `Ctrl+,` settings, `Up/Down` select task, `Space` pause/resume, `F5` retry, `Del` remove, `Esc` close panel.
+`Ctrl+1/2/3` sections, `Enter` read the typed link, `Ctrl+Enter` start all, `Ctrl+O` add files, `Ctrl+V` paste links,
+`Ctrl+L` log, `Ctrl+,` settings, `Up/Down` select a row, `Space` start/pause/resume, `F5` retry, `Del` remove (cancel when running), `Esc` close panel.
 
 ## Build
 Windows with MinGW-w64 GCC 13+, CMake and Ninja: `.\build.ps1 -Test`. `.\build.ps1 -Release` also needs Inno Setup 6.

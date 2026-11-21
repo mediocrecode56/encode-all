@@ -123,55 +123,53 @@ std::wstring shortMedia(const MediaInfo& m) {
         if (v->fps > 0) r += L" " + fmtFps(v->fps);
         if (v->bitDepth > 8) r += L" " + std::to_wstring(v->bitDepth) + L"b";
         if (v->hdr()) r += L" HDR";
-        r += L" | ";
+        r += L"  \u00b7  ";
     }
     int na = m.count("audio");
     if (const StreamInfo* a = m.audio()) {
         r += widen(a->codec) + L" " + (a->layout.empty() ? std::to_wstring(a->channels) + L"ch" : widen(a->layout));
         if (na > 1) r += L" +" + std::to_wstring(na - 1);
-        r += L" | ";
+        r += L"  \u00b7  ";
     }
     int ns = m.count("subtitle");
-    if (ns) r += std::to_wstring(ns) + L" subs | ";
-    r += fmtDuration(m.duration) + L" | " + fmtBytes((double)m.size);
-    if (m.bitrate > 0) r += L" | " + fmtBitrate(m.bitrate);
+    if (ns) r += std::to_wstring(ns) + L" subs  \u00b7  ";
+    r += fmtDuration(m.duration) + L"  \u00b7  " + fmtBytes((double)m.size);
+    if (m.bitrate > 0) r += L"  \u00b7  " + fmtBitrate(m.bitrate);
     return r;
 }
 
-const wchar_t* kindTag(TaskKind k) { return k == TaskKind::Download ? L"DL" : k == TaskKind::Convert ? L"CV" : L"RX"; }
+// What a download will fetch with the current options.
+DlPrefs dlPrefs(const Settings& s) {
+    DlPrefs p;
+    p.out = s.dlOut;
+    p.preferH264 = (s.dlOut == DlOut::MP4 || s.dlOut == DlOut::MOV) && !s.dlHevc;
+    p.crf = s.dlCrf;
+    p.hevc = s.dlHevc;
+    return p;
+}
+
+// "C:\clip.mkv" -> "MKV" (the tag a file shows where a download shows its thumbnail).
+std::wstring extTag(const std::wstring& path) {
+    std::wstring e = extension(path);
+    if (!e.empty() && e[0] == L'.') e.erase(0, 1);
+    for (auto& c : e) c = (wchar_t)towupper(c);
+    return e.size() > 5 ? e.substr(0, 5) : e;
+}
 const wchar_t* classTag(QualityClass c) { return c == QualityClass::Copy ? L"COPY" : c == QualityClass::Lossless ? L"LOSSLESS" : L"LOSSY"; }
 
 }  // namespace
 
 void MainWindow::build() {
-    int pad = S(16);
-    RECT area{pad, 0, client_.right - pad, client_.bottom - S(8)};
+    int pad = S(20);
+    RECT area{pad, 0, client_.right - pad, client_.bottom - S(14)};
     if (area.right - area.left < S(200)) return;
     buildHeader(area);
-    int total = area.bottom - area.top;
-    int qh = std::clamp(total * 30 / 100, rowH() * 5, rowH() * 14);
-    // Settings has the whole height; the queue slides down out of the way (queueOpen_ 1 -> 0) and back.
-    // The view takes its final size at once, so only the queue block moves while it slides.
-    bool queueFinal = overlay_ != Overlay::Settings;
-    RECT sec{area.left, area.top, area.right, queueFinal ? area.bottom - qh - S(10) : area.bottom};
     switch (overlay_) {
-        case Overlay::Log: buildLog(sec); break;
-        case Overlay::Settings: buildSettings(sec); break;
-        case Overlay::History: buildHistory(sec); break;
-        default:
-            if (tab_ == 0) buildDownload(sec);
-            else if (tab_ == 1) buildConvert(sec);
-            else buildRemux(sec);
+        case Overlay::Log: buildLog(area); break;
+        case Overlay::Settings: buildSettings(area); break;
+        case Overlay::History: buildHistory(area); break;
+        default: buildSection(area);
     }
-    int shown = (int)std::lround(qh * queueOpen_);
-    if (shown <= 0) return;
-    int qTop = area.bottom - shown;
-    bound_ = RECT{0, qTop - S(10), client_.right, client_.bottom};
-    bounded_ = true;
-    if (!queueFinal || animOn_) add(K_Clear, bound_);  // covers the view underneath while it slides
-    hline(area.left, area.right, qTop - S(5));
-    buildQueue(RECT{area.left, qTop + S(2), area.right, qTop + qh});
-    bounded_ = false;
 }
 
 void MainWindow::buildHeader(RECT& a) {
@@ -191,13 +189,13 @@ void MainWindow::buildHeader(RECT& a) {
         };
     }
     int x = text(a.left, y, L"ENCODE ALL", S_Big);
-    text(x + S(8), y, L"v" EA_VERSION_W, S_Mid);
+    text(x + S(10), y, L"v" EA_VERSION_W, S_Mid);
     // Right side, laid out right to left: an update ready to apply, then the tool status.
     int rx = wx - S(16);
     UpdateState us = updater_.state();
     if (us.staged) {
         std::wstring label = L"restart to update " + us.stagedVersion;
-        int w = tw(label, S_Bold) + S(20);
+        int w = tw(label, S_Bold) + S(24);
         rx -= w;
         Item& it = add(K_Button, RECT{rx, y + S(3), rx + w, y + rh - S(3)}, label, S_Bold | S_Click);
         it.click = [this] {
@@ -207,7 +205,7 @@ void MainWindow::buildHeader(RECT& a) {
             }
             if (AppUpdater::relaunch()) DestroyWindow(hwnd_);
         };
-        rx -= S(12);
+        rx -= S(14);
     }
     std::wstring st;
     bool problem = false;
@@ -230,49 +228,286 @@ void MainWindow::buildHeader(RECT& a) {
     Item& s = add(K_Text, RECT{rx, y, rx + sw, y + rh}, st, (problem ? S_Bold : S_Mid) | S_Click);
     s.click = [this] { setOverlay(Overlay::Settings); };
     hline(0, client_.right, bh - 1);
-    // Sections on the left, views (history, log, settings) as icons on the far right of the same row.
-    y = bh + S(8);
+    // Sections on the left (with how many of their tasks are active), views as icons on the far right.
+    int active[3] = {};
+    for (auto& t : tasks_)
+        if (t.state == TaskState::Running || t.state == TaskState::Waiting || t.state == TaskState::Paused) active[(int)t.kind]++;
+    y = bh + S(10);
     x = a.left;
     const wchar_t* names[] = {L"DOWNLOAD", L"CONVERT", L"REMUX"};
     for (int i = 0; i < 3; i++) {
-        int w = tw(names[i], S_Bold) + S(32);
+        std::wstring label = names[i];
+        if (active[i]) label += L"  " + std::to_wstring(active[i]);
+        int w = tw(label, S_Bold) + S(36);
         bool on = overlay_ == Overlay::None && tab_ == i;
-        Item& it = add(K_Cell, RECT{x, y, x + w, y + rh}, names[i], S_Bold | S_Click | (on ? S_Invert : 0));
+        Item& it = add(K_Cell, RECT{x, y, x + w, y + rh}, label, S_Bold | S_Click | (on ? S_Invert : 0));
         it.click = [this, i] { setTab(i); };
+        if (active[i]) it.tip = std::to_wstring(active[i]) + (active[i] == 1 ? L" task" : L" tasks") + L" running, waiting or paused";
         x += w + S(2);
     }
     auto toggleView = [this](Overlay o) { setOverlay(overlay_ == o ? Overlay::None : o); };
     int ix = a.right;
     ix = iconButton(ix, y, I_Settings, overlay_ == Overlay::Settings, [toggleView] { toggleView(Overlay::Settings); }) - S(4);
+    items_.back().tip = L"settings (Ctrl+,)";
     ix = iconButton(ix, y, I_Log, overlay_ == Overlay::Log, [toggleView] { toggleView(Overlay::Log); }) - S(4);
+    items_.back().tip = L"log (Ctrl+L)";
     ix = iconButton(ix, y, I_History, overlay_ == Overlay::History, [toggleView] { toggleView(Overlay::History); });
-    std::wstring hint = flash_.empty() ? us.error : flash_;
-    add(K_Text, RECT{x + S(16), y, ix - S(16), y + rh}, hint, S_Mid | S_Right);
-    y += rh + S(8);
+    items_.back().tip = L"download history";
+    // One hint line: what the hovered control does, else the last notice or update error.
+    hintDefault_ = !flash_.empty() ? flash_ : us.error;
+    hintIdx_ = items_.size();
+    add(K_Text, RECT{x + S(16), y, ix - S(16), y + rh}, hintDefault_, S_Mid | S_Right);
+    y += rh + S(10);
     hline(a.left, a.right, y);
-    a.top = y + S(12);
+    a.top = y + S(16);
 }
 
-// ---------- download ----------
+// ---------- sections ----------
+// Every section works the same way: a bar at the top takes links or files, the options below it apply
+// to what you start, and the list holds every item, before and after it starts. Each row opens its
+// link or file, shows its folder and starts (or pauses, resumes, retries) on its own; "start all" at
+// the top right starts every item that is ready. A click on a row shows its details under it.
 
-void MainWindow::buildDownload(RECT a) {
-    int rh = rowH(), cw = fonts_.charW;
+void MainWindow::syncRange(uint64_t key) {
+    if (key != rangeKey_) return;
+    for (auto& g : groups_)
+        if (g.key == key) SetWindowTextW(edits_[E_RANGE], rangesText(g.checked).c_str());
+}
+
+std::vector<ListRow> MainWindow::collectRows(int tab) {
+    std::vector<ListRow> rows;
+    for (auto& t : tasks_) {
+        if ((int)t.kind != tab) continue;
+        ListRow r;
+        r.type = ListRow::Task;
+        r.task = &t;
+        r.order = t.order ? t.order : (int64_t)t.id;  // tasks from before 1.0.3 sort below everything new
+        r.sub = t.sub;
+        r.id.task = t.id;
+        rows.push_back(r);
+    }
+    if (tab == 0) {
+        for (int gi = 0; gi < (int)groups_.size(); gi++) {
+            DlGroup& g = groups_[gi];
+            ListRow r;
+            r.idx = gi;
+            r.order = g.order;
+            r.id.key = g.key;
+            if (g.playlist && !g.busy && g.error.empty()) {
+                r.type = ListRow::Head;
+                r.sub = r.id.sub = -1;
+                rows.push_back(r);
+                r.type = ListRow::Pending;
+                for (int e = 0; e < (int)g.entries.size(); e++) {
+                    r.entry = e;
+                    r.sub = r.id.sub = std::max(1, g.entries[e].index);
+                    rows.push_back(r);
+                }
+            } else {
+                rows.push_back(r);
+            }
+        }
+    } else {
+        auto& list = tab == 2 ? remux_ : conv_;
+        for (int i = 0; i < (int)list.size(); i++) {
+            ListRow r;
+            r.idx = i;
+            r.order = list[i].order;
+            r.id.key = list[i].key;
+            rows.push_back(r);
+        }
+    }
+    // Newest first; a playlist's entries in playlist order under its head, started or not.
+    std::stable_sort(rows.begin(), rows.end(), [](const ListRow& a, const ListRow& b) { return a.order != b.order ? a.order > b.order : a.sub < b.sub; });
+    return rows;
+}
+
+void MainWindow::withRow(const RowId& id, const std::function<void(const ListRow&)>& fn) {
+    // Actions look their row up again when they run: the list may have changed since it was drawn.
+    for (auto& r : collectRows(tab_))
+        if (r.id == id) {
+            fn(r);
+            return;
+        }
+}
+
+void MainWindow::buildSection(RECT a) {
+    int rh = rowH();
     int y = a.top;
-    Settings s = settingsCopy();
-    sectionTitle(a.left, y, L"LINKS");
-    y += rh;
-    int bw = std::max<int>(tw(L"analyse"), tw(L"paste")) + S(20);
-    RECT er{a.left + 1, y + S(3), a.right - bw - S(12), y + rh * 2 + S(2)};
-    placeEdit(E_URLS, er);
-    int bx = a.right - bw;
-    Item& an = add(K_Button, RECT{bx, y + S(3), a.right, y + rh - S(3)}, L"analyse", S_Click);
-    an.click = [this] { analyzeUrls(); };
-    Item& pa = add(K_Button, RECT{bx, y + rh + S(1), a.right, y + rh * 2 - S(5)}, L"paste", S_Click);
-    pa.click = [this] {
-        SetFocus(edits_[E_URLS]);
-        SendMessageW(edits_[E_URLS], WM_PASTE, 0, 0);
+    view_ = settingsCopy();
+    // The bar: links on Download, files on Convert and Remux.
+    int bh = rh + S(18);
+    RECT bar{a.left, y, a.right, y + bh};
+    int ic = S(42);  // the leading icon's column
+    if (tab_ == 0) {
+        int pw = tw(L"paste") + S(36);
+        Item& pa = add(K_Cell, RECT{bar.right - pw, bar.top + 1, bar.right - 1, bar.bottom - 1}, L"paste", S_Click);
+        pa.tip = L"read every link on the clipboard (Ctrl+V)";
+        pa.click = [this] {
+            if (!pasteLinks()) flash(L"No links on the clipboard", 2500);
+        };
+        add(K_Line, RECT{bar.right - pw - 1, bar.top + S(10), bar.right - pw, bar.bottom - S(10)});
+        Item& li = add(K_Icon, RECT{bar.left, bar.top, bar.left + ic, bar.bottom}, L"", S_Mid);
+        li.value = I_Link;
+        int eh = fonts_.textH + S(4);
+        int ey = bar.top + (bh - eh) / 2;
+        placeEdit(E_URLS, RECT{bar.left + ic, ey, bar.right - pw - S(12), ey + eh}, false);
+    } else {
+        Item& b = add(K_Text, bar, L"", S_Click);
+        b.click = [this] { pickFiles(tab_); };
+        b.tip = L"choose media files (Ctrl+O)";
+        Item& pi = add(K_Icon, RECT{bar.left, bar.top, bar.left + ic, bar.bottom}, L"", 0);
+        pi.value = I_Plus;
+        int ty = bar.top + (bh - rh) / 2;
+        int x = text(bar.left + ic, ty, L"Add files", S_Bold) + S(12);
+        text(x, ty, tab_ == 1 ? L"or drop them on the window: video and audio, one by one or a whole folder"
+                              : L"or drop them on the window: their tracks are copied into MP4 or MOV",
+             S_Mid, bar.right - x - S(16));
+    }
+    add(K_Frame, bar);
+    y = bar.bottom + S(14);
+    if (tab_ == 0) buildDownloadOptions(y, a);
+    else if (tab_ == 1) buildConvertOptions(y, a);
+    else buildRemuxOptions(y, a);
+    y += S(8);
+    hline(a.left, a.right, y);
+    y += S(10);
+
+    // The list head: what is in the list, then the bulk actions at the top right.
+    std::vector<ListRow> rows = collectRows(tab_);
+    rowIds_.clear();
+    for (auto& r : rows) rowIds_.push_back(r.id);
+    int ready = 0, run = 0, wait = 0, paused = 0, failed = 0, done = 0, reading = 0;
+    double est = 0;
+    DlPrefs prefs = dlPrefs(view_);
+    for (auto& r : rows) {
+        if (r.type == ListRow::Task) {
+            switch (r.task->state) {
+                case TaskState::Running: run++; break;
+                case TaskState::Waiting: wait++; break;
+                case TaskState::Paused: paused++; break;
+                case TaskState::Failed: failed++; break;
+                default: done++;
+            }
+        } else if (r.type == ListRow::Pending && tab_ == 0) {
+            DlGroup& g = groups_[r.idx];
+            if (g.busy) reading++;
+            else if (!g.error.empty()) failed++;
+            else if (!g.playlist) {
+                ready++;
+                Selection sl = selectFormats(g.info, prefs);
+                if (sl.ok) est += sl.estBytes;
+            } else if (g.checked[r.entry]) {
+                ready++;
+            }
+        } else if (r.type == ListRow::Pending) {
+            const FileRow& f = (tab_ == 2 ? remux_ : conv_)[r.idx];
+            if (f.busy) reading++;
+            else if (fileReady(tab_, f, view_)) ready++;
+            else if (!f.error.empty()) failed++;
+        }
+    }
+    int x = sectionTitle(a.left, y, tab_ == 0 ? L"LINKS" : L"FILES") + S(16);
+    std::wstring sum;
+    auto part = [&](int n, const std::wstring& what) {
+        if (n) sum += (sum.empty() ? L"" : L"  \u00b7  ") + std::to_wstring(n) + L" " + what;
     };
-    y += rh * 2 + S(12);
+    part(reading, L"reading");
+    part(ready, L"ready");
+    if (est > 0) sum += L" (~" + fmtBytes(est) + L")";
+    part(run, L"running");
+    part(wait, L"waiting");
+    part(paused, L"paused");
+    part(failed, L"failed");
+    part(done, L"finished");
+    int rx = a.right;
+    std::wstring go = ready ? L"start all  " + std::to_wstring(ready) : L"start all";
+    int gw = tw(go, S_Bold) + S(32);
+    rx -= gw;
+    Item& gb = add(K_Button, RECT{rx, y + S(3), rx + gw, y + rh - S(3)}, go, S_Bold | (ready ? S_Invert | S_Click : S_Disabled));
+    if (ready) gb.click = [this] { startAll(tab_); };
+    gb.tip = L"start every item that is ready (Ctrl+Enter)";
+    rx -= S(10);
+    auto rb = [&](const std::wstring& l, const std::wstring& tip, std::function<void()> fn) {
+        rx -= tw(l) + S(20);
+        button(rx, y, l, std::move(fn));
+        items_.back().tip = tip;
+        rx -= S(10);
+    };
+    int kind = tab_;
+    if (paused) rb(L"resume all", L"resume every paused task here", [this, kind] { queue_.resumeAll(kind); });
+    else if (run || wait) rb(L"pause all", L"pause every running and waiting task here", [this, kind] { queue_.pauseAll(kind); });
+    if (done) rb(L"clear finished", L"remove finished and canceled tasks from the list (the files stay)", [this, kind] { queue_.clearFinished(kind); });
+    text(x, y, sum, S_Mid, rx - x - S(12));
+    y += rh + S(6);
+
+    RECT list{a.left, y, a.right, a.bottom};
+    listView_ = list;
+    hline(a.left, a.right, list.top);
+    if (rows.empty()) {
+        if (tab_ == 0) emptyState(list, L"Paste a link above", L"Every link on the clipboard is read at once. Ctrl+V works anywhere on this page.");
+        else emptyState(list, L"Drop files here", L"or click the bar above (Ctrl+O). Each file waits here until you start it.");
+        return;
+    }
+    // The playlist that holds the range box: the chosen one if it is still here, else the first.
+    if (tab_ == 0) {
+        bool found = false;
+        uint64_t first = 0;
+        for (auto& g : groups_)
+            if (g.playlist && !g.busy && g.error.empty()) {
+                found = found || g.key == rangeKey_;
+                if (!first) first = g.key;
+            }
+        if (!found && first) {
+            rangeKey_ = first;
+            for (auto& g : groups_)
+                if (g.key == first) SetWindowTextW(edits_[E_RANGE], rangesText(g.checked).c_str());
+        }
+    }
+    int rowRight = a.right - S(10);  // room for the scroll mark
+    int viewH = list.bottom - list.top - 1;
+    size_t mark = items_.size();
+    // Rows outside the view are skipped (only their height counts), except the selected one, whose
+    // details decide its height.
+    auto pass = [&](int scroll, int& selTop, int& selBottom) {
+        for (Edit e : {E_SEGA, E_SEGB, E_RANGE}) editPlaced_[e] = false;
+        beginClip(RECT{list.left, list.top + 1, list.right, list.bottom});
+        int ry = list.top + 1 - scroll;
+        selTop = selBottom = INT32_MIN;
+        for (auto& r : rows) {
+            bool sel = r.id == sel_[tab_];
+            int h = r.type == ListRow::Head ? rh + S(14) : itemH();
+            if (sel || (ry + h > list.top && ry < list.bottom)) h = buildRow(r, list.left, rowRight, ry, sel);
+            if (sel) {
+                selTop = ry - list.top - 1 + scroll;
+                selBottom = selTop + h;
+            }
+            ry += h;
+        }
+        endClip();
+        return ry + scroll - list.top - 1;
+    };
+    int selTop, selBottom;
+    int total = pass(listScroll_[tab_], selTop, selBottom);
+    int scroll = std::clamp(listScroll_[tab_], 0, std::max(0, total - viewH));
+    if (reveal_ && selTop != INT32_MIN) {
+        if (selBottom > scroll + viewH) scroll = selBottom - viewH;
+        if (selTop < scroll) scroll = selTop;
+        scroll = std::clamp(scroll, 0, std::max(0, total - viewH));
+    }
+    reveal_ = false;
+    if (scroll != listScroll_[tab_]) {
+        items_.resize(mark);
+        listScroll_[tab_] = scroll;
+        total = pass(scroll, selTop, selBottom);
+    }
+    region(list, [this, total, viewH](int n) { scrollBy(listScroll_[tab_], n * rowH() * 3, total - viewH); });
+    scrollbar(RECT{list.left, list.top + 1, list.right, list.bottom}, scroll, total);
+}
+
+void MainWindow::buildDownloadOptions(int& y, const RECT& a) {
+    const Settings& s = view_;
+    int rh = rowH();
     // Video and audio-only outputs are two separate rows so an audio-only choice is unmistakable;
     // the label of the active row is in full ink.
     bool audio = dlOutIsAudio(s.dlOut);
@@ -286,7 +521,7 @@ void MainWindow::buildDownload(RECT a) {
             updateSetting([i](Settings& st) { st.dlHevc = i == 1; });
             relayout();
         });
-        x = text(x, y, L"QUALITY", S_Mid) + S(8);
+        x = text(x, y, L"QUALITY", S_Mid) + S(10);
         int qi = s.dlCrf <= 12 ? 0 : s.dlCrf <= 14 ? 1 : 2;
         x = seg(x, y, {L"extreme", L"high", L"normal"}, qi, [this](int i) {
             const int crf[] = {12, 14, 16};
@@ -302,7 +537,7 @@ void MainWindow::buildDownload(RECT a) {
     });
     y += rh;
     x = fieldLabel(a.left, y, L"SAVE TO");
-    int pathMax = std::max<int>(S(160), (a.right - x) * 2 / 5);
+    int pathMax = std::max<int>(S(200), (a.right - x) * 2 / 5);
     x = choice(x, y, L"", s.dlDir, [this] {
         int r = popup({L"open folder", L"choose folder..."}, -1);
         if (r == 0) openFolder(settingsCopy().dlDir);
@@ -322,238 +557,13 @@ void MainWindow::buildDownload(RECT a) {
     x = toggle(x, y, L"chapters", s.chapters, [this] { updateSetting([](Settings& st) { st.chapters = !st.chapters; }); relayout(); });
     x = toggle(x, y, L"thumbnail", s.thumbnail, [this] { updateSetting([](Settings& st) { st.thumbnail = !st.thumbnail; }); relayout(); });
     toggle(x, y, L"subtitles", s.subs, [this] { updateSetting([](Settings& st) { st.subs = !st.subs; }); relayout(); });
-    y += rh + S(6);
-    hline(a.left, a.right, y);
-    y += S(6);
-
-    // List of analysed links.
-    int listBottom = a.bottom - rh * 2 - S(14);
-    RECT list{a.left, y, a.right, listBottom};
-    int thumbH = S(36), thumbW = S(64);
-    int tall = std::max<int>(rh * 2, thumbH + S(6));
-    struct Row {
-        int g, e, h;  // e = -1 header, -2 single, -3 busy or failed, >=0 entry
-    };
-    std::vector<Row> rows;
-    int totalH = 0;
-    for (int g = 0; g < (int)groups_.size(); g++) {
-        auto& gr = groups_[g];
-        if (gr.busy || !gr.error.empty()) {
-            rows.push_back({g, -3, gr.error.empty() ? rh : rh * 2});
-        } else if (gr.playlist) {
-            rows.push_back({g, -1, rh + S(4)});
-            for (int e = 0; e < (int)gr.entries.size(); e++) rows.push_back({g, e, tall});
-        } else {
-            rows.push_back({g, -2, tall});
-        }
-    }
-    for (auto& r : rows) totalH += r.h;
-    int viewH = list.bottom - list.top;
-    dlScroll_ = std::clamp(dlScroll_, 0, std::max<int>(0, totalH - viewH));
-    region(list, [this, totalH, viewH](int n) { scrollBy(dlScroll_, n * rowH() * 3, totalH - viewH); });
-    if (groups_.empty()) emptyState(list, L"Paste a link", L"Links are read as soon as they land in the box. Ctrl+V works anywhere on this page.");
-    beginClip(list);
-    int ry = list.top - dlScroll_;
-    bool rangePlaced = false;
-    int rowRight = a.right - S(8);  // room for the scroll mark
-    for (auto& r : rows) {
-        if (ry + r.h < list.top || ry > list.bottom) {
-            ry += r.h;
-            continue;
-        }
-        DlGroup& g = groups_[r.g];
-        int gi = r.g;
-        if (r.e == -3) {
-            if (g.busy) {
-                text(a.left + S(4), ry, L"analysing  " + g.url, S_Mid, rowRight - a.left);
-            } else {
-                int xx = text(a.left + S(4), ry, L"!", S_Bold) + S(10);
-                xx = button(xx, ry, L"retry", [this, gi] {
-                    std::wstring u = groups_[gi].url;
-                    removeGroup(gi);
-                    SetWindowTextW(edits_[E_URLS], u.c_str());
-                    analyzeUrls();
-                });
-                xx = button(xx, ry, L"remove", [this, gi] {
-                    removeGroup(gi);
-                    relayout(true);
-                });
-                text(xx + S(4), ry, g.url, S_Mid, rowRight - xx);
-                add(K_Text, RECT{a.left + cw * 4, ry + rh, rowRight, ry + rh * 2}, g.error + (g.hint.empty() ? L"" : L"  -> " + g.hint));
-            }
-        } else if (r.e == -1) {
-            int sel = 0;
-            for (char c : g.checked) sel += c;
-            int xx = text(a.left + S(4), ry + S(2), L"PLAYLIST", S_Bold) + S(12);
-            xx = button(xx, ry + S(2), L"all", [this, gi] {
-                std::fill(groups_[gi].checked.begin(), groups_[gi].checked.end(), 1);
-                relayout();
-            });
-            xx = button(xx, ry + S(2), L"none", [this, gi] {
-                std::fill(groups_[gi].checked.begin(), groups_[gi].checked.end(), 0);
-                relayout();
-            });
-            xx = text(xx + S(4), ry + S(2), L"RANGE", S_Mid) + S(8);
-            if (gi == (selGroup_ >= 0 ? selGroup_ : gi) && !rangePlaced && ry >= list.top && ry + rh <= list.bottom) {
-                placeEdit(E_RANGE, RECT{xx, ry + S(2) + S(4), xx + cw * 14, ry + S(2) + rh - S(4)});
-                rangePlaced = true;
-                xx += cw * 14 + S(12);
-            } else {
-                Item& it = add(K_Text, RECT{xx, ry + S(2), xx + cw * 14, ry + S(2) + rh}, L"1-" + std::to_wstring(g.entries.size()), S_Mid | S_Click);
-                it.click = [this, gi] {
-                    selGroup_ = gi;
-                    selEntry_ = 0;
-                    // The one range box moves to this playlist: show its selection, not the last one's.
-                    SetWindowTextW(edits_[E_RANGE], rangesText(groups_[gi].checked).c_str());
-                    relayout(true);
-                };
-                xx += cw * 14 + S(12);
-            }
-            xx = button(xx, ry + S(2), L"remove", [this, gi] {
-                removeGroup(gi);
-                relayout(true);
-            });
-            text(xx + S(4), ry + S(2), std::to_wstring(sel) + L"/" + std::to_wstring(g.entries.size()) + L"  " + g.title, S_Mid, rowRight - xx);
-        } else {
-            int e = r.e >= 0 ? r.e : 0;
-            bool selected = gi == selGroup_ && (r.e == -2 || e == selEntry_);
-            Item& sel = add(K_Text, RECT{a.left, ry, rowRight, ry + r.h - S(2)}, L"", S_Click | (selected ? S_Selected : 0));
-            sel.click = [this, gi, e] {
-                selGroup_ = gi;
-                selEntry_ = e;
-                auto& gg = groups_[gi];
-                SetWindowTextW(edits_[E_SEGA], gg.segA.size() > (size_t)e ? gg.segA[e].c_str() : L"");
-                SetWindowTextW(edits_[E_SEGB], gg.segB.size() > (size_t)e ? gg.segB[e].c_str() : L"");
-                relayout();
-            };
-            bool on = g.checked.size() > (size_t)e && g.checked[e];
-            check(a.left + S(6), ry + (r.h - S(2) - rh) / 2, on, [this, gi, e] {
-                auto& c = groups_[gi].checked;
-                if ((size_t)e < c.size()) c[e] = !c[e];
-                relayout();
-            });
-            int tx = a.left + S(34);
-            std::string thumb = r.e == -2 ? g.info.thumb : g.entries[e].thumb;
-            Item& th = add(K_Thumb, RECT{tx, ry + S(2), tx + thumbW, ry + S(2) + thumbH});
-            th.bmp = thumbs_.get(thumb);
-            tx += thumbW + S(12);
-            double dur = r.e == -2 ? g.info.duration : g.entries[e].duration;
-            std::wstring title = r.e == -2 ? g.title : widen(g.entries[e].title);
-            std::wstring lead = (r.e >= 0 ? std::to_wstring(g.entries[e].index) + L".  " : L"") + fmtDuration(dur) + L"  ";
-            int lx = text(tx, ry, lead, S_Mid | S_Mono);
-            text(lx, ry, title, S_Bold, rowRight - lx);
-            std::wstring sub;
-            if (r.e == -2) {
-                DlPrefs p;
-                p.out = s.dlOut;
-                p.preferH264 = (s.dlOut == DlOut::MP4 || s.dlOut == DlOut::MOV) && !s.dlHevc;
-                p.crf = s.dlCrf;
-                p.hevc = s.dlHevc;
-                Selection sl = selectFormats(g.info, p);
-                sub = sl.ok ? sl.summary + (sl.estBytes > 0 ? L"  ~" + fmtBytes(sl.estBytes) : L"") : L"! " + sl.error;
-            }
-            std::wstring segText;
-            if (g.segA.size() > (size_t)e && (!g.segA[e].empty() || !g.segB[e].empty()))
-                segText = L"segment " + (g.segA[e].empty() ? L"0" : g.segA[e]) + L" - " + (g.segB[e].empty() ? L"end" : g.segB[e]) + L"  | ";
-            add(K_Text, RECT{tx, ry + rh - S(2), rowRight, ry + rh * 2 - S(2)}, segText + sub, S_Mid | S_Mono);
-        }
-        ry += r.h;
-    }
-    endClip();
-    scrollbar(list, dlScroll_, totalH);
-    // Selected item: segment editor, then the action bar.
-    y = listBottom + S(6);
-    hline(a.left, a.right, y - S(2));
-    bool hasSel = selGroup_ >= 0 && selGroup_ < (int)groups_.size() && !groups_[selGroup_].busy && groups_[selGroup_].error.empty();
-    if (hasSel) {
-        x = fieldLabel(a.left, y + S(2), L"SEGMENT");
-        x = text(x, y + S(2), L"from", S_Mid) + S(8);
-        placeEdit(E_SEGA, RECT{x, y + S(2) + S(4), x + cw * 11, y + S(2) + rh - S(4)});
-        x += cw * 11 + S(12);
-        x = text(x, y + S(2), L"to", S_Mid) + S(8);
-        placeEdit(E_SEGB, RECT{x, y + S(2) + S(4), x + cw * 11, y + S(2) + rh - S(4)});
-        x += cw * 11 + S(12);
-        text(x, y + S(2), L"m:ss or seconds; empty = whole video", S_Mid, a.right - x);
-    }
-    y += rh + S(8);
-    int count = 0;
-    double est = 0;
-    for (auto& g : groups_) {
-        if (g.busy || !g.error.empty()) continue;
-        if (g.playlist) {
-            for (char c : g.checked) count += c;
-        } else if (!g.checked.empty() && g.checked[0]) {
-            count++;
-            DlPrefs p;
-            p.out = s.dlOut;
-            p.preferH264 = (s.dlOut == DlOut::MP4 || s.dlOut == DlOut::MOV) && !s.dlHevc;
-            p.crf = s.dlCrf;
-            p.hevc = s.dlHevc;
-            Selection sl = selectFormats(g.info, p);
-            if (sl.ok) est += sl.estBytes;
-        }
-    }
-    std::wstring sum = std::to_wstring(count) + L" selected" + (est > 0 ? L"   ~" + fmtBytes(est) + L" (single videos)" : L"");
-    text(a.left, y, sum, S_Mid, (a.right - a.left) / 2);
-    std::wstring go = L"download " + std::to_wstring(count);
-    int gw = tw(go, S_Bold) + S(24);
-    int cwid = tw(L"clear") + S(20);
-    button(a.right - gw - cwid - S(8), y, L"clear", [this] {
-        groups_.clear();
-        selGroup_ = -1;
-        relayout(true);
-    }, groups_.empty() ? S_Disabled : 0);
-    Item& gb = add(K_Button, RECT{a.right - gw, y + S(3), a.right, y + rh - S(3)}, go, S_Bold | (count ? S_Invert | S_Click : S_Disabled));
-    if (count) gb.click = [this] { startDownloads(); };
+    y += rh;
 }
 
-void MainWindow::buildConvert(RECT a) {
+void MainWindow::buildConvertOptions(int& y, const RECT& a) {
+    const Settings& s = view_;
+    const ConvertSpec& cs = s.convert;
     int rh = rowH();
-    int y = a.top;
-    Settings s = settingsCopy();
-    ConvertSpec& cs = s.convert;
-    int x = sectionTitle(a.left, y, L"FILES") + S(16);
-    x = button(x, y, L"add files", [this] { pickFiles(1); });
-    button(x, y, L"clear", [this] {
-        conv_.clear();
-        selConv_ = -1;
-        relayout(true);
-    }, conv_.empty() ? S_Disabled : 0);
-    y += rh + S(2);
-    int listH = std::clamp((int)conv_.size(), 2, 5) * rh;
-    RECT list{a.left, y, a.right, y + listH};
-    int maxOff = std::max<int>(0, (int)conv_.size() * rh - listH);
-    convScroll_ = std::clamp(convScroll_, 0, maxOff);
-    region(list, [this, maxOff](int n) { scrollBy(convScroll_, n * rowH(), maxOff); });
-    if (conv_.empty()) emptyState(list, L"Drop files here", L"or use add files (Ctrl+O)");
-    beginClip(list);
-    int rowRight = a.right - S(8);
-    for (int i = 0; i < (int)conv_.size(); i++) {
-        int ry = y + i * rh - convScroll_;
-        if (ry + rh < list.top || ry > list.bottom) continue;
-        FileRow& f = conv_[i];
-        Item& row = add(K_Text, RECT{a.left, ry, rowRight, ry + rh}, L"", S_Click | (i == selConv_ ? S_Selected : 0));
-        row.click = [this, i] {
-            selConv_ = i;
-            detailScroll_ = 0;
-            relayout();
-        };
-        check(a.left + S(6), ry, f.checked, [this, i] {
-            conv_[i].checked = !conv_[i].checked;
-            relayout();
-        });
-        int nx = text(a.left + S(34), ry, fileName(f.path), S_Bold, (a.right - a.left) * 2 / 5);
-        std::wstring info = f.busy ? L"analysing..." : !f.error.empty() ? L"! " + f.error : shortMedia(f.info);
-        add(K_Text, RECT{nx + S(16), ry, rowRight - S(40), ry + rh}, info, S_Mid | S_Mono);
-        Item& x2 = add(K_Icon, RECT{rowRight - S(28), ry + S(3), rowRight - S(2), ry + rh - S(3)}, L"", S_Click);
-        x2.value = I_Close;
-        x2.click = [this, i] { removeFile(1, i); };
-    }
-    endClip();
-    scrollbar(list, convScroll_, (int)conv_.size() * rh);
-    y += listH + S(6);
-    hline(a.left, a.right, y);
-    y += S(8);
     auto change = [this](const std::function<void(ConvertSpec&)>& f) {
         updateSetting([&](Settings& st) {
             f(st.convert);
@@ -563,7 +573,7 @@ void MainWindow::buildConvert(RECT a) {
         relayout();
     };
     // PRESET: the four built-in presets, then one dropdown for saved presets (pick, save, delete).
-    x = fieldLabel(a.left, y, L"PRESET");
+    int x = fieldLabel(a.left, y, L"PRESET");
     int ps = s.convertPreset == Preset::Custom ? -1 : (int)s.convertPreset;
     x = seg(x, y, {L"lossless", L"max quality", L"balanced", L"compact"}, ps, [this](int i) {
         updateSetting([i](Settings& st) {
@@ -626,7 +636,7 @@ void MainWindow::buildConvert(RECT a) {
         relayout();
     });
     if (customDone_) placeEdit(E_CUSTOM, editRects_[E_CUSTOM]);
-    y += rh + S(2);
+    y += rh;
     // TARGET: everything about the output in one row, the same dropdown control throughout; it wraps
     // to the control column on narrow windows. The encoder is automatic (Settings can pin one).
     EncoderCaps caps;
@@ -634,8 +644,6 @@ void MainWindow::buildConvert(RECT a) {
         std::lock_guard<std::mutex> lk(capsMu_);
         caps = caps_;
     }
-    ConvertSpec planSpec = cs;
-    planSpec.accel = s.encoder;
     bool audioTarget = cs.audio != AudioTarget::None;
     bool encodesVideo = !audioTarget && cs.vcodec != VCodec::Copy;
     int ti = targetIndex(cs);
@@ -841,153 +849,33 @@ void MainWindow::buildConvert(RECT a) {
         std::string enc = pickEncoder(cs.vcodec, s.encoder, cs.rate, caps);
         std::wstring ev = encoderLabel(enc) + (s.encoder == Accel::Auto ? L" (fastest here)" : L" (set in Settings)");
         if (!caps.probed && capsRunning_) ev = encoderLabel(enc) + L" (looking for graphics encoders...)";
-        int capW = tw(L"ENCODER", S_Mid) + S(8), ew = tw(ev);
+        int capW = tw(L"ENCODER", S_Mid) + S(10), ew = tw(ev);
         int ex = a.right - ew;
         if (ex - capW > x) {
             text(ex - capW, y, L"ENCODER", S_Mid);
             Item& ei = add(K_Text, RECT{ex, y, a.right, y + rh}, ev, S_Click);
+            ei.tip = L"choose the encoder in Settings";
             ei.click = [this] {
                 settingsScroll_ = 0;
                 setOverlay(Overlay::Settings);
             };
         }
     }
-    y += rh + S(4);
-    hline(a.left, a.right, y);
-    y += S(8);
-    // Plan for the selected file.
-    int actionY = a.bottom - rh;
-    RECT detail{a.left, y, a.right, actionY - S(8)};
-    if (selConv_ >= 0 && selConv_ < (int)conv_.size() && conv_[selConv_].info.ok) {
-        FileRow& f = conv_[selConv_];
-        Plan p = planConvert(f.info, planSpec, caps);
-        Advice adv = adviseConvert(f.info, cs);
-        int contentY = y - detailScroll_;
-        beginClip(detail);
-        int yy = contentY;
-        if (adv.mode != Advice::Convert && !adv.text.empty()) {
-            int xx = text(a.left, yy, adv.text, S_Bold, a.right - a.left - S(150));
-            button(xx + S(12), yy, L"send to remux", [this] {
-                if (selConv_ < 0 || selConv_ >= (int)conv_.size()) return;
-                FileRow f2 = conv_[selConv_];
-                conv_.erase(conv_.begin() + selConv_);
-                selConv_ = conv_.empty() ? -1 : std::min(selConv_, (int)conv_.size() - 1);
-                f2.key = nextKey_++;
-                remux_.push_back(f2);
-                selRemux_ = (int)remux_.size() - 1;
-                setTab(2);
-            });
-            yy += rh;
-        } else if (!adv.text.empty()) {
-            text(a.left, yy, adv.text, S_Mid, a.right - a.left);
-            yy += rh;
-        }
-        buildPlan(detail, p, yy);
-        yy += S(6);
-        text(a.left, yy, L"SOURCE  " + describeMedia(f.info), S_Bold, a.right - a.left - S(8));
-        yy += rh;
-        for (auto& st : f.info.streams) {
-            add(K_Text, RECT{a.left + S(16), yy, a.right - S(8), yy + denseH()}, describeStream(st), S_Mid | S_Mono);
-            yy += denseH();
-        }
-        endClip();
-        int contentH = yy - contentY;
-        int maxOff2 = std::max<int>(0, contentH - (detail.bottom - detail.top));
-        detailScroll_ = std::clamp(detailScroll_, 0, maxOff2);
-        region(detail, [this, maxOff2](int n) { scrollBy(detailScroll_, n * rowH() * 3, maxOff2); });
-        scrollbar(detail, detailScroll_, contentH);
-    } else if (!conv_.empty()) {
-        text(a.left, y, L"Select an analysed file to see exactly what will happen.", S_Mid);
-    }
-    int count = 0;
-    for (auto& f : conv_) count += f.checked && f.info.ok;
-    text(a.left, actionY, std::to_wstring(count) + L" of " + std::to_wstring(conv_.size()) + L" file(s) selected", S_Mid);
-    std::wstring go = L"convert " + std::to_wstring(count);
-    int gw = tw(go, S_Bold) + S(24);
-    Item& gb = add(K_Button, RECT{a.right - gw, actionY + S(3), a.right, actionY + rh - S(3)}, go, S_Bold | (count ? S_Invert | S_Click : S_Disabled));
-    if (count) gb.click = [this] { startConvert(); };
-}
-
-void MainWindow::buildPlan(RECT& area, const Plan& p, int& y) {
-    int rh = rowH();
-    int left = area.left, right = area.right - S(8);
-    if (!p.ok) {
-        text(left, y, L"! " + p.error, S_Bold, right - left);
-        y += rh;
-        return;
-    }
-    int x = text(left, y, className(p.cls), S_Bold, right - left - S(200));
-    text(x + S(16), y, L"size " + p.estText, S_Mid, right - x - S(16));
     y += rh;
-    int dh = denseH();
-    for (auto& l : p.lines) {
-        add(K_Text, RECT{left + S(16), y, right, y + dh}, l, S_Mono);
-        y += dh;
-    }
-    y += S(4);
-    for (auto& w : p.warnings) {
-        add(K_Text, RECT{left + S(16), y, right, y + dh}, L"! " + w, S_Bold);
-        y += dh;
-    }
 }
 
-// ---------- remux ----------
-
-void MainWindow::buildRemux(RECT a) {
+void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
+    const Settings& s = view_;
     int rh = rowH();
-    int y = a.top;
-    Settings s = settingsCopy();
-    int x = sectionTitle(a.left, y, L"FILES") + S(16);
-    x = button(x, y, L"add files", [this] { pickFiles(2); });
-    button(x, y, L"clear", [this] {
-        remux_.clear();
-        selRemux_ = -1;
-        relayout(true);
-    }, remux_.empty() ? S_Disabled : 0);
-    y += rh + S(2);
-    int listH = std::clamp((int)remux_.size(), 2, 4) * rh;
-    RECT list{a.left, y, a.right, y + listH};
-    int maxOff = std::max<int>(0, (int)remux_.size() * rh - listH);
-    remuxScroll_ = std::clamp(remuxScroll_, 0, maxOff);
-    region(list, [this, maxOff](int n) { scrollBy(remuxScroll_, n * rowH(), maxOff); });
-    if (remux_.empty()) emptyState(list, L"Drop files here", L"or use add files (Ctrl+O)");
-    beginClip(list);
-    int rowRight = a.right - S(8);
-    for (int i = 0; i < (int)remux_.size(); i++) {
-        int ry = y + i * rh - remuxScroll_;
-        if (ry + rh < list.top || ry > list.bottom) continue;
-        FileRow& f = remux_[i];
-        Item& row = add(K_Text, RECT{a.left, ry, rowRight, ry + rh}, L"", S_Click | (i == selRemux_ ? S_Selected : 0));
-        row.click = [this, i] {
-            selRemux_ = i;
-            detailScroll_ = 0;
-            relayout();
-        };
-        check(a.left + S(6), ry, f.checked, [this, i] {
-            remux_[i].checked = !remux_[i].checked;
-            relayout();
-        });
-        int nx = text(a.left + S(34), ry, fileName(f.path), S_Bold, (a.right - a.left) * 2 / 5);
-        std::wstring info = f.busy ? L"analysing..." : !f.error.empty() ? L"! " + f.error : shortMedia(f.info);
-        add(K_Text, RECT{nx + S(16), ry, rowRight - S(40), ry + rh}, info, S_Mid | S_Mono);
-        Item& x2 = add(K_Icon, RECT{rowRight - S(28), ry + S(3), rowRight - S(2), ry + rh - S(3)}, L"", S_Click);
-        x2.value = I_Close;
-        x2.click = [this, i] { removeFile(2, i); };
-    }
-    endClip();
-    scrollbar(list, remuxScroll_, (int)remux_.size() * rh);
-    y += listH + S(6);
-    hline(a.left, a.right, y);
-    y += S(8);
     // One row, as on Convert: container, then audio kept as it is or decoded to linear PCM
     // (exact by default; a fixed depth is optional).
-    x = fieldLabel(a.left, y, L"CONTAINER");
+    int x = fieldLabel(a.left, y, L"CONTAINER");
     x = seg(x, y, {L"MP4", L"MOV"}, s.remuxContainer == Container::MOV ? 1 : 0, [this](int i) {
         updateSetting([i](Settings& st) { st.remuxContainer = i == 0 ? Container::MP4 : Container::MOV; });
         for (auto& f : remux_) f.remux.actions.clear();  // defaults depend on the container
         relayout();
     });
-    x = text(x, y, L"AUDIO", S_Mid) + S(8);
+    x = text(x, y, L"AUDIO", S_Mid) + S(10);
     x = seg(x, y, {L"Original", L"Linear PCM"}, s.remuxPcm ? 1 : 0, [this](int i) {
         updateSetting([i](Settings& st) { st.remuxPcm = i == 1; });
         for (auto& f : remux_)
@@ -1023,264 +911,494 @@ void MainWindow::buildRemux(RECT a) {
         }
         relayout();
     }, nullptr, (a.right - x) / 2);
-    y += rh + S(4);
-    hline(a.left, a.right, y);
-    y += S(8);
-    int actionY = a.bottom - rh;
-    RECT detail{a.left, y, a.right, actionY - S(8)};
-    if (selRemux_ >= 0 && selRemux_ < (int)remux_.size() && remux_[selRemux_].info.ok) {
-        FileRow& f = remux_[selRemux_];
-        RemuxSpec rs = f.remux;
-        rs.container = s.remuxContainer;
-        rs.audioPcm = s.remuxPcm;
-        rs.pcmBits = s.remuxPcmBits;
-        ContainerAdvice adv = adviseContainer(s.remuxContainer, f.info);
-        int contentY = y - detailScroll_;
-        beginClip(detail);
-        int yy = contentY;
-        int rightEdge = a.right - S(8);
-        if (adv.best != s.remuxContainer) {
-            std::wstring t = std::wstring(containerName(s.remuxContainer)) + L" cannot keep " + std::to_wstring(adv.convertible + adv.impossible) +
-                             L" track(s) bit-for-bit. " + containerName(adv.best) + L" keeps every track with no compromise.";
-            int xx = text(a.left, yy, t, S_Bold, rightEdge - a.left - S(120));
-            Container best = adv.best;
-            button(xx + S(12), yy, std::wstring(L"use ") + containerName(best), [this, best] {
-                updateSetting([best](Settings& st) { st.remuxContainer = best; });
-                for (auto& ff : remux_) ff.remux.actions.clear();
-                relayout();
-            });
-            yy += rh;
-        } else if (adv.convertible + adv.impossible == 0) {
-            text(a.left, yy, std::wstring(L"Every track fits ") + containerName(s.remuxContainer) + L" bit-for-bit.", S_Mid);
-            yy += rh;
-        } else {
-            text(a.left, yy, std::wstring(L"Neither MP4 nor MOV holds every track as it is: the list shows what happens to each."), S_Mid, rightEdge - a.left);
-            yy += rh;
-        }
-        sectionTitle(a.left, yy, L"TRACKS");
-        yy += rh;
-        int idx = selRemux_;
-        int boxW = S(170);
-        for (auto& st : f.info.streams) {
-            auto it = rs.actions.find(st.index);
-            TrackAction act = it != rs.actions.end() ? it->second : defaultAction(s.remuxContainer, st, s.remuxPcm);
-            auto allowed = allowedActions(s.remuxContainer, st);
-            if (std::find(allowed.begin(), allowed.end(), act) == allowed.end()) act = defaultAction(s.remuxContainer, st, s.remuxPcm);
-            int sid = st.index;
-            int ax = rightEdge - boxW;
-            text(a.left + S(16), yy, describeStream(st), act == TrackAction::Exclude ? S_Mid : 0, ax - a.left - S(28));
-            if (st.type == "data") {
-                add(K_Text, RECT{ax + S(9), yy, rightEdge, yy + rh}, st.codec == "bin_data" && f.info.chapters ? L"chapter track" : L"not carried", S_Mid);
-                yy += rh;
-                continue;
-            }
-            std::wstring label = trackActionName(act);
-            if (act == TrackAction::ToPCM) label = std::wstring(L"PCM ") + pcmBitsName(s.remuxPcmBits);
-            if (fitStream(s.remuxContainer, st) == Fit::No && act == TrackAction::Exclude) label = L"EXCLUDED (cannot fit)";
-            Item& ch = add(K_Box, RECT{ax, yy + S(3), rightEdge, yy + rh - S(3)}, label, S_Click | (act == TrackAction::Copy ? 0 : S_Bold));
-            int pcmBits = s.remuxPcmBits;
-            ch.click = [this, idx, sid, allowed, act, pcmBits] {
-                std::vector<std::wstring> o;
-                int cur = -1;
-                for (size_t i = 0; i < allowed.size(); i++) {
-                    std::wstring n = trackActionName(allowed[i]);
-                    if (allowed[i] == TrackAction::Copy) n += L" (bit-for-bit)";
-                    if (allowed[i] == TrackAction::ToPCM) n = std::wstring(L"PCM ") + pcmBitsName(pcmBits) + (pcmBits == 0 || pcmBits == 32 ? L" (lossless decode)" : L" (rounded)");
-                    if (allowed[i] == TrackAction::ToText) n += L" (mov_text, styling lost)";
-                    if (allowed[i] == act) cur = (int)i;
-                    o.push_back(n);
-                }
-                int r = popup(o, cur);
-                if (r >= 0 && idx < (int)remux_.size()) remux_[idx].remux.actions[sid] = allowed[r];
-                relayout();
-            };
-            yy += rh;
-        }
-        Plan p = planRemux(f.info, rs);
-        yy += S(6);
-        buildPlan(detail, p, yy);
-        endClip();
-        int contentH = yy - contentY;
-        int maxOff2 = std::max<int>(0, contentH - (detail.bottom - detail.top));
-        detailScroll_ = std::clamp(detailScroll_, 0, maxOff2);
-        region(detail, [this, maxOff2](int n) { scrollBy(detailScroll_, n * rowH() * 3, maxOff2); });
-        scrollbar(detail, detailScroll_, contentH);
-    } else if (!remux_.empty()) {
-        text(a.left, y, L"Select an analysed file to see each track.", S_Mid);
-    }
-    int count = 0;
-    for (auto& f : remux_) count += f.checked && f.info.ok;
-    text(a.left, actionY, std::to_wstring(count) + L" of " + std::to_wstring(remux_.size()) + L" file(s) selected", S_Mid);
-    std::wstring go = L"remux " + std::to_wstring(count);
-    int gw = tw(go, S_Bold) + S(24);
-    Item& gb = add(K_Button, RECT{a.right - gw, actionY + S(3), a.right, actionY + rh - S(3)}, go, S_Bold | (count ? S_Invert | S_Click : S_Disabled));
-    if (count) gb.click = [this] { startRemux(); };
+    y += rh;
 }
 
-// ---------- queue ----------
+// ---------- list rows ----------
 
-void MainWindow::buildQueue(RECT a) {
+int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool selected) {
     int rh = rowH();
-    int y = a.top;
-    int run = 0, wait = 0, fail = 0, done = 0, paused = 0;
-    for (auto& t : tasks_) {
-        run += t.state == TaskState::Running;
-        wait += t.state == TaskState::Waiting;
-        fail += t.state == TaskState::Failed;
-        done += t.state == TaskState::Done || t.state == TaskState::Canceled;
-        paused += t.state == TaskState::Paused;
-    }
-    int x = sectionTitle(a.left, y, L"QUEUE") + S(16);
-    std::wstring counts;
-    auto part = [&](int n, const wchar_t* what) {
-        if (n) counts += (counts.empty() ? L"" : L"   ") + std::to_wstring(n) + L" " + what;
+    int is = S(30), gap = S(2);
+    RowId id = r.id;
+    auto act = [this, id](void (MainWindow::*fn)(const ListRow&)) {
+        return [this, id, fn] { withRow(id, [this, fn](const ListRow& x) { (this->*fn)(x); }); };
     };
-    part(run, L"running");
-    part(wait, L"queued");
-    part(paused, L"paused");
-    part(fail, L"failed");
-    part(done, L"finished");
-    text(x, y, counts, S_Mid);
-    // Only the actions that apply right now.
-    int rx = a.right;
-    auto rb = [&](const std::wstring& l, std::function<void()> fn) {
-        rx -= tw(l) + S(20);
-        button(rx, y, l, std::move(fn));
-        rx -= S(8);
-    };
-    if (done) rb(L"clear finished", [this] { queue_.clearFinished(); });
-    if (paused) rb(L"resume all", [this] { queue_.resumeAll(); });
-    if (run || wait) rb(L"pause all", [this] { queue_.pauseAll(); });
-    y += rh + S(4);
-    RECT list{a.left, y, a.right, a.bottom};
-    int rowHt = rh + S(10);
-    int selExtra = rh * 2;
-    int totalH = (int)tasks_.size() * rowHt + (selTask_ ? selExtra : 0);
-    int viewH = list.bottom - list.top;
-    if (revealTask_ && selTask_) {
-        int top = 0;
-        for (auto& t : tasks_) {
-            if (t.id == selTask_) break;
-            top += rowHt;
-        }
-        if (top + rowHt + selExtra > queueScroll_ + viewH) queueScroll_ = top + rowHt + selExtra - viewH;
-        if (top < queueScroll_) queueScroll_ = top;
-        revealTask_ = false;
-    }
-    queueScroll_ = std::clamp(queueScroll_, 0, std::max<int>(0, totalH - viewH));
-    region(list, [this, totalH, viewH](int n) { scrollBy(queueScroll_, n * rowH() * 2, totalH - viewH); });
-    if (tasks_.empty()) {
-        emptyState(list, L"Nothing queued", L"Downloads, conversions and remuxes you start appear here.");
-        return;
-    }
-    beginClip(list);
-    int ry = y - queueScroll_;
-    int rowRight = a.right - S(8);
-    for (auto& t : tasks_) {
-        bool sel = t.id == selTask_;
-        int h = rowHt + (sel ? selExtra : 0);
-        if (ry + h < list.top || ry > list.bottom) {
-            ry += h;
-            continue;
-        }
-        uint64_t id = t.id;
-        bool active = t.state == TaskState::Running || t.state == TaskState::Paused;
-        Item& row = add(K_Text, RECT{a.left, ry, rowRight, ry + rowHt - S(2)}, L"", S_Click | (sel ? S_Selected : 0));
-        row.click = [this, id] {
-            selTask_ = selTask_ == id ? 0 : id;
-            revealTask_ = true;
+
+    if (r.type == ListRow::Head) {  // a playlist: its entries follow
+        DlGroup& g = groups_[r.idx];
+        int h = rh + S(14);
+        Item& bg = add(K_Text, RECT{left, y, right, y + h - 1}, L"", S_Click | (selected ? S_Selected : 0));
+        bg.click = [this, id] {
+            select(0, sel_[0] == id ? RowId{} : id);
             relayout();
         };
-        int line = ry + S(1);
-        // Kind chip.
-        RECT chip{a.left + S(4), line + S(6), a.left + S(40), line + rh - S(6)};
-        add(K_Text, chip, kindTag(t.kind), S_Mono | S_Mid | S_Center);
-        add(K_Frame, chip);
-        int tx = a.left + S(52);
-        // Right side: buttons, then one short status.
-        int bx = rowRight;
-        Item& xb = add(K_Icon, RECT{bx - S(26), line + S(3), bx, line + rh - S(3)}, L"", S_Click);
-        xb.value = I_Close;
-        xb.click = [this, id, active] {
-            if (active) queue_.cancel(id);
-            else queue_.remove(id);
-        };
-        bx -= S(26) + S(8);
-        auto rowButton = [&](const std::wstring& label, std::function<void()> fn, unsigned st = 0) {
-            int w = tw(label, st) + S(20);
-            bx -= w;
-            Item& b = add(K_Button, RECT{bx, line + S(3), bx + w, line + rh - S(3)}, label, st | S_Click);
-            b.click = std::move(fn);
-            bx -= S(8);
-        };
-        std::wstring status;
-        unsigned statusStyle = S_Mid | S_Mono;
-        if (t.state == TaskState::Running) {
-            rowButton(L"pause", [this, id] { queue_.pause(id); });
-            if (t.progress >= 0) status = std::to_wstring((int)(t.progress * 100)) + L"%";
-            if (!t.speed.empty()) status += (status.empty() ? L"" : L"   ") + t.speed;
-            if (t.eta >= 0) status += (status.empty() ? L"" : L"   ") + fmtDuration(t.eta);
-            statusStyle = S_Mono;
-        } else if (t.state == TaskState::Waiting) {
-            rowButton(L"pause", [this, id] { queue_.pause(id); });
-            status = t.stage.empty() || t.stage == L"starting" ? L"queued" : t.stage;
-        } else if (t.state == TaskState::Paused) {
-            rowButton(L"resume", [this, id] { queue_.resume(id); });
-            status = t.progress >= 0 ? L"paused " + std::to_wstring((int)(t.progress * 100)) + L"%" : L"paused";
-        } else if (t.state == TaskState::Failed || t.state == TaskState::Canceled) {
-            rowButton(L"retry", [this, id] { queue_.retry(id); });
-            status = t.state == TaskState::Failed ? L"failed" : L"canceled";
-            statusStyle = t.state == TaskState::Failed ? (S_Bold | S_Mono) : (S_Mid | S_Mono);
-        } else if (t.state == TaskState::Done) {
-            if (!t.output.empty()) {
-                std::wstring out = t.output;
-                rowButton(L"show", [this, out] { openFolder(out); });
-            }
-            status = classTag(t.cls);
-            statusStyle = S_Mono | (t.cls == QualityClass::Lossy ? S_Bold : S_Mid);
+        int nSel = 0;
+        for (char c : g.checked) nSel += c;
+        int iy = y + (h - is) / 2;
+        int ix = right - S(4);
+        ix = rowIcon(ix, iy, is, I_Close, L"remove the playlist (started entries stay)", act(&MainWindow::removeRow)) - gap;
+        ix = rowIcon(ix, iy, is, I_Folder, L"open the download folder", [this] { openFolder(settingsCopy().dlDir); }) - gap;
+        ix = rowIcon(ix, iy, is, I_Open, L"open the playlist page", [this, u = g.url] { openUrl(u); }) - gap;
+        ix = rowIcon(ix, iy, is, I_Play, nSel ? L"start the checked entries" : L"", nSel ? std::function<void()>(act(&MainWindow::startRow)) : nullptr);
+        int ty = y + (h - rh) / 2;
+        int x = text(left + S(8), ty, L"PLAYLIST", S_Bold) + S(14);
+        uint64_t key = g.key;
+        x = button(x, ty, L"all", [this, key] {
+            for (auto& gg : groups_)
+                if (gg.key == key) std::fill(gg.checked.begin(), gg.checked.end(), 1);
+            syncRange(key);
+            relayout();
+        });
+        x = button(x, ty, L"none", [this, key] {
+            for (auto& gg : groups_)
+                if (gg.key == key) std::fill(gg.checked.begin(), gg.checked.end(), 0);
+            syncRange(key);
+            relayout();
+        });
+        x = text(x + S(4), ty, L"RANGE", S_Mid) + S(10);
+        int cw = fonts_.charW * 13;
+        RECT er{x, ty + S(5), x + cw, ty + rh - S(5)};
+        if (key == rangeKey_ && er.top >= listView_.top && er.bottom <= listView_.bottom) {
+            placeEdit(E_RANGE, er);
+        } else {
+            Item& it = add(K_Text, RECT{x, ty, x + cw, ty + rh}, rangesText(g.checked), S_Mid | S_Click);
+            it.tip = L"type a range such as 1-5,8";
+            it.click = [this, key] {
+                rangeKey_ = key;  // the one range box moves to this playlist and shows its own selection
+                for (auto& gg : groups_)
+                    if (gg.key == key) SetWindowTextW(edits_[E_RANGE], rangesText(gg.checked).c_str());
+                relayout(true);
+            };
         }
-        int sw = tw(status, statusStyle);
-        bx -= sw + S(4);
-        add(K_Text, RECT{bx, line, bx + sw, line + rh}, status, statusStyle);
-        bx -= S(16);
-        // Title, then the current step while running.
-        int titleMax = std::max<int>(S(80), bx - tx);
-        int tend = text(tx, line, t.title, t.state == TaskState::Running ? S_Bold : 0, titleMax);
-        if (t.state == TaskState::Running && !t.stage.empty() && bx - tend > S(60))
-            add(K_Text, RECT{tend + S(12), line, bx, line + rh}, t.stage, S_Mid);
-        // Thin progress line under running and paused tasks.
-        if (active || (t.state == TaskState::Waiting && t.progress >= 0)) {
-            Item& bar = add(K_Progress, RECT{tx, line + rh - S(1), rowRight - S(2), line + rh + S(5)});
-            bar.value = t.progress;
-        }
-        if (sel) {
-            int yy = ry + rowHt;
-            std::wstring l1;
-            if (t.state == TaskState::Failed) l1 = t.error + (t.hint.empty() ? L"" : L"   " + t.hint);
-            else if (!t.result.empty()) l1 = t.result;
-            else l1 = t.stage.empty() ? std::wstring(stateName(t.state)) : t.stage;
-            add(K_Text, RECT{tx, yy, rowRight, yy + denseH()}, l1, (t.state == TaskState::Failed ? S_Bold : S_Mid) | S_Mono);
-            yy += denseH() + S(2);
-            int xx = tx;
-            xx = button(xx, yy, L"log", [this] {
-                logApp_ = false;
-                setOverlay(Overlay::Log);
-            });
-            if (!t.output.empty()) {
-                std::wstring out = t.output;
-                if (t.state == TaskState::Done) {
-                    xx = button(xx, yy, L"play", [this, out] { ShellExecuteW(hwnd_, nullptr, out.c_str(), nullptr, nullptr, SW_SHOWNORMAL); });
-                    xx = button(xx, yy, L"convert", [this, out] { addFiles({out}, 1); });
-                    xx = button(xx, yy, L"remux", [this, out] { addFiles({out}, 2); });
-                }
-                text(xx + S(8), yy, t.output, S_Mid, rowRight - xx - S(8));
-            }
-        }
-        ry += h;
+        x += cw + S(14);
+        text(x, ty, std::to_wstring(nSel) + L"/" + std::to_wstring(g.entries.size()) + L"  " + g.title, S_Mid, ix - x - S(10));
+        hline(left, right, y + h - 1);
+        return h;
     }
-    endClip();
-    scrollbar(list, queueScroll_, totalH);
+
+    // A row: background (selects it), a thumbnail or extension tag, two lines, status and actions.
+    std::wstring title, sub, status, chip, openTip, folderTip, closeTip = L"remove";
+    unsigned titleSt = S_Bold, subSt = S_Mid | S_Mono, statusSt = S_Mid | S_Mono;
+    std::string thumb;
+    double prog = -2;  // -2: no bar
+    int primaryIcon = -1;
+    std::wstring primaryTip;
+    std::function<void()> primary, open, folder;
+    bool checkbox = false, checked = false;
+    std::function<void()> onCheck;
+    auto segText = [](const std::wstring& a, const std::wstring& b) {
+        if (a.empty() && b.empty()) return std::wstring();
+        return L"  \u00b7  segment " + (a.empty() ? L"0" : a) + L" - " + (b.empty() ? L"end" : b);
+    };
+    if (r.type == ListRow::Task) {
+        const TaskView& t = *r.task;
+        uint64_t tid = t.id;
+        title = t.title;
+        thumb = t.thumb;
+        std::wstring pct = t.progress >= 0 ? std::to_wstring((int)(t.progress * 100)) + L"%" : L"";
+        switch (t.state) {
+            case TaskState::Running:
+                status = pct;
+                if (!t.speed.empty()) status += (status.empty() ? L"" : L"  ") + t.speed;
+                if (t.eta >= 0) status += (status.empty() ? L"" : L"  ") + fmtDuration(t.eta);
+                if (status.empty()) status = L"running";
+                statusSt = S_Mono;
+                sub = t.stage;
+                prog = t.progress;
+                primaryIcon = I_Pause;
+                primaryTip = L"pause (Space)";
+                primary = [this, tid] { queue_.pause(tid); };
+                break;
+            case TaskState::Waiting:
+                status = L"waiting";
+                sub = t.stage.empty() || t.stage == L"starting" ? L"starts when a slot is free (Settings: parallel tasks)" : t.stage;
+                if (t.progress >= 0) prog = t.progress;
+                primaryIcon = I_Pause;
+                primaryTip = L"hold it (Space)";
+                primary = [this, tid] { queue_.pause(tid); };
+                break;
+            case TaskState::Paused:
+                status = L"paused" + (pct.empty() ? L"" : L" " + pct);
+                sub = t.stage.empty() ? L"paused" : t.stage;
+                if (t.progress >= 0) prog = t.progress;
+                primaryIcon = I_Play;
+                primaryTip = L"resume (Space)";
+                primary = [this, tid] { queue_.resume(tid); };
+                break;
+            case TaskState::Failed:
+            case TaskState::Canceled:
+                status = t.state == TaskState::Failed ? L"failed" : L"canceled";
+                statusSt = t.state == TaskState::Failed ? S_Bold | S_Mono : S_Mid | S_Mono;
+                sub = t.state == TaskState::Failed ? t.error + (t.hint.empty() ? L"" : L"  \u2192 " + t.hint) : L"canceled";
+                primaryIcon = I_Retry;
+                primaryTip = L"try again (F5)";
+                primary = [this, tid] { queue_.retry(tid); };
+                break;
+            case TaskState::Done:
+                status = classTag(t.cls);
+                statusSt = S_Mono | (t.cls == QualityClass::Lossy ? S_Bold : S_Mid);
+                sub = t.result.empty() ? fileName(t.output) : t.result;
+                break;
+        }
+        bool active = t.state == TaskState::Running || t.state == TaskState::Paused;
+        closeTip = active ? L"cancel" : L"remove from the list (the file stays)";
+        std::wstring out = t.output, src = t.source;
+        bool doneOut = t.state == TaskState::Done && !out.empty();
+        if (tab_ == 0) {
+            openTip = L"open the link";
+            open = [this, src] { openUrl(src); };
+        } else {
+            openTip = doneOut ? L"play the result" : L"play the source";
+            open = [this, p = doneOut ? out : src] { openPath(p); };
+            chip = extTag(doneOut ? out : src);
+        }
+        if (tab_ == 0 && thumb.empty()) chip = extTag(out).empty() ? L"LINK" : extTag(out);  // tasks from before 1.0.3 kept no thumbnail
+        std::wstring dir = doneOut ? out : !t.outDir.empty() ? t.outDir : tab_ == 0 ? view_.dlDir : src;
+        folderTip = doneOut ? L"show the result in its folder" : L"open the output folder";
+        folder = [this, dir] { openFolder(dir); };
+    } else if (tab_ == 0) {
+        DlGroup& g = groups_[r.idx];
+        std::wstring url = g.url;
+        if (g.busy) {
+            title = url;
+            titleSt = 0;
+            sub = L"reading the link...";
+        } else if (!g.error.empty()) {
+            title = url;
+            titleSt = 0;
+            sub = g.error + (g.hint.empty() ? L"" : L"  \u2192 " + g.hint);
+            subSt = S_Bold;
+            status = L"failed";
+            statusSt = S_Bold | S_Mono;
+            primaryIcon = I_Retry;
+            primaryTip = L"read the link again";
+            int gi = r.idx;
+            primary = [this, gi, url] {
+                removeGroup(gi);
+                analyzeText(url);
+            };
+        } else if (!g.playlist) {
+            title = g.title;
+            thumb = g.info.thumb;
+            Selection sl = selectFormats(g.info, dlPrefs(view_));
+            sub = fmtDuration(g.info.duration) + L"  \u00b7  " + (sl.ok ? sl.summary : L"! " + sl.error) + segText(g.segA[0], g.segB[0]);
+            status = sl.ok && sl.estBytes > 0 ? L"~" + fmtBytes(sl.estBytes) : L"ready";
+            primaryIcon = I_Play;
+            primaryTip = L"start this download (Space)";
+            primary = act(&MainWindow::startRow);
+        } else {
+            const YtEntry& e = g.entries[r.entry];
+            url = widen(e.url);
+            title = widen(e.title);
+            thumb = e.thumb;
+            checkbox = true;
+            checked = g.checked[r.entry] != 0;
+            uint64_t key = g.key;
+            int ei = r.entry;
+            onCheck = [this, key, ei] {
+                for (auto& gg : groups_)
+                    if (gg.key == key && ei < (int)gg.checked.size()) gg.checked[ei] = !gg.checked[ei];
+                syncRange(key);
+                relayout();
+            };
+            if (!checked) titleSt = 0;
+            sub = std::to_wstring(e.index) + L".  " + fmtDuration(e.duration) + segText(g.segA[r.entry], g.segB[r.entry]);
+            status = checked ? L"ready" : L"skipped";
+            primaryIcon = I_Play;
+            primaryTip = L"start this entry now";
+            primary = act(&MainWindow::startRow);
+        }
+        openTip = L"open the link";
+        open = [this, url] { openUrl(url); };
+        folderTip = L"open the download folder";
+        folder = [this] { openFolder(settingsCopy().dlDir); };
+    } else {
+        const FileRow& f = (tab_ == 2 ? remux_ : conv_)[r.idx];
+        title = fileName(f.path);
+        chip = extTag(f.path);
+        bool ready = fileReady(tab_, f, view_);
+        if (f.busy) {
+            sub = L"reading the file...";
+        } else if (!f.error.empty()) {
+            sub = L"! " + f.error;
+            subSt = S_Bold;
+            status = L"cannot read";
+            statusSt = S_Bold | S_Mono;
+        } else {
+            sub = shortMedia(f.info);
+            status = ready ? L"ready" : L"see tracks";
+        }
+        if (ready) {
+            primaryIcon = I_Play;
+            primaryTip = tab_ == 1 ? L"convert this file (Space)" : L"remux this file (Space)";
+            primary = act(&MainWindow::startRow);
+        }
+        std::wstring p = f.path;
+        openTip = L"play the file";
+        open = [this, p] { openPath(p); };
+        folderTip = L"show the file in its folder";
+        folder = [this, p] { openFolder(p); };
+    }
+
+    int h = itemH();
+    size_t bgIdx = items_.size();
+    Item& bg = add(K_Text, RECT{left, y, right, y + h - 1}, L"", S_Click | (selected ? S_Selected : 0));
+    bg.click = [this, id] {
+        select(tab_, sel_[tab_] == id ? RowId{} : id);  // a second click folds the details away
+        relayout();
+    };
+    int iy = y + (h - is) / 2;
+    int ix = right - S(4);
+    ix = rowIcon(ix, iy, is, I_Close, closeTip, act(&MainWindow::removeRow)) - gap;
+    ix = rowIcon(ix, iy, is, I_Folder, folderTip, folder) - gap;
+    ix = rowIcon(ix, iy, is, I_Open, openTip, open) - gap;
+    if (primaryIcon >= 0) rowIcon(ix, iy, is, primaryIcon, primaryTip, primary);
+    ix -= is;  // the column stays even when there is nothing to start
+    int textRight = ix - S(16);
+    int x = left + S(8) + (r.sub > 0 ? S(24) : 0);  // playlist entries sit under their head
+    if (checkbox) {
+        check(x, y + (h - rh) / 2, checked, onCheck);
+        items_.back().tip = checked ? L"skip this entry in start all" : L"include this entry in start all";
+    }
+    if (r.sub > 0) x += S(28);
+    int vw = S(80), vh = S(45);
+    RECT vis{x, y + (h - vh) / 2, x + vw, y + (h - vh) / 2 + vh};
+    if (tab_ == 0 && (!thumb.empty() || r.type != ListRow::Task)) {
+        Item& th = add(K_Thumb, vis);
+        th.bmp = thumb.empty() ? nullptr : thumbs_.get(thumb);
+    } else {
+        add(K_Chip, vis, chip.empty() ? L"?" : chip);
+    }
+    int tx = vis.right + S(14);
+    int line1 = y + (h - rh * 2) / 2 + S(1);
+    int sw = status.empty() ? 0 : tw(status, statusSt);
+    add(K_Text, RECT{textRight - sw, line1, textRight, line1 + rh}, status, statusSt);
+    text(tx, line1, title, titleSt, textRight - sw - S(16) - tx);
+    add(K_Text, RECT{tx, line1 + rh - S(3), textRight, line1 + rh * 2 - S(3)}, sub, subSt);
+    if (prog > -2) {
+        Item& b = add(K_Progress, RECT{tx, y + h - S(7), textRight, y + h - S(7) + std::max(2, S(3))}, L"", S_Mid);
+        b.value = prog;
+    }
+    if (selected) h += buildRowDetail(r, tx, right - S(8), y + h);
+    items_[bgIdx].r.bottom = y + h - 1;
+    hline(left, right, y + h - 1);
+    return h;
 }
+
+// The selected row's details: what will happen (plan, tracks, segment) before it starts, what
+// happened (result, error, output, log) after.
+int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
+    int rh = rowH(), dh = denseH();
+    int y = y0;
+    auto inView = [&](const RECT& e) { return e.top >= listView_.top && e.bottom <= listView_.bottom; };
+    if (r.type == ListRow::Task) {
+        const TaskView& t = *r.task;
+        if (t.state == TaskState::Failed) {  // the whole error (the row shows only its start)
+            add(K_Text, RECT{left, y, right, y + dh}, t.error, S_Bold | S_Mono);
+            y += dh;
+            if (!t.hint.empty()) {
+                add(K_Text, RECT{left, y, right, y + dh}, t.hint, S_Mono);
+                y += dh;
+            }
+        }
+        if (!t.source.empty()) {
+            add(K_Text, RECT{left, y, right, y + dh}, (t.kind == TaskKind::Download ? L"from  " : L"source  ") + t.source, S_Mid | S_Mono);
+            y += dh;
+        }
+        if (!t.output.empty()) {
+            add(K_Text, RECT{left, y, right, y + dh}, L"to  " + t.output, S_Mid | S_Mono);
+            y += dh;
+        }
+        y += S(4);
+        int x = button(left, y, L"log", [this, tid = t.id] {
+            selTask_ = tid;
+            logApp_ = false;
+            setOverlay(Overlay::Log);
+        });
+        if (t.state == TaskState::Done && !t.output.empty()) {
+            std::wstring out = t.output;
+            x = button(x, y, L"play", [this, out] { openPath(out); });
+            if (t.kind != TaskKind::Remux) x = button(x, y, L"convert", [this, out] { addFiles({out}, 1); });
+            button(x, y, L"remux", [this, out] { addFiles({out}, 2); });
+        } else if (t.kind == TaskKind::Download && !t.source.empty()) {
+            button(x, y, L"copy link", [this, src = t.source] {
+                copyText(src);
+                flash(L"link copied", 2000);
+            });
+        }
+        return y + rh + S(8) - y0;
+    }
+    if (tab_ == 0) {
+        DlGroup& g = groups_[r.idx];
+        if (g.busy) return 0;
+        if (!g.error.empty()) {
+            add(K_Text, RECT{left, y, right, y + dh}, g.error, S_Bold | S_Mono);
+            y += dh;
+            if (!g.hint.empty()) {
+                add(K_Text, RECT{left, y, right, y + dh}, g.hint, S_Mid | S_Mono);
+                y += dh;
+            }
+            return y + S(8) - y0;
+        }
+        // A segment of this video (or entry); empty boxes download the whole thing.
+        int cw = fonts_.charW * 11;
+        int x = text(left, y, L"SEGMENT  from", S_Mid) + S(10);
+        RECT ea{x, y + S(5), x + cw, y + rh - S(5)};
+        if (inView(ea)) placeEdit(E_SEGA, ea);
+        x += cw + S(14);
+        x = text(x, y, L"to", S_Mid) + S(10);
+        RECT eb{x, y + S(5), x + cw, y + rh - S(5)};
+        if (inView(eb)) placeEdit(E_SEGB, eb);
+        x += cw + S(14);
+        text(x, y, L"m:ss or seconds; empty = the whole video", S_Mid, right - x);
+        y += rh;
+        std::wstring url = g.playlist ? widen(g.entries[r.entry].url) : g.url;
+        add(K_Text, RECT{left, y, right, y + dh}, url, S_Mid | S_Mono);
+        y += dh;
+        if (!g.playlist && !g.info.uploader.empty()) {
+            add(K_Text, RECT{left, y, right, y + dh}, L"by " + widen(g.info.uploader), S_Mid | S_Mono);
+            y += dh;
+        }
+        return y + S(8) - y0;
+    }
+    auto& list = tab_ == 2 ? remux_ : conv_;
+    FileRow& f = list[r.idx];
+    add(K_Text, RECT{left, y, right, y + dh}, f.path, S_Mid | S_Mono);
+    y += dh + S(4);
+    if (!f.info.ok) return y + S(4) - y0;
+    const Settings& s = view_;
+    RECT area{left, y, right, y};
+    uint64_t key = f.key;
+    if (tab_ == 1) {
+        EncoderCaps caps;
+        {
+            std::lock_guard<std::mutex> lk(capsMu_);
+            caps = caps_;
+        }
+        ConvertSpec planSpec = s.convert;
+        planSpec.accel = s.encoder;
+        Plan p = planConvert(f.info, planSpec, caps);
+        Advice adv = adviseConvert(f.info, s.convert);
+        if (adv.mode != Advice::Convert && !adv.text.empty()) {
+            int xx = text(left, y, adv.text, S_Bold, right - left - S(170));
+            button(xx + S(14), y, L"send to remux", [this, key] {
+                for (size_t i = 0; i < conv_.size(); i++) {
+                    if (conv_[i].key != key) continue;
+                    FileRow f2 = conv_[i];
+                    conv_.erase(conv_.begin() + i);
+                    f2.key = nextKey_++;
+                    remux_.push_back(f2);
+                    sel_[2] = RowId{0, f2.key, 0};
+                    setTab(2);
+                    return;
+                }
+            });
+            y += rh;
+        } else if (!adv.text.empty()) {
+            text(left, y, adv.text, S_Mid, right - left);
+            y += rh;
+        }
+        buildPlan(area, p, y);
+        y += S(6);
+        text(left, y, L"SOURCE  " + describeMedia(f.info), S_Bold, right - left);
+        y += rh;
+        for (auto& st : f.info.streams) {
+            add(K_Text, RECT{left + S(16), y, right, y + dh}, describeStream(st), S_Mid | S_Mono);
+            y += dh;
+        }
+        return y + S(10) - y0;
+    }
+    // Remux: container advice, then every track with what happens to it.
+    RemuxSpec rs = f.remux;
+    rs.container = s.remuxContainer;
+    rs.audioPcm = s.remuxPcm;
+    rs.pcmBits = s.remuxPcmBits;
+    ContainerAdvice adv = adviseContainer(s.remuxContainer, f.info);
+    if (adv.best != s.remuxContainer) {
+        std::wstring t = std::wstring(containerName(s.remuxContainer)) + L" cannot keep " + std::to_wstring(adv.convertible + adv.impossible) +
+                         L" track(s) bit-for-bit. " + containerName(adv.best) + L" keeps every track with no compromise.";
+        int xx = text(left, y, t, S_Bold, right - left - S(130));
+        Container best = adv.best;
+        button(xx + S(14), y, std::wstring(L"use ") + containerName(best), [this, best] {
+            updateSetting([best](Settings& st) { st.remuxContainer = best; });
+            for (auto& ff : remux_) ff.remux.actions.clear();
+            relayout();
+        });
+        y += rh;
+    } else if (adv.convertible + adv.impossible == 0) {
+        text(left, y, std::wstring(L"Every track fits ") + containerName(s.remuxContainer) + L" bit-for-bit.", S_Mid, right - left);
+        y += rh;
+    } else {
+        text(left, y, L"Neither MP4 nor MOV holds every track as it is: the list shows what happens to each.", S_Mid, right - left);
+        y += rh;
+    }
+    int boxW = S(220);
+    for (auto& st : f.info.streams) {
+        auto it = rs.actions.find(st.index);
+        TrackAction act = it != rs.actions.end() ? it->second : defaultAction(s.remuxContainer, st, s.remuxPcm);
+        auto allowed = allowedActions(s.remuxContainer, st);
+        if (std::find(allowed.begin(), allowed.end(), act) == allowed.end()) act = defaultAction(s.remuxContainer, st, s.remuxPcm);
+        int sid = st.index;
+        int ax = right - boxW;
+        text(left, y, describeStream(st), (act == TrackAction::Exclude ? S_Mid : 0) | S_Mono, ax - left - S(16));
+        if (st.type == "data") {
+            add(K_Text, RECT{ax + S(9), y, right, y + rh}, st.codec == "bin_data" && f.info.chapters ? L"chapter track" : L"not carried", S_Mid);
+            y += rh;
+            continue;
+        }
+        std::wstring label = trackActionName(act);
+        if (act == TrackAction::ToPCM) label = std::wstring(L"PCM ") + pcmBitsName(s.remuxPcmBits);
+        if (fitStream(s.remuxContainer, st) == Fit::No && act == TrackAction::Exclude) label = L"EXCLUDED (cannot fit)";
+        Item& ch = add(K_Box, RECT{ax, y + S(3), right, y + rh - S(3)}, label, S_Click | (act == TrackAction::Copy ? 0 : S_Bold));
+        int pcmBits = s.remuxPcmBits;
+        ch.click = [this, key, sid, allowed, act, pcmBits] {
+            std::vector<std::wstring> o;
+            int cur = -1;
+            for (size_t i = 0; i < allowed.size(); i++) {
+                std::wstring n = trackActionName(allowed[i]);
+                if (allowed[i] == TrackAction::Copy) n += L" (bit-for-bit)";
+                if (allowed[i] == TrackAction::ToPCM) n = std::wstring(L"PCM ") + pcmBitsName(pcmBits) + (pcmBits == 0 || pcmBits == 32 ? L" (lossless decode)" : L" (rounded)");
+                if (allowed[i] == TrackAction::ToText) n += L" (mov_text, styling lost)";
+                if (allowed[i] == act) cur = (int)i;
+                o.push_back(n);
+            }
+            int r2 = popup(o, cur);
+            if (r2 >= 0)
+                for (auto& ff : remux_)
+                    if (ff.key == key) ff.remux.actions[sid] = allowed[r2];
+            relayout();
+        };
+        y += rh;
+    }
+    Plan p = planRemux(f.info, rs);
+    y += S(6);
+    buildPlan(area, p, y);
+    return y + S(10) - y0;
+}
+
+void MainWindow::buildPlan(RECT& area, const Plan& p, int& y) {
+    int rh = rowH();
+    int left = area.left, right = area.right;
+    if (!p.ok) {
+        text(left, y, L"! " + p.error, S_Bold, right - left);
+        y += rh;
+        return;
+    }
+    int x = text(left, y, className(p.cls), S_Bold, right - left - S(200));
+    text(x + S(16), y, L"size " + p.estText, S_Mid, right - x - S(16));
+    y += rh;
+    int dh = denseH();
+    for (auto& l : p.lines) {
+        add(K_Text, RECT{left + S(16), y, right, y + dh}, l, S_Mono);
+        y += dh;
+    }
+    y += S(4);
+    for (auto& w : p.warnings) {
+        add(K_Text, RECT{left + S(16), y, right, y + dh}, L"! " + w, S_Bold);
+        y += dh;
+    }
+}
+
 
 // ---------- views: log, history, settings ----------
 // Each view has the same head: a bold title with its summary, actions on the right, and a close icon.
@@ -1495,7 +1613,7 @@ void MainWindow::buildSettings(RECT a) {
         toggle(x, y, L"run encoders at low priority (the PC stays responsive)", s.lowPriority, [upd] { upd([](Settings& st) { st.lowPriority = !st.lowPriority; }); });
         y += rh;
     }
-    section(L"QUEUE");
+    section(L"TASKS");
     num(L"Parallel downloads", s.maxDownloads, 1, 8, [](Settings& st, int v) { st.maxDownloads = v; });
     num(L"Parallel conversions", s.maxEncodes, 1, 4, [](Settings& st, int v) { st.maxEncodes = v; });
     num(L"Parallel remuxes", s.maxRemux, 1, 8, [](Settings& st, int v) { st.maxRemux = v; });

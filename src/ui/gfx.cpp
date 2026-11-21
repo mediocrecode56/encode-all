@@ -63,23 +63,24 @@ void Fonts::create(int dpi) {
         return CreateFontW(-MulDiv(px, dpi, 96), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, pitch, face);
     };
-    normal = mk(14, FW_NORMAL, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
-    bold = mk(14, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
-    big = mk(18, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
-    mono = mk(13, FW_NORMAL, L"Consolas", FIXED_PITCH | FF_MODERN);
-    monoBold = mk(13, FW_BOLD, L"Consolas", FIXED_PITCH | FF_MODERN);
+    // 12 px Segoe UI (Windows' own 9 pt) and 11 px Consolas: the compact scale (see scale()).
+    normal = mk(12, FW_NORMAL, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
+    bold = mk(12, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
+    big = mk(15, FW_SEMIBOLD, L"Segoe UI", VARIABLE_PITCH | FF_SWISS);
+    mono = mk(11, FW_NORMAL, L"Consolas", FIXED_PITCH | FF_MODERN);
+    monoBold = mk(11, FW_BOLD, L"Consolas", FIXED_PITCH | FF_MODERN);
     HDC dc = GetDC(nullptr);
     HGDIOBJ old = SelectObject(dc, normal);
     TEXTMETRICW tm;
     GetTextMetricsW(dc, &tm);
     charW = tm.tmAveCharWidth;
-    ascent = tm.tmAscent;
     int h = tm.tmHeight;
+    textH = h;
     SelectObject(dc, mono);
     GetTextMetricsW(dc, &tm);
-    denseH = tm.tmHeight + MulDiv(5, dpi, 96);
+    denseH = tm.tmHeight + MulDiv(4, dpi, 96);
     h = std::max<int>(h, tm.tmHeight);
-    lineH = h + MulDiv(11, dpi, 96);
+    lineH = h + MulDiv(7, dpi, 96);
     SelectObject(dc, old);
     ReleaseDC(nullptr, dc);
 }
@@ -238,6 +239,65 @@ void Painter::icon(int k, const RECT& r, COLORREF c, int size) {
             float q = h * 0.5f, dy = (k == I_Up) ? -1.0f : 1.0f;
             PointF p[3] = {PointF(cx - q, cy - dy * q * 0.5f), PointF(cx, cy + dy * q * 0.5f), PointF(cx + q, cy - dy * q * 0.5f)};
             g.DrawLines(&pen, p, 3);
+            break;
+        }
+        case I_Play: {  // outlined triangle pointing right
+            float q = h * 0.78f;
+            PointF p[3] = {PointF(cx - q * 0.62f, cy - q), PointF(cx + q * 0.9f, cy), PointF(cx - q * 0.62f, cy + q)};
+            g.DrawPolygon(&pen, p, 3);
+            break;
+        }
+        case I_Pause: {
+            float q = std::round(h * 0.36f);
+            line(cx - q, cy - h * 0.72f, cx - q, cy + h * 0.72f);
+            line(cx + q, cy - h * 0.72f, cx + q, cy + h * 0.72f);
+            break;
+        }
+        case I_Retry: {  // circular arrow, clockwise, the head near the top
+            float R = h * 0.78f;
+            const float pi = 3.14159265f;
+            g.DrawArc(&pen, cx - R, cy - R, 2 * R, 2 * R, -40.0f, 290.0f);
+            float te = (-40.0f + 290.0f) * pi / 180.0f;
+            PointF e(cx + R * std::cos(te), cy + R * std::sin(te));
+            PointF d(-std::sin(te), std::cos(te)), n(std::cos(te), std::sin(te));  // direction of travel, outward
+            float a = h * 0.46f;
+            line(e.X, e.Y, e.X - a * d.X + a * 0.8f * n.X, e.Y - a * d.Y + a * 0.8f * n.Y);
+            line(e.X, e.Y, e.X - a * d.X - a * 0.8f * n.X, e.Y - a * d.Y - a * 0.8f * n.Y);
+            break;
+        }
+        case I_Folder: {
+            PointF p[6] = {PointF(cx - h * 0.9f, cy - h * 0.66f), PointF(cx - h * 0.22f, cy - h * 0.66f), PointF(cx + h * 0.02f, cy - h * 0.4f),
+                           PointF(cx + h * 0.9f, cy - h * 0.4f),  PointF(cx + h * 0.9f, cy + h * 0.7f),   PointF(cx - h * 0.9f, cy + h * 0.7f)};
+            g.DrawPolygon(&pen, p, 6);
+            break;
+        }
+        case I_Open: {  // a box with an arrow leaving its top-right corner
+            PointF p[5] = {PointF(cx - h * 0.1f, cy - h * 0.72f), PointF(cx - h * 0.8f, cy - h * 0.72f), PointF(cx - h * 0.8f, cy + h * 0.8f),
+                           PointF(cx + h * 0.72f, cy + h * 0.8f), PointF(cx + h * 0.72f, cy + h * 0.1f)};
+            g.DrawLines(&pen, p, 5);
+            line(cx - h * 0.05f, cy + h * 0.05f, cx + h * 0.86f, cy - h * 0.86f);
+            PointF a[3] = {PointF(cx + h * 0.24f, cy - h * 0.86f), PointF(cx + h * 0.86f, cy - h * 0.86f), PointF(cx + h * 0.86f, cy - h * 0.24f)};
+            g.DrawLines(&pen, a, 3);
+            break;
+        }
+        case I_Link: {  // two chain links at 45 degrees
+            g.TranslateTransform(cx, cy);
+            g.RotateTransform(-45.0f);
+            float lw = h * 1.12f, lh = h * 0.62f, r = lh / 2;
+            for (float x0 : {-h * 1.0f, -h * 0.12f}) {
+                GraphicsPath path;
+                path.AddArc(x0, -r, lh, lh, 90.0f, 180.0f);
+                path.AddArc(x0 + lw - lh, -r, lh, lh, 270.0f, 180.0f);
+                path.CloseFigure();
+                g.DrawPath(&pen, &path);
+            }
+            g.ResetTransform();
+            break;
+        }
+        case I_Plus: {
+            float q = h * 0.72f;
+            line(cx - q, cy, cx + q, cy);
+            line(cx, cy - q, cx, cy + q);
             break;
         }
         // Window buttons: square glyphs of whole pixels, like Windows' own.

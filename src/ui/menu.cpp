@@ -22,7 +22,7 @@ struct Menu {
     bool done = false;
     HWND hwnd = nullptr;
 
-    int S(int v) const { return MulDiv(v, dpi, 96); }
+    int S(int v) const { return scale(v, dpi); }
     bool sep(int i) const { return (*items)[i] == L"-"; }
     bool head(int i) const { return !(*items)[i].empty() && (*items)[i][0] == L'#'; }
     bool inert(int i) const { return sep(i) || head(i); }
@@ -311,7 +311,7 @@ struct Confirm {
     RECT msgRect{};
     bool done = false, result = false;
 
-    int S(int v) const { return MulDiv(v, dpi, 96); }
+    int S(int v) const { return scale(v, dpi); }
     int at(POINT p) const {
         for (int i = 0; i < 2; i++)
             if (PtInRect(&btn[i], p)) return i;

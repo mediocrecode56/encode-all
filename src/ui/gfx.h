@@ -19,12 +19,13 @@ void allowDarkMenus(bool dark);  // uxtheme preferred app mode, so native scroll
 
 // Line icons in the ink colour (no bitmaps, no colours).
 // Anti-aliased (GDI+); the window glyphs (I_Min and after) keep whole-pixel strokes so they stay sharp.
-enum Icon { I_History, I_Log, I_Settings, I_Close, I_Check, I_Chevron, I_Up, I_Down, I_Min, I_Max, I_Restore, I_WinClose };
+enum Icon { I_History, I_Log, I_Settings, I_Close, I_Check, I_Chevron, I_Up, I_Down, I_Play, I_Pause, I_Retry, I_Folder, I_Open, I_Link, I_Plus,
+            I_Min, I_Max, I_Restore, I_WinClose };
 
 struct Fonts {
     // Segoe UI for labels and controls; Consolas for technical lines (streams, plans, logs, numbers).
     HFONT normal = nullptr, bold = nullptr, big = nullptr, mono = nullptr, monoBold = nullptr;
-    int charW = 7, lineH = 18, denseH = 16, ascent = 13;  // denseH: monospace lists (plans, logs)
+    int charW = 6, lineH = 23, denseH = 17, textH = 16;  // denseH: monospace lists (plans, logs); textH: one Segoe UI line
     void create(int dpi);
     void destroy();
 };
@@ -51,6 +52,9 @@ private:
     const Fonts& f_;
 };
 
-inline int scale(int v, int dpi) { return MulDiv(v, dpi, 96); }
+// Layout sizes are design units: 0.7 px at 96 dpi (owner's request, 2026-11-21: the UI 30% smaller).
+// Fonts are sized separately (Fonts::create) so text stays readable.
+constexpr int kUiScale = 70;
+inline int scale(int v, int dpi) { return MulDiv(v, dpi * kUiScale, 96 * 100); }
 
 }  // namespace ea::ui

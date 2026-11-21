@@ -158,7 +158,7 @@ bool MainWindow::create(HINSTANCE inst, int show, const std::vector<std::wstring
     using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
     if (HMODULE sh = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
         if (auto f = (GetDpiForMonitorFn)(void*)GetProcAddress(sh, "GetDpiForMonitor")) f(mon, 0, &mdx, &mdy);
-    int w = settings_.winW > 0 ? settings_.winW : MulDiv(1120, mdx, 96), h = settings_.winH > 0 ? settings_.winH : MulDiv(780, mdx, 96);
+    int w = settings_.winW > 0 ? settings_.winW : MulDiv(900, mdx, 96), h = settings_.winH > 0 ? settings_.winH : MulDiv(640, mdx, 96);
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     if (settings_.winX != INT32_MIN) {
         RECT r{settings_.winX, settings_.winY, settings_.winX + w, settings_.winY + h};
@@ -192,7 +192,7 @@ static LRESULT CALLBACK editProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     HWND parent = GetParent(h);
     int id = GetDlgCtrlID(h);
     if (m == WM_KEYDOWN) {
-        if (w == VK_RETURN && !(id == 100 + E_URLS && (GetKeyState(VK_SHIFT) & 0x8000))) {
+        if (w == VK_RETURN) {
             SendMessageW(parent, WM_COMMAND, MAKEWPARAM(id, 0x7001), (LPARAM)h);
             return 0;
         }
@@ -205,13 +205,9 @@ static LRESULT CALLBACK editProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
     }
-    if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE || w == 1 /* ctrl+a */) && !(id == 100 + E_URLS && w == VK_RETURN && (GetKeyState(VK_SHIFT) & 0x8000)))
-        return 0;
-    if (m == WM_PASTE && id == 100 + E_URLS) {
-        LRESULT r = CallWindowProcW(gEditProc, h, m, w, l);
-        PostMessageW(parent, WM_COMMAND, MAKEWPARAM(id, 0x7003), (LPARAM)h);
-        return r;
-    }
+    if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE || w == 1 /* ctrl+a */)) return 0;
+    // Links pasted into the link box are read at once (all of them, one per line or not); other text pastes normally.
+    if (m == WM_PASTE && id == 100 + E_URLS && SendMessageW(parent, WM_APP_PASTE, 0, 0)) return 0;
     if (m == WM_KILLFOCUS) SendMessageW(parent, WM_COMMAND, MAKEWPARAM(id, 0x7004), (LPARAM)h);
     if (m == WM_CONTEXTMENU) {  // the app's own menu instead of the native edit menu
         SendMessageW(parent, WM_APP_EDITMENU, (WPARAM)h, l);
@@ -226,32 +222,22 @@ void MainWindow::onCreate() {
     measureDc_ = CreateCompatibleDC(nullptr);
     applyTheme();
     for (int i = 0; i < E_COUNT; i++) {
-        DWORD style = WS_CHILD | ES_AUTOHSCROLL;
-        if (i == E_URLS) style = WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN;
-        edits_[i] = CreateWindowExW(0, L"EDIT", L"", style, 0, 0, 10, 10, hwnd_, (HMENU)(INT_PTR)(100 + i), inst_, nullptr);
-        SendMessageW(edits_[i], WM_SETFONT, (WPARAM)(i == E_URLS ? fonts_.mono : fonts_.normal), FALSE);
+        edits_[i] = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd_, (HMENU)(INT_PTR)(100 + i), inst_, nullptr);
+        SendMessageW(edits_[i], WM_SETFONT, (WPARAM)fonts_.normal, FALSE);
         SendMessageW(edits_[i], EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(4), S(4)));
-        SendMessageW(edits_[i], EM_LIMITTEXT, i == E_URLS ? 1 << 20 : 512, 0);
+        SendMessageW(edits_[i], EM_LIMITTEXT, i == E_URLS ? 1 << 16 : 512, 0);
         WNDPROC old = (WNDPROC)SetWindowLongPtrW(edits_[i], GWLP_WNDPROC, (LONG_PTR)editProc);
         if (!gEditProc) gEditProc = old;
     }
+    SendMessageW(edits_[E_URLS], EM_SETCUEBANNER, TRUE, (LPARAM)L"Paste links, or type one and press Enter");
     RegisterDragDrop(hwnd_, new DropTarget([this](std::vector<std::wstring> files, std::wstring text) {
         if (!files.empty()) {
             addFiles(files, tab_ == 2 ? 2 : 1);
             return;
         }
-        auto urls = extractUrls(text);
-        if (urls.empty()) return;
-        setTab(0);
-        std::wstring cur;
-        int n = GetWindowTextLengthW(edits_[E_URLS]);
-        cur.resize(n);
-        GetWindowTextW(edits_[E_URLS], cur.data(), n + 1);
-        for (auto& u : urls) cur += (cur.empty() ? L"" : L"\r\n") + u;
-        SetWindowTextW(edits_[E_URLS], cur.c_str());
-        analyzeUrls();
+        analyzeText(text);
     }));
-    thumbs_.setSize(S(64), S(36));
+    thumbs_.setSize(S(80), S(45));
     thumbs_.start([this] { PostMessageW(hwnd_, WM_APP_THUMB, 0, 0); });
     cleanTmp();
     // Tools, queue and runners.
@@ -301,7 +287,6 @@ void MainWindow::onDestroy() {
     queue_.shutdown();
     deps_.shutdown();
     thumbs_.stop();
-    KillTimer(hwnd_, T_ANIM);
     for (auto& w : workers_)
         if (w.t.joinable()) w.t.join();
     if (updateThread_.joinable()) updateThread_.join();
@@ -325,10 +310,10 @@ void MainWindow::onDpi(int dpi, const RECT* r) {
     dpi_ = dpi;
     fonts_.create(dpi);
     for (HWND e : edits_) {
-        SendMessageW(e, WM_SETFONT, (WPARAM)(e == edits_[E_URLS] ? fonts_.mono : fonts_.normal), FALSE);
+        SendMessageW(e, WM_SETFONT, (WPARAM)fonts_.normal, FALSE);
         SendMessageW(e, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(4), S(4)));
     }
-    thumbs_.setSize(S(64), S(36));
+    thumbs_.setSize(S(80), S(45));
     if (r) SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
     relayout(true);
 }
@@ -369,10 +354,8 @@ Item& MainWindow::add(int kind, const RECT& r, const std::wstring& t, unsigned s
     it.r = r;
     it.text = t;
     it.style = style;
-    if (clipping_ || bounded_) {
-        RECT c = clipping_ ? clip_ : bound_;
-        if (clipping_ && bounded_) IntersectRect(&c, &clip_, &bound_);
-        it.clip = c;
+    if (clipping_) {
+        it.clip = clip_;
         it.clipped = true;
     }
     return it;
@@ -448,20 +431,23 @@ int MainWindow::seg(int x, int y, const std::vector<std::wstring>& opts, int sel
 
 void MainWindow::hline(int x0, int x1, int y) { add(K_Line, RECT{x0, y, x1, y + 1}); }
 
-void MainWindow::progressBar(const RECT& r, double v) {
-    Item& it = add(K_Progress, r);
-    it.value = v;
-}
-
 void MainWindow::region(const RECT& r, std::function<void(int)> wheel) {
     Item& it = add(K_Region, r);
     it.wheel = std::move(wheel);
 }
 
-void MainWindow::placeEdit(Edit e, const RECT& r) {
+void MainWindow::placeEdit(Edit e, const RECT& r, bool frame) {
     editPlaced_[e] = true;
     editRects_[e] = r;
-    add(K_Frame, RECT{r.left - 1, r.top - 1, r.right + 1, r.bottom + 1});
+    if (frame) add(K_Frame, RECT{r.left - 1, r.top - 1, r.right + 1, r.bottom + 1});
+}
+
+int MainWindow::rowIcon(int right, int top, int size, int icon, const std::wstring& tip, std::function<void()> fn) {
+    Item& it = add(K_Icon, RECT{right - size, top, right, top + size}, L"", fn ? S_Click : S_Disabled);
+    it.value = icon;
+    it.tip = tip;
+    it.click = std::move(fn);
+    return right - size;
 }
 
 int MainWindow::popup(const std::vector<std::wstring>& opts, int checked) {
@@ -538,6 +524,15 @@ void MainWindow::scrollbar(const RECT& v, int offset, int content) {
     add(K_Bar, RECT{v.right - S(3), ty, v.right, ty + th});
 }
 
+// Icon buttons name themselves in the header's hint line; only that line repaints.
+void MainWindow::setHint(const std::wstring& tip) {
+    if (tip == hoverTip_) return;
+    hoverTip_ = tip;
+    if (hintIdx_ >= items_.size()) return;
+    items_[hintIdx_].text = tip.empty() ? hintDefault_ : tip;
+    InvalidateRect(hwnd_, &items_[hintIdx_].r, FALSE);
+}
+
 void MainWindow::scrollBy(int& off, int delta, int maxOff) {
     off = std::clamp(off - delta, 0, std::max(0, maxOff));
     relayout();
@@ -546,11 +541,15 @@ void MainWindow::scrollBy(int& off, int delta, int maxOff) {
 // ---------- layout and paint ----------
 
 void MainWindow::relayout(bool full) {
-    if (!hwnd_ || !fonts_.normal) return;
+    // Never nested: setting an edit's text during a build sends EN_CHANGE, whose handler lays out again.
+    if (!hwnd_ || !fonts_.normal || building_) return;
     prev_.swap(items_);
     items_.clear();
+    hintIdx_ = SIZE_MAX;
     for (bool& p : editPlaced_) p = false;
+    building_ = true;
     build();
+    building_ = false;
     // Native edits follow the layout.
     HDWP dw = BeginDeferWindowPos(E_COUNT);
     for (int i = 0; i < E_COUNT; i++) {
@@ -570,8 +569,10 @@ void MainWindow::relayout(bool full) {
         }
     }
     EndDeferWindowPos(dw);
-    // Hover follows the mouse through structural changes.
+    // Hover follows the mouse through structural changes, and so does the hint it shows.
     hover_ = hitTest(mouse_);
+    hoverTip_ = hover_ >= 0 ? items_[hover_].tip : L"";
+    if (hintIdx_ < items_.size()) items_[hintIdx_].text = hoverTip_.empty() ? hintDefault_ : hoverTip_;
     if (full || prev_.size() != items_.size()) {
         InvalidateRect(hwnd_, nullptr, FALSE);
         return;
@@ -668,7 +669,14 @@ void MainWindow::onPaint() {
                 bool on = (it.style & S_Invert) || press;
                 if (on) p.fill(it.r, theme_.ink);
                 else if (hov) p.fill(it.r, theme_.hover);
-                p.icon((int)it.value, it.r, on ? theme_.bg : theme_.ink, S(16));
+                COLORREF c = on ? theme_.bg : (it.style & S_Disabled) ? theme_.line : (it.style & S_Mid) && !hov ? theme_.mid : theme_.ink;
+                p.icon((int)it.value, it.r, c, std::min<int>(S(17), (int)(it.r.bottom - it.r.top) - S(6)));
+                break;
+            }
+            case K_Chip: {
+                p.fill(it.r, theme_.off);
+                p.frame(it.r, theme_.line);
+                p.text(it.r, it.text, theme_.mid, fonts_.monoBold, DT_CENTER);
                 break;
             }
             case K_Bar: p.fill(it.r, theme_.line); break;
@@ -684,10 +692,16 @@ void MainWindow::onPaint() {
                 break;
             }
             case K_Fill: p.fill(it.r, (it.style & S_Invert) ? theme_.ink : theme_.off); break;
-            case K_Clear: p.fill(it.r, theme_.bg); break;
             case K_Line: p.fill(it.r, theme_.line); break;
             case K_Frame: p.frame(it.r, theme_.line); break;
             case K_Progress: {
+                if (it.style & S_Mid) {  // a list row's hairline progress: no track frame
+                    p.fill(it.r, theme_.line);
+                    RECT fill = it.r;
+                    fill.right = it.value >= 0 ? it.r.left + (int)std::lround((it.r.right - it.r.left) * std::clamp(it.value, 0.0, 1.0)) : it.r.left;
+                    if (fill.right > fill.left) p.fill(fill, theme_.ink);
+                    break;
+                }
                 int h = std::min<int>(S(8), (int)(it.r.bottom - it.r.top));
                 int top = it.r.top + (it.r.bottom - it.r.top - h) / 2;
                 RECT track{it.r.left, top, it.r.right, top + h};
@@ -718,23 +732,11 @@ void MainWindow::onPaint() {
 
 // ---------- events ----------
 
-// Active work first: running, paused, queued, failed, then finished tasks newest first.
 void MainWindow::refreshTasks() {
     tasks_ = queue_.snapshot();
-    auto rank = [](TaskState s) {
-        switch (s) {
-            case TaskState::Running: return 0;
-            case TaskState::Paused: return 1;
-            case TaskState::Waiting: return 2;
-            case TaskState::Failed: return 3;
-            default: return 4;
-        }
-    };
-    std::stable_sort(tasks_.begin(), tasks_.end(), [&](const TaskView& a, const TaskView& b) {
-        int ra = rank(a.state), rb = rank(b.state);
-        if (ra != rb) return ra < rb;
-        return ra == 4 ? a.id > b.id : a.id < b.id;
-    });
+    bool found = !selTask_;
+    for (auto& t : tasks_) found = found || t.id == selTask_;
+    if (!found) selTask_ = 0;
 }
 
 int MainWindow::hitTest(POINT p) const {
@@ -779,9 +781,7 @@ bool MainWindow::preTranslate(MSG& m) {
         return true;
     }
     if (ctrl && k == VK_RETURN) {
-        if (tab_ == 0) startDownloads();
-        else if (tab_ == 1) startConvert();
-        else startRemux();
+        startAll(tab_);
         return true;
     }
     if (k == VK_F5 && selTask_) {
@@ -798,27 +798,32 @@ bool MainWindow::preTranslate(MSG& m) {
         SendMessageW(edits_[E_URLS], WM_PASTE, 0, 0);
         return true;
     }
-    if ((k == VK_UP || k == VK_DOWN) && !tasks_.empty()) {
+    if (overlay_ != Overlay::None) return false;
+    // The list: arrows select, Space starts, pauses or resumes, Delete removes (or cancels a running task).
+    if ((k == VK_UP || k == VK_DOWN) && !rowIds_.empty()) {
         int i = 0;
-        for (; i < (int)tasks_.size(); i++)
-            if (tasks_[i].id == selTask_) break;
-        i = std::clamp(i + (k == VK_UP ? -1 : 1), 0, (int)tasks_.size() - 1);
-        selTask_ = tasks_[i].id;
-        revealTask_ = true;
+        for (; i < (int)rowIds_.size(); i++)
+            if (rowIds_[i] == sel_[tab_]) break;
+        if (i == (int)rowIds_.size()) i = k == VK_UP ? (int)rowIds_.size() : -1;
+        i = std::clamp(i + (k == VK_UP ? -1 : 1), 0, (int)rowIds_.size() - 1);
+        select(tab_, rowIds_[i]);
+        reveal_ = true;
         relayout();
         return true;
     }
-    if (k == VK_SPACE && selTask_) {
-        for (auto& t : tasks_)
-            if (t.id == selTask_) {
-                if (t.state == TaskState::Paused) queue_.resume(t.id);
-                else if (t.state == TaskState::Running || t.state == TaskState::Waiting) queue_.pause(t.id);
+    if ((k == VK_SPACE || k == VK_DELETE) && !sel_[tab_].empty()) {
+        for (auto& r : collectRows(tab_)) {
+            if (!(r.id == sel_[tab_])) continue;
+            if (k == VK_DELETE) {
+                removeRow(r);
+            } else if (r.type == ListRow::Task) {
+                if (r.task->state == TaskState::Paused) queue_.resume(r.task->id);
+                else if (r.task->state == TaskState::Running || r.task->state == TaskState::Waiting) queue_.pause(r.task->id);
+            } else {
+                startRow(r);
             }
-        return true;
-    }
-    if (k == VK_DELETE && selTask_) {
-        for (auto& t : tasks_)
-            if (t.id == selTask_ && t.state != TaskState::Running && t.state != TaskState::Paused) queue_.remove(t.id);
+            break;
+        }
         return true;
     }
     return false;
@@ -875,7 +880,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
         case WM_NCACTIVATE: return DefWindowProcW(hwnd_, m, w, -1);  // no default caption repaint over our bar
         case WM_GETMINMAXINFO: {
             auto mm = (MINMAXINFO*)l;
-            mm->ptMinTrackSize = {S(860), S(600)};
+            mm->ptMinTrackSize = {S(940), S(640)};
             return 0;
         }
         case WM_DPICHANGED: onDpi(HIWORD(w), (RECT*)l); return 0;
@@ -900,6 +905,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
                 if (h >= 0) InvalidateRect(hwnd_, &items_[h].r, FALSE);
                 hover_ = h;
                 SetCursor(LoadCursor(nullptr, h >= 0 ? IDC_HAND : IDC_ARROW));
+                setHint(h >= 0 ? items_[h].tip : L"");
             }
             TRACKMOUSEEVENT te{sizeof te, TME_LEAVE, hwnd_, 0};
             TrackMouseEvent(&te);
@@ -915,6 +921,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
             mouse_ = {-1, -1};
             if (hover_ >= 0 && hover_ < (int)items_.size()) InvalidateRect(hwnd_, &items_[hover_].r, FALSE);
             hover_ = -1;
+            setHint(L"");
             return 0;
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK: {
@@ -979,28 +986,28 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
             } else if (code == 0x7002) {  // Esc
                 if (id == E_CUSTOM) commitCustom(false);
                 else SetFocus(hwnd_);
-            } else if (code == 0x7003) {  // pasted into the URL box
-                analyzeUrls();
             } else if (code == 0x7004) {  // focus left
                 if (id == E_CUSTOM && customDone_) commitCustom(true);
-            } else if (code == EN_CHANGE) {
+            } else if (code == EN_CHANGE && (id == E_SEGA || id == E_SEGB || id == E_RANGE)) {
                 int n = GetWindowTextLengthW(edits_[id]);
                 std::wstring t(n, L'\0');
                 GetWindowTextW(edits_[id], t.data(), n + 1);
-                if ((id == E_SEGA || id == E_SEGB) && selGroup_ >= 0 && selGroup_ < (int)groups_.size()) {
-                    auto& g = groups_[selGroup_];
-                    int e = g.playlist ? selEntry_ : 0;
-                    if (e >= 0 && e < (int)g.segA.size()) (id == E_SEGA ? g.segA : g.segB)[e] = trim(t);
-                    relayout();
-                } else if (id == E_RANGE && selGroup_ >= 0 && selGroup_ < (int)groups_.size()) {
-                    auto& g = groups_[selGroup_];
-                    std::vector<int> idx;
-                    if (g.playlist && parseRanges(t, (int)g.entries.size(), idx)) {
-                        std::fill(g.checked.begin(), g.checked.end(), 0);
-                        for (int i : idx) g.checked[i - 1] = 1;
-                        relayout();
+                uint64_t key = id == E_RANGE ? rangeKey_ : sel_[0].key;
+                for (auto& g : groups_) {
+                    if (g.key != key) continue;
+                    if (id == E_RANGE) {
+                        std::vector<int> idx;
+                        if (g.playlist && parseRanges(t, (int)g.entries.size(), idx)) {
+                            std::fill(g.checked.begin(), g.checked.end(), 0);
+                            for (int i : idx) g.checked[i - 1] = 1;
+                        }
+                    } else {
+                        int sub = sel_[0].sub;
+                        for (size_t e = 0; e < g.segA.size(); e++)
+                            if ((g.playlist ? g.entries[e].index : 0) == sub) (id == E_SEGA ? g.segA : g.segB)[e] = trim(t);
                     }
                 }
+                relayout();
             }
             return 0;
         }
@@ -1021,8 +1028,6 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
             } else if (w == T_SAVE) {
                 KillTimer(hwnd_, T_SAVE);
                 saveSettingsNow();
-            } else if (w == T_ANIM) {
-                stepQueueAnim();
             }
             return 0;
         case WM_APP_QUEUE: {
@@ -1052,6 +1057,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_UPDATE: relayout(); return 0;
         case WM_APP_CAPS: relayout(); return 0;
         case WM_APP_EDITMENU: editMenu((HWND)w, l); return 0;
+        case WM_APP_PASTE: return pasteLinks() ? 1 : 0;
         case WM_COPYDATA: {
             auto cd = (COPYDATASTRUCT*)l;
             if (cd->dwData == 0xEA01 && cd->lpData) {
@@ -1077,11 +1083,7 @@ void MainWindow::openArgs(const std::vector<std::wstring>& args) {
         else urls += a + L"\r\n";
     }
     if (!files.empty()) addFiles(files, 1);
-    if (!urls.empty()) {
-        setTab(0);
-        SetWindowTextW(edits_[E_URLS], urls.c_str());
-        analyzeUrls();
-    }
+    if (!urls.empty()) analyzeText(urls);
 }
 
 void MainWindow::setTab(int t) {
@@ -1097,37 +1099,8 @@ void MainWindow::setOverlay(Overlay o) {
             historyScroll_ = 0;
         }
         if (o == Overlay::Log) logScroll_ = 0;
-        animateQueue();
     }
     relayout(true);
-}
-
-// The queue slides out of the way under Settings and back elsewhere: 160 ms, ease-out. The views
-// take their final layout at once; only the queue block moves, so nothing else jumps or redraws twice.
-void MainWindow::animateQueue() {
-    double target = overlay_ == Overlay::Settings ? 0 : 1;
-    if (target == animTo_ && (animOn_ || queueOpen_ == target)) return;
-    animFrom_ = queueOpen_;
-    animTo_ = target;
-    animStart_ = GetTickCount64();
-    if (!animOn_) {
-        SetTimer(hwnd_, T_ANIM, 8, nullptr);
-        animOn_ = true;
-    }
-}
-
-void MainWindow::stepQueueAnim() {
-    const double dur = 160;
-    double t = std::min(1.0, (GetTickCount64() - animStart_) / dur);
-    double e = 1 - (1 - t) * (1 - t) * (1 - t);
-    queueOpen_ = animFrom_ + (animTo_ - animFrom_) * e;
-    if (t >= 1) {
-        queueOpen_ = animTo_;
-        KillTimer(hwnd_, T_ANIM);
-        animOn_ = false;
-    }
-    relayout();
-    UpdateWindow(hwnd_);  // paint each frame now
 }
 
 void MainWindow::flash(const std::wstring& msg, UINT ms) {
@@ -1136,26 +1109,70 @@ void MainWindow::flash(const std::wstring& msg, UINT ms) {
     relayout();
 }
 
-void MainWindow::removeGroup(int gi) {
-    if (gi < 0 || gi >= (int)groups_.size()) return;
-    groups_.erase(groups_.begin() + gi);
-    if (selGroup_ == gi) {
-        selGroup_ = groups_.empty() ? -1 : std::min(gi, (int)groups_.size() - 1);
-        selEntry_ = 0;
-    } else if (selGroup_ > gi) {
-        selGroup_--;
+void MainWindow::select(int tab, const RowId& id) {
+    sel_[tab] = id;
+    selTask_ = id.task;
+    if (tab != 0 || !id.key) return;
+    // The segment boxes edit the selected link (or playlist entry).
+    for (auto& g : groups_) {
+        if (g.key != id.key) continue;
+        for (size_t e = 0; e < g.segA.size(); e++)
+            if ((g.playlist ? g.entries[e].index : 0) == id.sub) {
+                SetWindowTextW(edits_[E_SEGA], g.segA[e].c_str());
+                SetWindowTextW(edits_[E_SEGB], g.segB[e].c_str());
+            }
     }
 }
 
-void MainWindow::removeFile(int tab, int i) {
-    auto& list = tab == 2 ? remux_ : conv_;
-    int& sel = tab == 2 ? selRemux_ : selConv_;
-    if (i < 0 || i >= (int)list.size()) return;
-    list.erase(list.begin() + i);
-    if (sel > i || sel >= (int)list.size()) sel--;
-    if (sel < 0 && !list.empty()) sel = 0;
-    detailScroll_ = 0;
+int64_t MainWindow::newOrder() {
+    // Milliseconds since 1970 (exact in a JSON number), never repeated, so newer items sort first.
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    int64_t ms = (int64_t)((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10000 - 11644473600000ULL);
+    lastOrder_ = std::max(ms, lastOrder_ + 1);
+    return lastOrder_;
+}
+
+void MainWindow::removeGroup(int gi) {
+    if (gi < 0 || gi >= (int)groups_.size()) return;
+    groups_.erase(groups_.begin() + gi);
+}
+
+void MainWindow::removeRow(const ListRow& r) {
+    if (r.type == ListRow::Task) {
+        const TaskView& t = *r.task;
+        if (t.state == TaskState::Running || t.state == TaskState::Paused) queue_.cancel(t.id);
+        else queue_.remove(t.id);
+        return;
+    }
+    if (tab_ == 0) {
+        if (r.idx < 0 || r.idx >= (int)groups_.size()) return;
+        DlGroup& g = groups_[r.idx];
+        if (r.type == ListRow::Pending && g.playlist && r.entry >= 0 && r.entry < (int)g.entries.size() && g.entries.size() > 1) {
+            g.entries.erase(g.entries.begin() + r.entry);
+            g.checked.erase(g.checked.begin() + r.entry);
+            g.segA.erase(g.segA.begin() + r.entry);
+            g.segB.erase(g.segB.begin() + r.entry);
+            syncRange(g.key);
+        } else {
+            removeGroup(r.idx);
+        }
+    } else {
+        auto& list = tab_ == 2 ? remux_ : conv_;
+        if (r.idx >= 0 && r.idx < (int)list.size()) list.erase(list.begin() + r.idx);
+    }
+    if (sel_[tab_] == r.id) sel_[tab_] = RowId{};
     relayout(true);
+}
+
+void MainWindow::openUrl(const std::wstring& url) {
+    std::wstring l = lower(url);
+    if (startsWith(l, L"https://") || startsWith(l, L"http://")) ShellExecuteW(hwnd_, nullptr, url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void MainWindow::openPath(const std::wstring& path) {
+    if (fileExists(path)) ShellExecuteW(hwnd_, nullptr, path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    else flash(L"File not found: " + path, 4000);
 }
 
 void MainWindow::spawn(std::function<void()> fn) {
@@ -1259,7 +1276,7 @@ std::vector<std::wstring> MainWindow::openFiles(const wchar_t* typeName, const w
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return files;
     DWORD o;
     d->GetOptions(&o);
-    d->SetOptions(o | (multi ? FOS_ALLOWMULTISELECT : 0) | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    d->SetOptions(o | (multi ? (DWORD)FOS_ALLOWMULTISELECT : 0u) | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
     COMDLG_FILTERSPEC f[] = {{typeName, spec}, {L"All files", L"*.*"}};
     d->SetFileTypes(2, f);
     if (SUCCEEDED(d->Show(hwnd_))) {
@@ -1301,7 +1318,6 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
     }
     tab_ = tab;
     overlay_ = Overlay::None;
-    animateQueue();
     auto& list = tab == 2 ? remux_ : conv_;
     for (auto& f : files) {
         bool dup = false;
@@ -1309,6 +1325,7 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
         if (dup) continue;
         FileRow row;
         row.key = nextKey_++;
+        row.order = newOrder();
         row.path = f;
         list.push_back(row);
         uint64_t key = row.key;
@@ -1325,8 +1342,7 @@ void MainWindow::addFiles(const std::vector<std::wstring>& in, int tab) {
             PostMessageW(hwnd_, WM_APP_RESULT, 0, 0);
         });
     }
-    if (tab == 2 && selRemux_ < 0 && !remux_.empty()) selRemux_ = 0;
-    if (tab == 1 && selConv_ < 0 && !conv_.empty()) selConv_ = 0;
+    listScroll_[tab] = 0;  // newest first: show what was just added
     relayout(true);
 }
 
@@ -1334,9 +1350,29 @@ void MainWindow::analyzeUrls() {
     int n = GetWindowTextLengthW(edits_[E_URLS]);
     std::wstring t(n, L'\0');
     GetWindowTextW(edits_[E_URLS], t.data(), n + 1);
-    auto urls = extractUrls(t);
-    if (urls.empty()) return;
+    if (extractUrls(t).empty()) return;
     SetWindowTextW(edits_[E_URLS], L"");
+    analyzeText(t);
+}
+
+bool MainWindow::pasteLinks() {
+    std::wstring t;
+    if (!OpenClipboard(hwnd_)) return false;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* p = (const wchar_t*)GlobalLock(h)) t = p;
+        GlobalUnlock(h);
+    }
+    CloseClipboard();
+    // A lone word is typed text, not a link: let it paste.
+    std::wstring l = lower(trim(t));
+    if (extractUrls(t).empty() || (!startsWith(l, L"http") && l.find(L'/') == std::wstring::npos && l.find(L'\n') == std::wstring::npos)) return false;
+    analyzeText(t);
+    return true;
+}
+
+void MainWindow::analyzeText(const std::wstring& text) {
+    auto urls = extractUrls(text);
+    if (urls.empty()) return;
     Settings s = settingsCopy();
     for (auto& u : urls) {
         bool dup = false;
@@ -1344,6 +1380,7 @@ void MainWindow::analyzeUrls() {
         if (dup) continue;
         DlGroup g;
         g.key = nextKey_++;
+        g.order = newOrder();
         g.url = u;
         g.title = u;
         groups_.push_back(g);
@@ -1388,7 +1425,7 @@ void MainWindow::analyzeUrls() {
     }
     tab_ = 0;
     overlay_ = Overlay::None;
-    animateQueue();
+    listScroll_[0] = 0;
     relayout(true);
 }
 
@@ -1421,10 +1458,6 @@ void MainWindow::applyResults() {
                     g.segA.assign(1, L"");
                     g.segB.assign(1, L"");
                 }
-                if (selGroup_ < 0) {
-                    selGroup_ = (int)(&g - groups_.data());
-                    selEntry_ = 0;
-                }
                 break;
             }
         } else if (r.type == 2) {
@@ -1434,94 +1467,135 @@ void MainWindow::applyResults() {
                     f.busy = false;
                     f.error = r.error;
                     f.info = r.media;
-                    if (!r.error.empty()) f.checked = false;
                 }
         }
     }
     relayout(true);
 }
 
-void MainWindow::startDownloads() {
-    Settings s = settingsCopy();
-    int n = 0;
-    std::vector<DlGroup> keep;
-    for (auto& g : groups_) {
-        if (g.busy || !g.error.empty()) {
-            keep.push_back(g);
-            continue;
-        }
-        if (g.playlist) {
-            for (size_t i = 0; i < g.entries.size(); i++) {
-                if (!g.checked[i]) continue;
-                auto& e = g.entries[i];
-                queue_.add(TaskKind::Download, widen(e.title), makeDownloadSpec(s, widen(e.url), L"", g.segA[i], g.segB[i]));
-                n++;
-            }
-        } else if (!g.checked.empty() && g.checked[0]) {
-            queue_.add(TaskKind::Download, g.title, makeDownloadSpec(s, g.url, g.infoFile, g.segA[0], g.segB[0]));
-            n++;
-        }
-    }
-    if (n == 0) return;
-    groups_ = keep;
-    selGroup_ = groups_.empty() ? -1 : 0;
-    selEntry_ = 0;
-    dlScroll_ = 0;
-    flash(std::to_wstring(n) + (n == 1 ? L" download queued" : L" downloads queued"));
-    relayout(true);
-}
+// ---------- starting ----------
 
-void MainWindow::startConvert() {
-    Settings s = settingsCopy();
+int MainWindow::queueGroup(DlGroup& g, int onlyEntry, const Settings& s, uint64_t* firstTask) {
     int n = 0;
-    std::vector<FileRow> keep;
-    for (auto& f : conv_) {
-        if (f.busy || !f.info.ok || !f.checked) {
-            keep.push_back(f);
-            continue;
-        }
-        json::Value spec = json::Value::object();
-        spec.set("input", f.path);
-        spec.set("outDir", s.convertDir);
-        spec.set("convert", s.convert.toJson());
-        queue_.add(TaskKind::Convert, fileName(f.path), spec);
+    auto note = [&](uint64_t id) {
+        if (firstTask && !*firstTask) *firstTask = id;
         n++;
+    };
+    if (!g.playlist) {
+        json::Value spec = makeDownloadSpec(s, g.url, g.infoFile, g.segA.empty() ? L"" : g.segA[0], g.segB.empty() ? L"" : g.segB[0]);
+        spec.set("order", (long long)g.order);
+        spec.set("thumb", g.info.thumb);
+        note(queue_.add(TaskKind::Download, g.title, spec));
+        g.entries.clear();
+        return n;
     }
-    if (!n) return;
-    conv_ = keep;
-    selConv_ = conv_.empty() ? -1 : 0;
-    flash(std::to_wstring(n) + (n == 1 ? L" conversion queued" : L" conversions queued"));
-    relayout(true);
-}
-
-void MainWindow::startRemux() {
-    Settings s = settingsCopy();
-    int n = 0;
-    std::vector<FileRow> keep;
-    for (auto& f : remux_) {
-        if (f.busy || !f.info.ok || !f.checked) {
-            keep.push_back(f);
+    for (size_t i = 0; i < g.entries.size();) {
+        bool go = onlyEntry >= 0 ? (int)i == onlyEntry : g.checked[i] != 0;
+        if (!go) {
+            i++;
             continue;
         }
+        auto& e = g.entries[i];
+        json::Value spec = makeDownloadSpec(s, widen(e.url), L"", g.segA[i], g.segB[i]);
+        spec.set("order", (long long)g.order);
+        spec.set("orderSub", e.index);
+        spec.set("thumb", e.thumb);
+        note(queue_.add(TaskKind::Download, widen(e.title), spec));
+        g.entries.erase(g.entries.begin() + i);
+        g.checked.erase(g.checked.begin() + i);
+        g.segA.erase(g.segA.begin() + i);
+        g.segB.erase(g.segB.begin() + i);
+    }
+    return n;
+}
+
+bool MainWindow::fileReady(int tab, const FileRow& f, const Settings& s) {
+    if (f.busy || !f.info.ok) return false;
+    if (tab != 2) return true;
+    RemuxSpec rs = f.remux;
+    rs.container = s.remuxContainer;
+    rs.audioPcm = s.remuxPcm;
+    rs.pcmBits = s.remuxPcmBits;
+    return planRemux(f.info, rs).ok;
+}
+
+uint64_t MainWindow::queueFile(int tab, const FileRow& f, const Settings& s) {
+    if (!fileReady(tab, f, s)) return 0;
+    json::Value spec = json::Value::object();
+    spec.set("input", f.path);
+    spec.set("order", (long long)f.order);
+    if (tab == 2) {
         RemuxSpec rs = f.remux;
         rs.container = s.remuxContainer;
         rs.audioPcm = s.remuxPcm;
         rs.pcmBits = s.remuxPcmBits;
-        if (!planRemux(f.info, rs).ok) {
-            keep.push_back(f);
-            continue;
-        }
-        json::Value spec = json::Value::object();
-        spec.set("input", f.path);
         spec.set("outDir", s.remuxDir);
         spec.set("remux", rs.toJson());
-        queue_.add(TaskKind::Remux, fileName(f.path), spec);
-        n++;
+        return queue_.add(TaskKind::Remux, fileName(f.path), spec);
+    }
+    spec.set("outDir", s.convertDir);
+    spec.set("convert", s.convert.toJson());
+    return queue_.add(TaskKind::Convert, fileName(f.path), spec);
+}
+
+// One item: a link, a playlist entry, a whole playlist (its checked entries) or a file. The started
+// item becomes a task in the same place and keeps the selection.
+void MainWindow::startRow(const ListRow& r) {
+    if (r.type == ListRow::Task) return;
+    Settings s = settingsCopy();
+    uint64_t id = 0;
+    if (tab_ == 0) {
+        if (r.idx < 0 || r.idx >= (int)groups_.size()) return;
+        DlGroup& g = groups_[r.idx];
+        if (g.busy || !g.error.empty()) return;
+        queueGroup(g, r.type == ListRow::Head ? -1 : r.entry, s, &id);
+        if (g.entries.empty()) removeGroup(r.idx);
+        else syncRange(g.key);
+    } else {
+        auto& list = tab_ == 2 ? remux_ : conv_;
+        if (r.idx < 0 || r.idx >= (int)list.size()) return;
+        id = queueFile(tab_, list[r.idx], s);
+        if (!id) return;
+        list.erase(list.begin() + r.idx);
+    }
+    if (id && sel_[tab_] == r.id && r.type != ListRow::Head) select(tab_, RowId{id, 0, 0});
+    refreshTasks();
+    relayout(true);
+}
+
+void MainWindow::startAll(int tab) {
+    Settings s = settingsCopy();
+    int n = 0;
+    if (tab == 0) {
+        for (size_t i = 0; i < groups_.size();) {
+            DlGroup& g = groups_[i];
+            if (g.busy || !g.error.empty()) {
+                i++;
+                continue;
+            }
+            n += queueGroup(g, -1, s, nullptr);
+            if (g.entries.empty()) {
+                groups_.erase(groups_.begin() + i);
+            } else {
+                syncRange(g.key);
+                i++;  // a playlist keeps its unchecked entries
+            }
+        }
+    } else {
+        auto& list = tab == 2 ? remux_ : conv_;
+        for (size_t i = 0; i < list.size();) {
+            if (queueFile(tab, list[i], s)) {
+                list.erase(list.begin() + i);
+                n++;
+            } else {
+                i++;
+            }
+        }
     }
     if (!n) return;
-    remux_ = keep;
-    selRemux_ = remux_.empty() ? -1 : 0;
-    flash(std::to_wstring(n) + (n == 1 ? L" remux queued" : L" remuxes queued"));
+    const wchar_t* what[3][2] = {{L" download", L" downloads"}, {L" conversion", L" conversions"}, {L" remux", L" remuxes"}};
+    flash(std::to_wstring(n) + what[tab][n == 1 ? 0 : 1] + L" started");
+    refreshTasks();
     relayout(true);
 }
 

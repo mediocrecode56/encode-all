@@ -32,6 +32,12 @@ struct TaskView {
     double progress = -1, eta = -1;
     int attempts = 0;
     QualityClass cls = QualityClass::Copy;
+    // From the spec: the list position the item had before it started ("order", "orderSub"), what it
+    // came from ("url" or "input"), where it goes ("outDir") and its thumbnail ("thumb").
+    int64_t order = 0;
+    int sub = 0;
+    std::wstring source, outDir;
+    std::string thumb;
 };
 
 struct Task {
@@ -101,9 +107,9 @@ public:
     void cancel(uint64_t id);
     void retry(uint64_t id);
     void remove(uint64_t id);
-    void clearFinished();
-    void pauseAll();
-    void resumeAll();
+    void clearFinished(int kind = -1);  // -1: every kind
+    void pauseAll(int kind = -1);
+    void resumeAll(int kind = -1);
 
     std::vector<TaskView> snapshot();
     std::vector<std::wstring> taskLog(uint64_t id);

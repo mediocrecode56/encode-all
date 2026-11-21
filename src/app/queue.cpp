@@ -303,33 +303,33 @@ void Queue::remove(uint64_t id) {
     if (notify_) notify_(true);
 }
 
-void Queue::clearFinished() {
+void Queue::clearFinished(int kind) {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        tasks_.remove_if([](const std::unique_ptr<Task>& t) {
-            return !t->th.joinable() && (t->state == TaskState::Done || t->state == TaskState::Canceled);
+        tasks_.remove_if([kind](const std::unique_ptr<Task>& t) {
+            return (kind < 0 || (int)t->kind == kind) && !t->th.joinable() && (t->state == TaskState::Done || t->state == TaskState::Canceled);
         });
         dirty_ = true;
     }
     if (notify_) notify_(true);
 }
 
-void Queue::pauseAll() {
+void Queue::pauseAll(int kind) {
     std::vector<uint64_t> ids;
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto& t : tasks_)
-            if (t->state == TaskState::Running || t->state == TaskState::Waiting) ids.push_back(t->id);
+            if ((kind < 0 || (int)t->kind == kind) && (t->state == TaskState::Running || t->state == TaskState::Waiting)) ids.push_back(t->id);
     }
     for (auto id : ids) pause(id);
 }
 
-void Queue::resumeAll() {
+void Queue::resumeAll(int kind) {
     std::vector<uint64_t> ids;
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto& t : tasks_)
-            if (t->state == TaskState::Paused) ids.push_back(t->id);
+            if ((kind < 0 || (int)t->kind == kind) && t->state == TaskState::Paused) ids.push_back(t->id);
     }
     for (auto id : ids) resume(id);
 }
@@ -355,6 +355,11 @@ std::vector<TaskView> Queue::snapshot() {
         v.eta = t->eta;
         v.attempts = t->attempts;
         v.cls = t->cls;
+        v.order = t->spec["order"].integer(0);
+        v.sub = (int)t->spec["orderSub"].integer(0);
+        v.source = t->spec[t->kind == TaskKind::Download ? "url" : "input"].wstr();
+        v.outDir = t->spec["outDir"].wstr();
+        v.thumb = t->spec["thumb"].str();
         r.push_back(std::move(v));
     }
     return r;
