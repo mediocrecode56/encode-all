@@ -1,6 +1,9 @@
 #include "menu.h"
 
 #include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <thread>
 
 namespace ea::ui {
 
@@ -300,6 +303,7 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
 namespace {
 
 const wchar_t* kConfirmClass = L"EncodeAllConfirm";
+constexpr UINT kFrameReady = WM_APP + 1;
 
 struct Confirm {
     const std::wstring *title = nullptr, *message = nullptr, *labels[2] = {};
@@ -308,10 +312,17 @@ struct Confirm {
     int dpi = 96;
     int focus = 0, hover = -1, pressed = -1;  // 0 cancel, 1 confirm
     RECT btn[2] = {};
-    RECT msgRect{};
-    bool done = false, result = false;
+    RECT msgRect{}, picture{};
+    HBITMAP frame = nullptr;
+    std::wstring frameError;
+    bool preview = false, loading = false;
+    bool done = false, result = false, next = false;
 
     int S(int v) const { return scale(v, dpi); }
+    void choose(int i) {
+        if (i == 1 && preview) { if (!loading) next = true; }
+        else { result = i == 1; done = true; }
+    }
     int at(POINT p) const {
         for (int i = 0; i < 2; i++)
             if (PtInRect(&btn[i], p)) return i;
@@ -332,13 +343,28 @@ struct Confirm {
         RECT mr = msgRect;
         DrawTextW(m, message->c_str(), (int)message->size(), &mr, DT_WORDBREAK | DT_NOPREFIX);
         SelectObject(m, of);
+        if (preview) {
+            p.frame(picture, theme->line);
+            if (frame) {
+                RECT inner{picture.left + 1, picture.top + 1, picture.right - 1, picture.bottom - 1};
+                p.bitmap(frame, inner);
+            } else {
+                RECT inner{picture.left + pad, picture.top + pad, picture.right - pad, picture.bottom - pad};
+                HGDIOBJ oldFont = SelectObject(m, fonts->normal);
+                SetTextColor(m, theme->mid);
+                const std::wstring label = loading ? L"Rendering a frame…" : frameError;
+                DrawTextW(m, label.c_str(), (int)label.size(), &inner, DT_WORDBREAK | DT_NOPREFIX | DT_CENTER);
+                SelectObject(m, oldFont);
+            }
+        }
         for (int i = 0; i < 2; i++) {
             // The focused button is inverted; the other is a framed box that fills on hover.
-            bool filled = focus == i || pressed == i;
+            bool disabled = i == 1 && loading;
+            bool filled = !disabled && (focus == i || pressed == i);
             if (filled) p.fill(btn[i], theme->ink);
             else if (hover == i) p.fill(btn[i], theme->hover);
             p.frame(btn[i], filled || hover == i ? theme->ink : theme->mid);
-            p.text(btn[i], *labels[i], filled ? theme->bg : theme->ink, fonts->bold, DT_CENTER);
+            p.text(btn[i], *labels[i], filled ? theme->bg : disabled ? theme->mid : theme->ink, fonts->bold, DT_CENTER);
         }
         p.frame(rc, theme->mid);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
@@ -398,19 +424,14 @@ LRESULT CALLBACK confirmProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 c->pressed = -1;
                 ReleaseCapture();
                 InvalidateRect(h, nullptr, FALSE);
-                if (i >= 0 && i == was) {
-                    c->result = i == 1;
-                    c->done = true;
-                }
+                if (i >= 0 && i == was) c->choose(i);
             }
             return 0;
         case WM_KEYDOWN:
             if (!c) break;
             if (w == VK_ESCAPE) c->done = true;
-            else if (w == VK_RETURN || w == VK_SPACE) {
-                c->result = c->focus == 1;
-                c->done = true;
-            } else if (w == VK_LEFT || w == VK_RIGHT || w == VK_TAB) {
+            else if (w == VK_RETURN || w == VK_SPACE) c->choose(c->focus);
+            else if (w == VK_LEFT || w == VK_RIGHT || w == VK_TAB) {
                 c->focus = 1 - c->focus;
                 InvalidateRect(h, nullptr, FALSE);
             }
@@ -425,10 +446,10 @@ LRESULT CALLBACK confirmProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, msg, w, l);
 }
 
-}  // namespace
+using RenderFrame = std::function<std::pair<HBITMAP, std::wstring>(const std::atomic<bool>&)>;
 
-bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& message, const std::wstring& confirm, const std::wstring& cancel,
-                const Theme& theme, const Fonts& fonts, int dpi) {
+bool runDialog(HWND owner, const std::wstring& title, const std::wstring& message, const std::wstring& confirm, const std::wstring& cancel,
+               const Theme& theme, const Fonts& fonts, int dpi, int pictureW = 0, int pictureH = 0, const RenderFrame& render = {}) {
     static bool registered = false;
     HINSTANCE inst = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
     if (!registered) {
@@ -448,7 +469,21 @@ bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& messa
     c.theme = &theme;
     c.fonts = &fonts;
     c.dpi = dpi;
-    int pad = c.S(20), w = c.S(440);
+    c.preview = c.loading = (bool)render;
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT work = mi.rcWork;
+    int pad = c.S(20), w = c.S(c.preview ? 920 : 440);
+    w = std::min<int>(w, work.right - work.left);
+    int imageW = 0, imageH = 0;
+    if (c.preview) {
+        double k = std::min((double)(w - 2 * pad - 2) / pictureW,
+                            (double)std::max(fonts.lineH, std::min<int>(c.S(680), work.bottom - work.top - 8 * fonts.lineH)) / pictureH);
+        imageW = std::max(1, (int)std::lround(pictureW * k)) + 2;
+        imageH = std::max(1, (int)std::lround(pictureH * k)) + 2;
+        w = std::max(c.S(510), imageW + 2 * pad);
+        w = std::min<int>(w, work.right - work.left);
+    }
     // Measure the wrapped message, then size the window around it.
     HDC dc = GetDC(owner);
     HGDIOBJ old = SelectObject(dc, fonts.normal);
@@ -467,6 +502,10 @@ bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& messa
     int msgH = mr.bottom - mr.top;
     c.msgRect = RECT{pad, msgTop, w - pad, msgTop + msgH};
     int by = msgTop + msgH + c.S(20);
+    if (c.preview) {
+        c.picture = RECT{(w - imageW) / 2, by, (w + imageW) / 2, by + imageH};
+        by += imageH + c.S(16);
+    }
     int bh = fonts.lineH;
     c.btn[1] = RECT{w - pad - bw, by, w - pad, by + bh};
     c.btn[0] = RECT{c.btn[1].left - c.S(8) - bw, by, c.btn[1].left - c.S(8), by + bh};
@@ -474,25 +513,72 @@ bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& messa
     RECT orc;
     GetWindowRect(owner, &orc);
     int x = (orc.left + orc.right - w) / 2, y = (orc.top + orc.bottom - h) / 2;
-    HWND hw = CreateWindowExW(0, kConfirmClass, title.c_str(), WS_POPUP, x, y, w, h, owner, nullptr, inst, &c);
+    x = std::clamp<int>(x, work.left, std::max<int>(work.left, work.right - w));
+    y = std::clamp<int>(y, work.top, std::max<int>(work.top, work.bottom - h));
+    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW, kConfirmClass, title.c_str(), WS_POPUP, x, y, w, h, owner, nullptr, inst, &c);
     if (!hw) return false;
     EnableWindow(owner, FALSE);
     ShowWindow(hw, SW_SHOW);
     SetForegroundWindow(hw);
     SetFocus(hw);
+    std::atomic<bool> stop{false};
+    std::pair<HBITMAP, std::wstring> frame;
+    std::mutex frameMu;
+    std::thread worker;
+    auto renderNext = [&] {
+        if (worker.joinable()) worker.join();
+        c.loading = true;
+        c.next = false;
+        InvalidateRect(hw, nullptr, FALSE);
+        worker = std::thread([&] {
+            auto r = render(stop);
+            {
+                std::lock_guard<std::mutex> lk(frameMu);
+                frame = std::move(r);
+            }
+            PostMessageW(hw, kFrameReady, 0, 0);
+        });
+    };
+    if (render) renderNext();
     MSG m;
     while (!c.done) {
-        if (!GetMessageW(&m, nullptr, 0, 0)) {
-            PostQuitMessage((int)m.wParam);
+        BOOL got = GetMessageW(&m, nullptr, 0, 0);
+        if (got <= 0) {
+            if (!got) PostQuitMessage((int)m.wParam);
             break;
+        }
+        if (m.hwnd == hw && m.message == kFrameReady) {
+            std::lock_guard<std::mutex> lk(frameMu);
+            if (c.frame) DeleteObject(c.frame);
+            c.frame = std::exchange(frame.first, nullptr);
+            c.frameError = std::move(frame.second);
+            c.loading = false;
+            InvalidateRect(hw, nullptr, FALSE);
+            continue;
         }
         TranslateMessage(&m);
         DispatchMessageW(&m);
+        if (c.next && !c.done) renderNext();
     }
+    stop = true;
+    DestroyWindow(hw);
+    if (worker.joinable()) worker.join();
+    if (frame.first) DeleteObject(frame.first);
+    if (c.frame) DeleteObject(c.frame);
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);
-    DestroyWindow(hw);
     return c.result;
+}
+
+}  // namespace
+
+bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& message, const std::wstring& confirm, const std::wstring& cancel,
+                const Theme& theme, const Fonts& fonts, int dpi) {
+    return runDialog(owner, title, message, confirm, cancel, theme, fonts, dpi);
+}
+
+void runPreview(HWND owner, const std::wstring& caption, int w, int h, const RenderFrame& render, const Theme& theme, const Fonts& fonts, int dpi) {
+    runDialog(owner, L"Conversion preview", caption, L"another frame", L"close", theme, fonts, dpi, w, h, render);
 }
 
 }  // namespace ea::ui

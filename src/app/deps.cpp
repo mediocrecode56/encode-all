@@ -1,6 +1,9 @@
 #include "deps.h"
 
 #include <algorithm>
+#include <chrono>
+
+#include "../media/hwenc.h"
 #include <windows.h>
 
 #include "../core/json.h"
@@ -32,10 +35,7 @@ static const wchar_t* folder(Dep d) {
 static const int64_t kDay = 86400;
 
 std::string extractHash(const std::string& text, const std::string& name) {
-    if (!name.empty()) {
-        std::string h = findHash(text, name);
-        if (!h.empty()) return h;
-    }
+    if (!name.empty()) return findHash(text, name);
     // Deno publishes PowerShell Get-FileHash output: "Hash : CBA8...". Take the first 64-hex run.
     std::string run;
     for (char c : text + " ") {
@@ -86,6 +86,9 @@ DepView Deps::view(Dep d) const {
     v.version = s.version;
     v.status = s.status;
     v.error = s.error;
+    v.health = s.health;
+    v.staged = s.pendingSwap;
+    v.path = exeIn(d, joinPath(root(d), L"current"));
     v.channel = s.channel;
     v.checked = s.checked;
     v.hasPrevious = fileExists(exeIn(d, joinPath(root(d), L"previous")));
@@ -121,12 +124,14 @@ void Deps::load() {
         if (fileExists(exeIn(d, staged)) && o["pendingSha"].isStr()) {
             s.pendingSwap = true;
             s.pendingVersion = o["pendingVersion"].wstr();
+            s.pendingChannel = o["pendingChannel"].wstr(s.channel);
             s.pendingSha = o["pendingSha"].str();
         }
     }
 }
 
 void Deps::save() {
+    std::lock_guard<std::mutex> serial(saveMu_);
     json::Value v = json::Value::object();
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -141,6 +146,7 @@ void Deps::save() {
             o.set("installed", (long long)s.installed);
             if (s.pendingSwap) {
                 o.set("pendingVersion", s.pendingVersion);
+                o.set("pendingChannel", s.pendingChannel);
                 o.set("pendingSha", s.pendingSha);
             }
             v.set(narrow(folder((Dep)i)), o);
@@ -161,6 +167,7 @@ void Deps::init(const std::wstring& dataDir, Notify notify) {
 void Deps::shutdown() {
     stop_ = true;
     cv_.notify_all();
+    std::lock_guard<std::mutex> one(maintMu_);
     if (worker_.joinable()) worker_.join();
 }
 
@@ -231,14 +238,17 @@ bool Deps::smoke(Dep d, const std::wstring& dir, std::wstring& version, std::wst
     Capture c;
     switch (d) {
         case Dep::YtDlp:
-            c = runCapture(exe, {L"--version"}, {}, 60000, &stop_);
+            c = runCapture(exe, {L"--ignore-config", L"--version"}, {}, 15000, &stop_);
             if (c.code == 0) version = firstLine(c.out);
             break;
         case Dep::FFmpeg: {
             c = runCapture(exe, {L"-hide_banner", L"-v", L"error", L"-f", L"lavfi", L"-i", L"testsrc2=s=128x72:d=0.2", L"-c:v", L"libx264", L"-f", L"null", L"-"}, {},
                            60000, &stop_);
             if (c.code != 0) break;
-            auto pv = runCapture(joinPath(dir, L"ffprobe.exe"), {L"-version"}, {}, 30000, &stop_);
+            auto pv = runCapture(joinPath(dir, L"ffprobe.exe"), {L"-v", L"error", L"-f", L"lavfi", L"-i", L"color=s=16x16:d=0.1",
+                                 L"-show_entries", L"stream=width,height", L"-of", L"json"}, {}, 15000, &stop_);
+            json::Value probe;
+            if (pv.code == 0 && (!json::parse(pv.out, probe) || probe["streams"].a.empty())) pv.code = -1;
             if (pv.code != 0) {
                 c = pv;
                 break;
@@ -252,11 +262,9 @@ bool Deps::smoke(Dep d, const std::wstring& dir, std::wstring& version, std::wst
             break;
         }
         case Dep::Deno:
-            c = runCapture(exe, {L"--version"}, {}, 60000, &stop_);
+            c = runCapture(exe, {L"eval", L"if (3 * 7 !== 21) Deno.exit(1); console.log(Deno.version.deno)"}, {}, 15000, &stop_);
             if (c.code == 0) {
-                std::wstring l = firstLine(c.out);  // deno 2.9.8 (stable, ...)
-                auto parts = splitLines(replaceAll(l, L" ", L"\n"));
-                version = parts.size() > 1 ? parts[1] : l;
+                version = firstLine(c.out);
             }
             break;
     }
@@ -271,8 +279,10 @@ bool Deps::stage(Dep d, const std::wstring& channel, const std::string& sha, std
     std::wstring r = root(d), staged = joinPath(r, L"new"), dl = joinPath(r, L"download");
     removeTree(staged);
     removeTree(dl);
-    makeDirs(staged);
-    makeDirs(dl);
+    if (dirExists(staged) || dirExists(dl) || !makeDirs(staged) || !makeDirs(dl)) {
+        err = L"Cannot create a clean staging area in " + r + L". Check disk space and folder permissions.";
+        return false;
+    }
     std::wstring url, file;
     switch (d) {
         case Dep::YtDlp:
@@ -340,7 +350,7 @@ bool Deps::stage(Dep d, const std::wstring& channel, const std::string& sha, std
             if (h == INVALID_HANDLE_VALUE) return;
             do {
                 std::wstring n = fd.cFileName;
-                if (n == L"." || n == L"..") continue;
+                if (n == L"." || n == L".." || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
                 std::wstring p = joinPath(dir, n);
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) walk(p);
                 else
@@ -366,44 +376,68 @@ bool Deps::stage(Dep d, const std::wstring& channel, const std::string& sha, std
 
 bool Deps::swapIn(Dep d) {
     std::wstring r = root(d), cur = joinPath(r, L"current"), prev = joinPath(r, L"previous"), staged = joinPath(r, L"new");
+    std::wstring version;
+    bool installed = false;
     {
+        // The check and rename must be atomic with acquire(), including the state publication.
         std::lock_guard<std::mutex> lk(mu_);
-        if (st_[(int)d].users > 0) return false;
+        State& s = st_[(int)d];
+        if (s.users || !s.pendingSwap) return false;
+        if (fileExists(exeIn(d, staged)) && (d != Dep::FFmpeg || fileExists(joinPath(staged, L"ffprobe.exe")))) {
+            bool hadCur = dirExists(cur);
+            if (hadCur) removeTree(prev);
+            if (!hadCur || MoveFileExW(cur.c_str(), prev.c_str(), 0)) {
+                installed = MoveFileExW(staged.c_str(), cur.c_str(), 0) != FALSE;
+                if (!installed && hadCur) MoveFileExW(prev.c_str(), cur.c_str(), 0);
+            }
+        }
+        if (installed) {
+            s.present = true;
+            version = s.version = s.pendingVersion;
+            s.sha = s.pendingSha;
+            s.channel = s.pendingChannel;
+            s.installed = nowUnix();
+            s.pendingSwap = false;
+            s.status.clear();
+            s.error.clear();
+            s.health.clear();
+            s.progress = -1;
+        } else {
+            s.present = fileExists(exeIn(d, cur)) && (d != Dep::FFmpeg || fileExists(ffprobe()));
+            s.error = L"Could not activate the staged tool. Check access to the tool folder, close other app instances, then retry.";
+        }
     }
-    if (!fileExists(exeIn(d, staged))) return false;
-    removeTree(prev);
-    bool hadCur = dirExists(cur);
-    if (hadCur && !MoveFileExW(cur.c_str(), prev.c_str(), 0)) return false;
-    if (!MoveFileExW(staged.c_str(), cur.c_str(), 0)) {
-        if (hadCur) MoveFileExW(prev.c_str(), cur.c_str(), 0);  // put the old one back
-        return false;
-    }
-    set(d, [&](State& s) {
-        s.present = true;
-        s.version = s.pendingVersion;
-        s.sha = s.pendingSha;
-        s.installed = nowUnix();
-        s.pendingSwap = false;
-        s.status.clear();
-        s.error.clear();
-        s.progress = -1;
-    });
+    cv_.notify_all();
     save();
-    logLine(std::wstring(depName(d)) + L" " + view(d).version + L" installed");
-    return true;
+    if (notify_) notify_();
+    if (installed) logLine(std::wstring(depName(d)) + L" " + version + L" installed");
+    return installed;
 }
 
-bool Deps::install(Dep d, bool force, std::wstring& note) {
+bool Deps::install(Dep d, bool reinstall, std::wstring& note, const wchar_t* requestedChannel) {
     std::lock_guard<std::mutex> one(installMu_);
+    if (stop_) return false;
+    if (!reinstall && !requestedChannel && swapIn(d)) {
+        set(d, [](State& s) { s.busy = false; });
+        note = std::wstring(depName(d)) + L" activated its staged update";
+        return true;
+    }
     std::wstring channel;
     std::string curSha, skipSha;
     bool present;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        channel = st_[(int)d].channel;
-        curSha = st_[(int)d].sha;
-        skipSha = st_[(int)d].skipSha;
-        present = st_[(int)d].present;
+        State& s = st_[(int)d];
+        channel = requestedChannel ? requestedChannel : s.channel;
+        curSha = s.sha;
+        skipSha = s.skipSha;
+        present = s.present;
+    }
+    if (!reinstall && view(d).staged) {
+        auto staged = view(d);
+        note = std::wstring(depName(d)) + (staged.error.empty() ? L" has a verified update waiting for active tasks" : L": " + staged.error);
+        set(d, [](State& s) { s.busy = false; });
+        return false;
     }
     set(d, [&](State& s) {
         s.busy = true;
@@ -422,33 +456,34 @@ bool Deps::install(Dep d, bool force, std::wstring& note) {
         note = err;
         return false;
     }
-    if (present && (sha == curSha || sha == skipSha) && !force) {
+    if (present && (sha == curSha || sha == skipSha) && !reinstall) {
         set(d, [&](State& s) {
             s.busy = false;
             s.status.clear();
             s.checked = nowUnix();
         });
         save();
-        note = std::wstring(depName(d)) + L" is up to date";
+        note = std::wstring(depName(d)) + (sha == curSha ? L" is up to date" : L" uses a rollback; the latest build is skipped by preference");
         return false;
     }
-    if (present && sha == curSha) {
-        set(d, [&](State& s) { s.busy = false; s.status.clear(); s.checked = nowUnix(); });
-        save();
-        note = std::wstring(depName(d)) + L" is already the latest " + channel;
-        return false;
-    }
+    // A previously pending release must never be swapped while its staging folder is rewritten.
+    set(d, [](State& s) { s.pendingSwap = false; });
+    save();
     if (stage(d, channel, sha, version, err)) {
         set(d, [&](State& s) {
             s.pendingSwap = true;
             s.pendingVersion = version;
+            s.pendingChannel = channel;
             s.pendingSha = sha;
+            if (reinstall) s.skipSha.clear();
             s.checked = nowUnix();
             s.status = L"ready, waiting for running tasks";
         });
         save();
         changed = swapIn(d);
-        note = std::wstring(depName(d)) + L" " + version + (changed ? L" installed" : L" staged (applies when idle)");
+        auto current = view(d);
+        note = std::wstring(depName(d)) + L" " + version + (changed || (current.present && current.status.empty() && current.error.empty())
+                   ? L" installed and verified" : !current.error.empty() ? L": " + current.error : L" verified and staged (applies when idle)");
         set(d, [&](State& s) { s.busy = false; });
         return changed;
     }
@@ -463,27 +498,48 @@ bool Deps::install(Dep d, bool force, std::wstring& note) {
     return false;
 }
 
-void Deps::startMaintenance(bool autoUpdate, bool force) {
+bool Deps::launchMaintenance(std::function<void()> work) {
     std::lock_guard<std::mutex> one(maintMu_);
-    if (worker_.joinable()) {
-        bool running;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            running = st_[0].busy || st_[1].busy || st_[2].busy;
-        }
-        if (running) return;
-        worker_.join();
-    }
-    worker_ = std::thread([this, autoUpdate, force] {
+    if (stop_ || maintaining_) return false;
+    if (worker_.joinable()) worker_.join();
+    maintaining_ = true;
+    worker_ = std::thread([this, work = std::move(work)] {
+        work();
+        maintaining_ = false;
+        if (notify_) notify_();
+    });
+    return true;
+}
+
+bool Deps::checkLocal(Dep d, std::wstring& version, std::wstring& error) {
+    acquire(d);
+    auto v = view(d);
+    bool ok = smoke(d, dirName(v.path), version, error);
+    set(d, [&](State& s) {
+        s.health = !ok ? error : !s.version.empty() && s.version != version ? L"Installed executable does not match the recorded version." : L"";
+        if (ok && s.version.empty()) s.version = version;
+    });
+    release(d);
+    return ok && view(d).health.empty();
+}
+
+void Deps::startMaintenance(bool autoUpdate, bool force) {
+    launchMaintenance([this, autoUpdate, force] {
         // Missing tools first, smallest first so downloads can start early.
         Dep order[] = {Dep::YtDlp, Dep::Deno, Dep::FFmpeg};
         for (Dep d : order) {
             if (stop_) return;
-            if (!ready(d)) {
+            if (ready(d)) {
+                std::wstring version, error;
+                checkLocal(d, version, error);
+            } else {
                 std::wstring n;
                 for (int attempt = 0; attempt < 3 && !ready(d) && !stop_; attempt++) {
                     install(d, false, n);
-                    if (!ready(d)) Sleep(3000 * (attempt + 1));
+                    if (!ready(d)) {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_.wait_for(lk, std::chrono::seconds(3 * (attempt + 1)), [&] { return stop_.load(); });
+                    }
                 }
             }
         }
@@ -508,22 +564,16 @@ bool Deps::updateYtDlpNow(bool allowNightly, std::wstring& note) {
     std::wstring n;
     bool changed = install(Dep::YtDlp, false, n);
     note = n;
-    if (changed || !allowNightly) return changed;
-    bool onNightly;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        onNightly = st_[0].channel == L"nightly";
-    }
-    if (onNightly) return false;
-    set(Dep::YtDlp, [](State& s) { s.channel = L"nightly"; });
-    changed = install(Dep::YtDlp, false, n);
-    if (!changed) set(Dep::YtDlp, [](State& s) { s.channel = L"stable"; });
-    note = changed ? L"yt-dlp switched to the nightly build (fixes reach it first): " + n : n;
-    save();
+    if (changed || !allowNightly || repairing_ || stop_) return changed;
+    auto v = view(Dep::YtDlp);
+    if (v.staged || v.channel == L"nightly" || !v.error.empty()) return false;
+    changed = install(Dep::YtDlp, false, n, L"nightly");
+    note = changed ? L"yt-dlp switched to the nightly build: " + n : n;
     return changed;
 }
 
 bool Deps::rollback(Dep d, std::wstring& note) {
+    std::lock_guard<std::mutex> serial(installMu_);
     std::wstring r = root(d), cur = joinPath(r, L"current"), prev = joinPath(r, L"previous"), tmp = joinPath(r, L"rollback");
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -541,23 +591,140 @@ bool Deps::rollback(Dep d, std::wstring& note) {
         note = L"The previous version fails its self-test: " + err;
         return false;
     }
-    removeTree(tmp);
-    if (!MoveFileExW(cur.c_str(), tmp.c_str(), 0) || !MoveFileExW(prev.c_str(), cur.c_str(), 0) || !MoveFileExW(tmp.c_str(), prev.c_str(), 0)) {
-        note = L"Could not swap folders.";
-        return false;
-    }
-    set(d, [&](State& s) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        State& s = st_[(int)d];
+        if (s.users || s.pendingSwap) {
+            note = L"In use or awaiting an update; try again when it finishes.";
+            return false;
+        }
+        if (dirExists(tmp)) {
+            note = L"An interrupted rollback needs attention in " + r + L". Use Auto Repair to stage a clean build.";
+            return false;
+        }
+        if (!MoveFileExW(cur.c_str(), tmp.c_str(), 0)) {
+            note = L"Could not move the current tool.";
+            return false;
+        }
+        if (!MoveFileExW(prev.c_str(), cur.c_str(), 0)) {
+            MoveFileExW(tmp.c_str(), cur.c_str(), 0);
+            note = L"Could not start the previous tool; the current tool was not replaced.";
+            return false;
+        }
+        bool kept = MoveFileExW(tmp.c_str(), prev.c_str(), 0) != FALSE;
         s.version = version;
-        // The build rolled away from is skipped by automatic checks until a newer one is published.
         if (!s.sha.empty()) s.skipSha = s.sha;
         s.sha.clear();
         s.present = true;
         s.error.clear();
-    });
+        s.health.clear();
+        if (!kept) s.error = L"The replaced version was retained in the rollback folder.";
+    }
     save();
     note = std::wstring(depName(d)) + L" rolled back to " + version;
     logLine(note);
+    if (notify_) notify_();
     return true;
+}
+
+bool Deps::startRepair(bool rebuild, std::vector<std::wstring> recentErrors, const Settings& settings) {
+    if (repairing_.exchange(true)) return false;
+    if (launchMaintenance([this, rebuild, errors = std::move(recentErrors), settings] {
+        repair(rebuild, errors, settings);
+        repairing_ = false;
+    })) return true;
+    repairing_ = false;
+    return false;
+}
+
+std::vector<std::wstring> Deps::repairReport() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return repairReport_;
+}
+
+void Deps::repair(bool rebuild, const std::vector<std::wstring>& errors, const Settings& settings) {
+    std::vector<std::wstring> report;
+    for (Dep d : {Dep::YtDlp, Dep::Deno, Dep::FFmpeg}) {
+        if (stop_) return;
+        set(d, [](State& s) { s.busy = true; s.status = L"running diagnostics"; });
+        std::wstring version, error;
+        bool healthy = checkLocal(d, version, error);
+        auto before = view(d);
+        std::wstring note;
+        bool changed = install(d, rebuild || !healthy, note);
+        auto current = view(d);
+        if (!healthy && error.empty()) error = before.health;
+        if (changed) {
+            std::wstring installedVersion, installedError;
+            if (!checkLocal(d, installedVersion, installedError))
+                report.push_back(std::wstring(depName(d)) + L" after activation: " + view(d).health);
+        }
+        if (d == Dep::YtDlp && settings.nightlyFallback && !changed && !current.staged && current.error.empty() && current.health.empty() && current.channel != L"nightly") {
+            bool extraction = std::any_of(errors.begin(), errors.end(), [](const std::wstring& line) {
+                auto t = lower(line);
+                return t.find(L"unable to extract") != t.npos || t.find(L"signature extraction") != t.npos || t.find(L"nsig") != t.npos;
+            });
+            if (extraction) {
+                std::wstring next;
+                if (install(d, false, next, L"nightly") || view(d).staged) report.push_back(L"Recent extraction failure: " + next);
+                else report.push_back(L"Nightly fallback did not replace yt-dlp: " + next);
+            }
+        }
+        if (healthy && !version.empty()) report.push_back(std::wstring(depName(d)) + L" " + version + L" passed its local test.");
+        else report.push_back(std::wstring(depName(d)) + L": " + error);
+        report.push_back(note);
+        if (!current.error.empty() && current.error != note) report.push_back(current.error);
+    }
+    if (!settings.cookiesFile.empty() && !fileExists(settings.cookiesFile))
+        report.push_back(L"Cookies file is missing. Choose a replacement or none under Downloads > Sign-in cookies.");
+    const std::pair<const wchar_t*, const std::wstring*> outputs[] = {{L"Download", &settings.dlDir}, {L"Convert", &settings.convertDir}, {L"Remux", &settings.remuxDir}};
+    for (const auto& [label, path] : outputs) {
+        if (path->empty()) continue;
+        if (!dirExists(*path)) report.push_back(std::wstring(label) + L" output folder does not exist. Check its drive or choose another folder.");
+        else {
+            auto free = freeSpace(*path);
+            if (free == UINT64_MAX || !free) report.push_back(std::wstring(label) + L" output folder is inaccessible or out of space.");
+            else {
+                std::wstring probe = joinPath(*path, L".encodeall-write-test-" + std::to_wstring(GetCurrentProcessId()));
+                HANDLE file = CreateFileW(probe.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+                                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                if (file == INVALID_HANDLE_VALUE) report.push_back(std::wstring(label) + L" output folder did not allow a temporary file. Check write access.");
+                else CloseHandle(file);
+            }
+        }
+    }
+    if (settings.encoder != Accel::Auto && settings.encoder != Accel::Software && ready(Dep::FFmpeg) && !stop_) {
+        acquire(Dep::FFmpeg);
+        EncoderCaps caps = detectEncoders(ffmpeg(), &stop_);
+        release(Dep::FFmpeg);
+        const char* suffix = settings.encoder == Accel::NVENC ? "nvenc" : settings.encoder == Accel::QSV ? "qsv" : "amf";
+        if (!caps.has(std::string("h264_") + suffix) && !caps.has(std::string("hevc_") + suffix))
+            report.push_back(L"The pinned hardware encoder failed. Choose Automatic or Software in Settings, or update your graphics driver.");
+    }
+    for (const auto& line : errors) {
+        const std::wstring t = lower(line);
+        auto has = [&](const wchar_t* word) { return t.find(word) != std::wstring::npos; };
+        std::wstring advice;
+        if (has(L"cookie") || has(L"sign in") || has(L"sign-in"))
+            advice = L"Download: check Sign-in cookies for the site. Auto Repair does not read or change credentials.";
+        else if (has(L"no space") || has(L"disk full") || has(L"output folder") || has(L"permission denied"))
+            advice = L"Output: check free space and write access, or choose a different Save To folder.";
+        else if (has(L"timed out") || has(L"certificate") || has(L"network"))
+            advice = L"Network: check connectivity and proxy/certificate settings before retrying.";
+        else if (has(L"nvenc") || has(L"qsv") || has(L"amf"))
+            advice = L"Convert: if the graphics encoder keeps failing, update its driver or choose Software under Encoding.";
+        else if (has(L"channel layout") || has(L"cannot be copied") || has(L"not supported in container"))
+            advice = L"Convert/Remux: inspect the failing track in the plan; try MOV with original audio or exact PCM.";
+        else if (has(L"extract") || has(L"signature") || has(L"javascript"))
+            advice = L"Download: yt-dlp and Deno were tested and checked for updates. If extraction still fails, the site may need an upstream fix.";
+        if (!advice.empty() && std::find(report.begin(), report.end(), advice) == report.end()) report.push_back(std::move(advice));
+    }
+    if (!errors.empty()) report.push_back(L"Reviewed " + std::to_wstring(errors.size()) + L" recent error lines. Existing tasks and preferences were not changed.");
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        repairReport_ = report;
+    }
+    for (const auto& line : report) logLine(L"Auto Repair: " + line);
 }
 
 }  // namespace ea

@@ -3,7 +3,10 @@
 #pragma once
 #include <windows.h>
 
+#include <atomic>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gfx.h"
@@ -21,6 +24,10 @@ int runMenu(HWND owner, const RECT& anchor, const std::vector<std::wstring>& ite
 // The app's own confirmation dialog (no MessageBox): a title, a wrapped message and two buttons,
 // centred on the owner, modal. The safe choice (cancel) is the default. Returns true for confirm.
 bool runConfirm(HWND owner, const std::wstring& title, const std::wstring& message, const std::wstring& confirm, const std::wstring& cancel,
+                const Theme& theme, const Fonts& fonts, int dpi);
+
+// The shared app popup, with a frame rendered on a cancellable worker. Keeps the popup open while another frame renders.
+void runPreview(HWND owner, const std::wstring& caption, int w, int h, const std::function<std::pair<HBITMAP, std::wstring>(const std::atomic<bool>&)>& render,
                 const Theme& theme, const Fonts& fonts, int dpi);
 
 }  // namespace ea::ui

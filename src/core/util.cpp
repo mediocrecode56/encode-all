@@ -373,7 +373,9 @@ bool moveReplace(const std::wstring& from, const std::wstring& to) {
 
 bool removeTree(const std::wstring& p) {
     if (fileExists(p)) return DeleteFileW(lp(p).c_str());
-    if (!dirExists(p)) return true;
+    DWORD attr = GetFileAttributesW(lp(p).c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return true;
+    if (attr & FILE_ATTRIBUTE_REPARSE_POINT) return RemoveDirectoryW(lp(p).c_str());
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(lp(joinPath(p, L"*")).c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {

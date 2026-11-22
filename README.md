@@ -5,7 +5,7 @@ remux video and audio with yt-dlp, FFmpeg and FFprobe. Paste a link or drop a fi
 best source quality and tells you exactly what will happen before anything runs.
 
 ```
-ENCODE ALL v1.0.5                                                        tools ready   _  []  X
+ENCODE ALL v1.0.6                                                                      _  []  X
 [DOWNLOAD 2]  CONVERT   REMUX                                           (history) (log) (settings)
 [ (link)  Paste links, or type one and press Enter                                     paste ]
 VIDEO       [MP4|MOV|Original]  [H.264|H.265]  QUALITY [extreme|high|normal]
@@ -31,7 +31,9 @@ LINKS  1 ready (~812 MiB)  .  1 running            [pause all]  [download all 1 
 ## Convert
 - Any input FFmpeg reads. Targets: H.264, H.265 (MP4 or MOV), DNxHR LB, SQ, HQ, HQX, 444 (MOV), copy video, FLAC, MP3, WAV.
 - Encoder: automatically the fastest that works on your PC: NVENC, then Quick Sync, then AMF (each tested with a real encode), then software x264/x265. Settings can pin one; lossless stays on x264/x265.
-- CRF/CQ, bitrate, lossless; AAC, exact PCM or copied audio; FLAC level, MP3 CBR/VBR, bit depth.
+- Separate CRF and Mbps controls: quality or lossless, average bitrate target, or maximum video bitrate cap. The footer estimates the pending outputs. MP4 and MOV always use Faststart.
+- Choose a portrait, landscape, source-aspect or custom canvas. Fit keeps the whole image, Fill crops to cover, Stretch changes proportions, and Centered crops or pads without zoom. Preview renders a random frame with the selected filters; it does not simulate compression or HDR playback.
+- AAC, exact PCM or copied audio. WAV, FLAC and MP3 hold one track; use a video target or Remux for multi-track input.
 - Filters, each its own dropdown: PICTURE size (up to 8K or custom), frame rate, pixel format (8/10-bit, 4:2:0/4:2:2/4:4:4), deinterlace (auto, every frame, double rate), rotate or mirror, denoise, sharpen; SOUND channels (stereo or mono downmix), loudness (-23, -16 or -14 LUFS), sample rate for audio files.
 - Odd frame sizes, rotated phone clips, 192 kHz or surround audio are handled: the plan says what is cropped, turned, resampled or downmixed so the output always plays.
 - Presets: lossless, max quality, balanced, compact, plus your own saved presets.
@@ -55,7 +57,7 @@ existing files are never overwritten.
 
 ## Install and updates
 - Run `EncodeAll-Setup-<version>.exe` (per user, no admin). First start downloads yt-dlp, FFmpeg and Deno from their official releases and verifies them; no Python, PATH or manual steps.
-- Tools update in the background and never while a task uses them; the previous version is kept for one-click rollback.
+- Tools update in the background and never while a task uses them; the previous version is kept for rollback. Settings shows clickable tool warnings, Auto Repair and a report. Rebuild tools asks first and replaces only managed tool files, not your preferences, media, queue or history.
 - Encode All updates itself from GitHub Releases (SHA-256 checked) and switches on the next start; if a new version fails to start twice, the previous one comes back.
 - Portable mode: put an empty file named `portable` next to `EncodeAll.exe`.
 

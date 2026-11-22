@@ -190,6 +190,9 @@ private:
     int queueGroup(DlGroup& g, int onlyEntry, const Settings& s, uint64_t* firstTask);  // queues and removes entries; returns the count
     uint64_t queueFile(int tab, const FileRow& f, const Settings& s);  // 0 when the remux plan fails
     bool fileReady(int tab, const FileRow& f, const Settings& s);
+    const Plan& convertPlan(const FileRow& file);
+    void previewFile(const RowId& id);
+    void repairTools(bool rebuild);
     int64_t newOrder();
     void openUrl(const std::wstring& url);
     void openPath(const std::wstring& path);
@@ -267,6 +270,8 @@ private:
     std::wstring hoverTip_, hintDefault_;  // the header's hint: the hovered item's tip, else the last notice
     size_t hintIdx_ = SIZE_MAX;
     void setHint(const std::wstring& tip);
+    std::string convertPlanKey_;
+    std::map<uint64_t, Plan> convertPlans_;
     Settings view_;     // the settings the current layout was built from
     RECT listView_{};   // the visible list (edits inside it are placed only when wholly visible)
     int logScroll_ = 0, settingsScroll_ = 0;

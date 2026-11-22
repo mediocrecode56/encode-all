@@ -3,6 +3,8 @@
 // and the controls to its right; lists scroll with a thin position mark; empty lists say what to do.
 #include "window.h"
 
+#include "menu.h"
+
 #include <commdlg.h>
 #include <shellapi.h>
 
@@ -58,14 +60,6 @@ void setTarget(ConvertSpec& s, int i) {
         case 13: s.audio = AudioTarget::WAV; break;
     }
     if (s.rate == RateMode::Lossless && isDnxhr(s.vcodec)) s.rate = RateMode::Quality;
-}
-
-std::wstring qualityText(const ConvertSpec& s) {
-    if (isDnxhr(s.vcodec)) return L"fixed by profile";
-    if (s.vcodec == VCodec::Copy) return L"copy";
-    if (s.rate == RateMode::Lossless) return L"lossless";
-    if (s.rate == RateMode::Bitrate) return fmtFixed(s.mbps, s.mbps < 10 ? 1 : 0) + L" Mb/s";
-    return L"CRF " + std::to_wstring(s.quality);
 }
 
 // The SIZE dropdown's value: "source", "1080p", "1920x1080" or "1280w".
@@ -174,7 +168,7 @@ void MainWindow::buildHeader(RECT& a) {
     }
     int x = text(a.left, y, L"ENCODE ALL", S_Big);
     text(x + S(10), y, L"v" EA_VERSION_W, S_Mid);
-    // Right side, laid out right to left: an update ready to apply, then the tool status.
+    // Right side, laid out right to left: an update ready to apply.
     int rx = wx - S(16);
     UpdateState us = updater_.state();
     if (us.staged) {
@@ -189,28 +183,7 @@ void MainWindow::buildHeader(RECT& a) {
             }
             if (AppUpdater::relaunch()) DestroyWindow(hwnd_);
         };
-        rx -= S(14);
     }
-    std::wstring st;
-    bool problem = false;
-    for (int i = 0; i < kDeps; i++) {
-        DepView v = deps_.view((Dep)i);
-        if (v.busy && !v.status.empty()) {
-            st = std::wstring(depName((Dep)i)) + L": " + v.status;
-            break;
-        }
-        if (!v.present && !v.error.empty()) {
-            st = L"! " + std::wstring(depName((Dep)i)) + L": " + v.error;
-            problem = true;
-            break;
-        }
-        if (!v.present) st = L"preparing tools";
-    }
-    if (st.empty()) st = L"tools ready";
-    int sw = std::min<int>(tw(st), std::max<int>(0, rx - (a.left + S(260))));
-    rx -= sw;
-    Item& s = add(K_Text, RECT{rx, y, rx + sw, y + rh}, st, (problem ? S_Bold : S_Mid) | S_Click);
-    s.click = [this] { setOverlay(Overlay::Settings); };
     hline(0, client_.right, bh - 1);
     // Sections on the left (with how many of their tasks are active), views as icons on the far right.
     int active[3] = {};
@@ -319,6 +292,13 @@ void MainWindow::buildSection(RECT a) {
     int rh = rowH();
     int y = a.top;
     view_ = settingsCopy();
+    if (tab_ == 1) {
+        std::string key = json::dump(view_.convert.toJson()) + ":" + std::to_string((int)view_.encoder);
+        if (key != convertPlanKey_) {
+            convertPlanKey_ = std::move(key);
+            convertPlans_.clear();
+        }
+    }
     // The bar: links on Download, files on Convert and Remux.
     int bh = rh + S(18);
     RECT bar{a.left, y, a.right, y + bh};
@@ -339,14 +319,11 @@ void MainWindow::buildSection(RECT a) {
     } else {
         Item& b = add(K_Text, bar, L"", S_Click);
         b.click = [this] { pickFiles(tab_); };
-        b.tip = L"choose media files (Ctrl+O)";
+        b.tip = L"add files (Ctrl+O)";
         Item& pi = add(K_Icon, RECT{bar.left, bar.top, bar.left + ic, bar.bottom}, L"", 0);
         pi.value = I_Plus;
         int ty = bar.top + (bh - rh) / 2;
-        int x = text(bar.left + ic, ty, L"Add files", S_Bold) + S(12);
-        text(x, ty, tab_ == 1 ? L"or drop them on the window: video and audio, one by one or a whole folder"
-                              : L"or drop them on the window: their tracks are copied into MP4 or MOV",
-             S_Mid, bar.right - x - S(16));
+        text(bar.left + ic, ty, L"Drop files or click to add", S_Mid, bar.right - bar.left - ic - S(16));
     }
     add(K_Frame, bar);
     y = bar.bottom + S(14);
@@ -363,6 +340,9 @@ void MainWindow::buildSection(RECT a) {
     for (auto& r : rows) rowIds_.push_back(r.id);
     int ready = 0, run = 0, wait = 0, paused = 0, failed = 0, done = 0, reading = 0;
     double est = 0;
+    int estimated = 0, unknown = 0;
+    bool approximate = false, capped = false;
+    RowId previewRow;
     DlPrefs prefs = dlPrefs(view_);
     for (auto& r : rows) {
         if (r.type == ListRow::Task) {
@@ -387,7 +367,19 @@ void MainWindow::buildSection(RECT a) {
         } else if (r.type == ListRow::Pending) {
             const FileRow& f = (tab_ == 2 ? remux_ : conv_)[r.idx];
             if (f.busy) reading++;
-            else if (fileReady(tab_, f, view_)) ready++;
+            else if (tab_ == 1 && f.info.ok) {
+                const Plan& p = convertPlan(f);
+                if (p.ok) {
+                    ++ready;
+                    if (p.estBytes > 0) {
+                        est += p.estBytes;
+                        ++estimated;
+                        approximate |= p.estVariable;
+                        capped |= p.estCapped;
+                    } else ++unknown;
+                    if (p.preview.sourceIndex >= 0 && (previewRow.empty() || r.id == sel_[1])) previewRow = r.id;
+                } else ++failed;
+            } else if (fileReady(tab_, f, view_)) ready++;
             else if (!f.error.empty()) failed++;
         }
     }
@@ -398,7 +390,7 @@ void MainWindow::buildSection(RECT a) {
     };
     part(reading, L"reading");
     part(ready, L"ready");
-    if (est > 0) sum += L" (~" + fmtBytes(est) + L")";
+    if (tab_ == 0 && est > 0) sum += L" (~" + fmtBytes(est) + L")";
     part(run, L"running");
     part(wait, L"waiting");
     part(paused, L"paused");
@@ -423,6 +415,22 @@ void MainWindow::buildSection(RECT a) {
     y += rh + S(6);
 
     RECT list{a.left, y, a.right, a.bottom};
+    if (tab_ == 1) {
+        list.bottom -= rh + S(6);
+        hline(a.left, a.right, list.bottom);
+        int fy = list.bottom + S(3);
+        int lx = text(a.left, fy, L"ESTIMATED OUTPUT", S_Bold) + S(14);
+        int right = a.right;
+        if (!previewRow.empty()) {
+            right -= tw(L"preview") + S(24);
+            button(right, fy, L"preview", [this, previewRow] { previewFile(previewRow); });
+            items_.back().tip = L"preview the selected video (or the newest ready video)";
+        }
+        std::wstring label = estimated ? L"~" + fmtBytes(est) + (capped ? L" at cap" : L"") + (approximate ? L" · content-dependent" : L"") : L"—";
+        if (unknown) label += L" · " + std::to_wstring(unknown) + L" unknown";
+        if (estimated > 1 || (estimated && unknown)) label += L" · " + std::to_wstring(estimated) + L" estimated";
+        text(lx, fy, label, S_Mono | S_Mid, right - lx - S(8));
+    }
     listView_ = list;
     hline(a.left, a.right, list.top);
     if (rows.empty()) {
@@ -664,37 +672,53 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
         relayout();
     });
     if (encodesVideo && !isDnxhr(cs.vcodec)) {
-        field(x, y, left, a.right, L"QUALITY", qualityText(cs), [this, change] {
+        bool bitrate = cs.rate == RateMode::Bitrate;
+        field(x, y, left, a.right, L"CRF", bitrate ? L"off" : cs.rate == RateMode::Lossless ? L"lossless" : std::to_wstring(cs.quality), [this, change] {
             RECT at = anchor_;
-            std::vector<std::wstring> o = {L"lossless", L"CRF 16 (very high)", L"CRF 18", L"CRF 20", L"CRF 22 (balanced)", L"CRF 24", L"CRF 26", L"CRF 28 (compact)",
-                                           L"CRF 30", L"-", L"4 Mb/s", L"8 Mb/s", L"12 Mb/s", L"20 Mb/s", L"35 Mb/s", L"50 Mb/s", L"-", L"custom CRF...", L"custom Mb/s..."};
             ConvertSpec cur = settingsCopy().convert;
-            int checked = -1;
-            const int crf[] = {0, 16, 18, 20, 22, 24, 26, 28, 30};
-            const double mb[] = {4, 8, 12, 20, 35, 50};
-            if (cur.rate == RateMode::Lossless) checked = 0;
-            for (int i = 1; i <= 8; i++)
-                if (cur.rate == RateMode::Quality && cur.quality == crf[i]) checked = i;
-            for (int i = 0; i < 6; i++)
-                if (cur.rate == RateMode::Bitrate && std::fabs(cur.mbps - mb[i]) < 0.01) checked = 10 + i;
-            int r = popup(o, checked);
-            if (r < 0) return;
-            if (r == 0) change([](ConvertSpec& c) { c.rate = RateMode::Lossless; });
-            else if (r <= 8) change([&](ConvertSpec& c) { c.rate = RateMode::Quality; c.quality = crf[r]; });
-            else if (r >= 10 && r <= 15) change([&](ConvertSpec& c) { c.rate = RateMode::Bitrate; c.mbps = mb[r - 10]; });
-            else if (r == 17 || r == 18) {
-                bool isCrf = r == 17;
-                std::wstring init = isCrf ? std::to_wstring(cur.quality) : fmtFixed(cur.mbps, 1);
-                customValue(init, at, [isCrf, change](const std::wstring& v) {
-                    double d = _wtof(v.c_str());
-                    if (isCrf && d >= 0 && d <= 51) change([&](ConvertSpec& c) { c.rate = RateMode::Quality; c.quality = (int)d; });
-                    else if (!isCrf && d > 0.1 && d < 2000) change([&](ConvertSpec& c) { c.rate = RateMode::Bitrate; c.mbps = d; });
-                });
+            const int q[] = {16, 18, 20, 22, 24, 26, 28, 30};
+            std::vector<std::wstring> o = {L"lossless"};
+            int checked = cur.rate == RateMode::Lossless ? 0 : -1;
+            for (int v : q) {
+                if (cur.rate == RateMode::Quality && cur.quality == v) checked = (int)o.size();
+                o.push_back(L"CRF " + std::to_wstring(v));
             }
-        }, [change](int n) {
-            change([n](ConvertSpec& c) {
-                if (c.rate == RateMode::Quality) c.quality = std::clamp(c.quality - n, 0, 51);
-                else if (c.rate == RateMode::Bitrate) c.mbps = std::clamp(c.mbps + n * (c.mbps >= 20 ? 5.0 : 1.0), 0.5, 500.0);
+            o.push_back(L"custom CRF...");
+            int r = popup(o, checked);
+            if (r == 0) change([](ConvertSpec& c) { c.rate = RateMode::Lossless; });
+            else if (r > 0 && r <= (int)std::size(q)) change([&](ConvertSpec& c) { c.rate = RateMode::Quality; c.quality = q[r - 1]; });
+            else if (r == (int)o.size() - 1) customValue(std::to_wstring(cur.quality), at, [this, change](const std::wstring& v) {
+                wchar_t* end = nullptr;
+                long q2 = wcstol(v.c_str(), &end, 10);
+                if (end != v.c_str() && !*end && q2 >= 0 && q2 <= 51) change([&](ConvertSpec& c) { c.rate = RateMode::Quality; c.quality = (int)q2; });
+                else flash(L"Enter a whole CRF between 0 and 51.");
+            });
+        });
+        field(x, y, left, a.right, L"MBPS", !bitrate ? L"off" : (cs.maxBitrate ? L"max " : L"avg ") + fmtFixed(cs.mbps, 2), [this, change] {
+            RECT at = anchor_;
+            ConvertSpec cur = settingsCopy().convert;
+            const double rates[] = {4, 8, 12, 20, 35, 50};
+            std::vector<std::wstring> o;
+            int checked = -1;
+            for (bool capped : {false, true}) {
+                o.push_back(capped ? L"#MAXIMUM BITRATE (VBR CAP)" : L"#AVERAGE BITRATE (TARGET)");
+                for (double rate : rates) {
+                    if (cur.rate == RateMode::Bitrate && cur.maxBitrate == capped && cur.mbps == rate) checked = (int)o.size();
+                    o.push_back(fmtFixed(rate, 0) + L" Mb/s");
+                }
+                o.push_back(L"custom Mb/s...");
+            }
+            int r = popup(o, checked), block = (int)std::size(rates) + 2;
+            if (r < 0) return;
+            bool capped = r >= block;
+            auto setRate = [change, capped](double d) { change([&](ConvertSpec& c) { c.rate = RateMode::Bitrate; c.maxBitrate = capped; c.mbps = d; }); };
+            int i = r % block - 1;
+            if (i >= 0 && i < (int)std::size(rates)) setRate(rates[i]);
+            else if (i == (int)std::size(rates)) customValue(fmtFixed(cur.mbps, 2), at, [this, setRate](const std::wstring& v) {
+                wchar_t* end = nullptr;
+                double d = wcstod(v.c_str(), &end);
+                if (end != v.c_str() && !*end && d >= 0.1 && d <= 2000) setRate(d);
+                else flash(L"Enter a bitrate between 0.10 and 2000 Mb/s.");
             });
         });
         field(x, y, left, a.right, L"SPEED", widen(cs.speed), [this, change] {
@@ -787,23 +811,44 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
     };
     if (encodesVideo) {
         x = fieldLabel(a.left, y, L"PICTURE");
-        field(x, y, left, a.right, L"SIZE", sizeText(cs), [this, change] {
+        field(x, y, left, a.right, L"RESOLUTION", sizeText(cs), [this, change] {
             RECT at = anchor_;
             ConvertSpec cur = settingsCopy().convert;
-            std::vector<std::wstring> o = {L"source", L"4320p (8K)", L"2160p (4K)", L"1440p", L"1080p", L"720p", L"576p", L"480p", L"360p", L"-", L"custom WxH..."};
-            const int hgt[] = {0, 4320, 2160, 1440, 1080, 720, 576, 480, 360};
-            int checked = cur.width ? 10 : -1;
-            for (int i = 0; i < 9; i++)
-                if (cur.width == 0 && cur.height == hgt[i]) checked = i;
-            int r = popup(o, checked);
-            if (r >= 0 && r <= 8) change([&](ConvertSpec& c) { c.height = hgt[r]; c.width = 0; });
-            else if (r == 10)
-                customValue(cur.width && cur.height ? std::to_wstring(cur.width) + L"x" + std::to_wstring(cur.height) : L"1920x1080", at, [change](const std::wstring& v) {
-                    int w2 = 0, h2 = 0;
-                    if (swscanf(v.c_str(), L"%dx%d", &w2, &h2) == 2 && w2 >= 16 && h2 >= 16 && w2 <= 16384 && h2 <= 16384)
-                        change([&](ConvertSpec& c) { c.width = w2 & ~1; c.height = h2 & ~1; });
-                });
+            struct Size { int w, h; };
+            const Size sizes[] = {{640,360}, {854,480}, {1280,720}, {1920,1080}, {2560,1440}, {3840,2160}, {7680,4320}};
+            std::vector<std::wstring> options;
+            std::vector<Size> dims;
+            auto addSize = [&](std::wstring label, Size size = {-1, -1}) { options.push_back(std::move(label)); dims.push_back(size); };
+            addSize(L"source", {0, 0});
+            for (int orientation = 0; orientation < 3; ++orientation) {
+                addSize(orientation == 0 ? L"#HORIZONTAL (LANDSCAPE)" : orientation == 1 ? L"#VERTICAL (PORTRAIT)" : L"#SOURCE ASPECT");
+                for (auto [w, h] : sizes) {
+                    if (orientation == 1) std::swap(w, h);
+                    if (orientation == 2) addSize(std::to_wstring(h) + L"p height", {0, h});
+                    else addSize(std::to_wstring(w) + L"x" + std::to_wstring(h), {w, h});
+                }
+            }
+            addSize(L"custom WxH...");
+            int checked = (int)options.size() - 1;
+            for (int i = 0; i < (int)dims.size(); ++i)
+                if (dims[i].w == cur.width && dims[i].h == cur.height) checked = i;
+            int r = popup(options, checked);
+            if (r < 0) return;
+            if (r != (int)options.size() - 1) change([&](ConvertSpec& c) { c.width = dims[r].w; c.height = dims[r].h; });
+            else customValue(cur.width && cur.height ? sizeText(cur) : L"1920x1080", at, [this, change](const std::wstring& v) {
+                int w = 0, h = 0, end = 0;
+                if (swscanf(v.c_str(), L"%6d%*[xX]%6d%n", &w, &h, &end) == 2 && (size_t)end == v.size() && w >= 16 && h >= 16 && w <= 16384 && h <= 16384)
+                    change([&](ConvertSpec& c) { c.width = w; c.height = h; });
+                else flash(L"Enter a resolution such as 1080x1920 (each side 16 to 16384).");
+            });
         });
+        if (cs.width && cs.height) {
+            const wchar_t* names[] = {L"fit", L"fill", L"stretch", L"centered"};
+            field(x, y, left, a.right, L"FRAMING", names[(int)cs.framing], [this, change] {
+                int r = popup({L"fit (whole frame, add bars)", L"fill (crop to fill the canvas)", L"stretch (change proportions)", L"centered (no zoom, crop or pad)"}, (int)settingsCopy().convert.framing);
+                if (r >= 0) change([&](ConvertSpec& c) { c.framing = (Framing)r; });
+            });
+        }
         field(x, y, left, a.right, L"FRAME RATE", cs.fps > 0 ? fmtFps(cs.fps) : L"source", [this, change] {
             RECT at = anchor_;
             std::vector<std::wstring> o = {L"source", L"23.976", L"24", L"25", L"29.97", L"30", L"48", L"50", L"59.94", L"60", L"120", L"-", L"custom..."};
@@ -844,6 +889,7 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
         if (cs.hasVideoFilters())
             clearButton([](ConvertSpec& c) {
                 c.width = c.height = 0;
+                c.framing = Framing::Fit;
                 c.fps = 0;
                 c.pixFmt.clear();
                 c.deinterlace = c.rotate = c.denoise = c.sharpen = 0;
@@ -880,7 +926,6 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
     }, nullptr, (a.right - x) / 3);
     if (!audioTarget) {
         x = toggle(x, y, L"subtitles", cs.keepSubs, [change] { change([](ConvertSpec& c) { c.keepSubs = !c.keepSubs; }); });
-        if (cs.container != Container::MKV) x = toggle(x, y, L"faststart", cs.faststart, [change] { change([](ConvertSpec& c) { c.faststart = !c.faststart; }); });
     }
     if (encodesVideo) {
         std::string enc = pickEncoder(cs.vcodec, s.encoder, cs.rate, caps);
@@ -1179,7 +1224,7 @@ int MainWindow::buildRow(const ListRow& r, int left, int right, int y, bool sele
             statusSt = S_Bold | S_Mono;
         } else {
             sub = briefMedia(f.info);
-            status = ready ? L"ready" : L"see tracks";
+            status = ready ? L"ready" : tab_ == 1 ? L"see plan" : L"see tracks";
         }
         if (ready) {
             primaryIcon = I_Go;
@@ -1323,14 +1368,7 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
     RECT area{left, y, right, y};
     uint64_t key = f.key;
     if (tab_ == 1) {
-        EncoderCaps caps;
-        {
-            std::lock_guard<std::mutex> lk(capsMu_);
-            caps = caps_;
-        }
-        ConvertSpec planSpec = s.convert;
-        planSpec.accel = s.encoder;
-        Plan p = planConvert(f.info, planSpec, caps);
+        const Plan& p = convertPlan(f);
         Advice adv = adviseConvert(f.info, s.convert);
         if (adv.mode != Advice::Convert && !adv.text.empty()) {
             int xx = text(left, y, adv.text, S_Bold, right - left - S(170));
@@ -1338,6 +1376,7 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
                 for (size_t i = 0; i < conv_.size(); i++) {
                     if (conv_[i].key != key) continue;
                     FileRow f2 = conv_[i];
+                    convertPlans_.erase(key);
                     conv_.erase(conv_.begin() + i);
                     f2.key = nextKey_++;
                     remux_.push_back(f2);
@@ -1624,6 +1663,57 @@ void MainWindow::buildSettings(RECT a) {
         y += rh;
     };
 
+    section(L"TOOLS");
+    {
+        bool repairing = deps_.repairing();
+        int x = row(L"Diagnostics");
+        x = button(x, y, repairing ? L"repairing…" : L"auto repair", [this] { repairTools(false); }, repairing ? S_Disabled : 0);
+        x = button(x, y, L"rebuild tools…", [this] { repairTools(true); }, repairing ? S_Disabled : 0);
+        if (!deps_.repairReport().empty()) button(x, y, L"repair report", [this] {
+            logApp_ = true;
+            logScroll_ = 0;
+            setOverlay(Overlay::Log);
+        });
+        y += rh;
+        for (int i = 0; i < kDeps; i++) {
+            Dep d = (Dep)i;
+            DepView v = deps_.view(d);
+            int left = row(d == Dep::FFmpeg ? L"FFmpeg / FFprobe" : depName(d));
+            std::wstring label = !v.present ? L"not installed" : v.version.empty() ? L"installed (version unknown)" : v.version;
+            if (!v.status.empty()) label += L" · " + v.status;
+            bool problem = !v.present || !v.error.empty() || !v.health.empty() || v.staged;
+            if (problem) label = L"! " + (!v.health.empty() ? v.health : !v.error.empty() ? v.error : label);
+            int right = maxR;
+            if (v.hasPrevious) {
+                right -= tw(L"roll back") + S(24);
+                button(right, y, L"roll back", [this, d] {
+                    spawn([this, d] {
+                        std::wstring result;
+                        if (!deps_.rollback(d, result)) logLine(std::wstring(depName(d)) + L" rollback: " + result);
+                        PostMessageW(hwnd_, WM_APP_DEPS, 0, 0);
+                    });
+                }, v.busy || repairing ? S_Disabled : 0);
+            }
+            right -= tw(L"check") + S(24);
+            button(right, y, L"check", [this] { deps_.startMaintenance(true, true); }, v.busy || repairing ? S_Disabled : 0);
+            Item& warning = add(K_Text, RECT{left, y, right - S(8), y + rh}, label, S_Mono | (problem ? S_Bold | S_Click : 0));
+            if (problem) {
+                warning.tip = L"show the problem and how to fix it";
+                warning.click = [this, d] {
+                    DepView st = deps_.view(d);
+                    std::wstring details = st.health;
+                    if (!st.error.empty()) details += (details.empty() ? L"" : L"\n") + st.error;
+                    if (details.empty()) details = st.staged ? L"A newer verified build is ready; it activates when the running jobs release this tool."
+                        : d == Dep::FFmpeg ? L"FFmpeg or FFprobe is missing." : std::wstring(depName(d)) + L" is missing.";
+                    details += L"\n\nTool location: " + st.path;
+                    details += L"\n\nRun Auto Repair to check the installation and fetch a verified replacement when needed. If the download fails, check your connection and retry.";
+                    if (runConfirm(hwnd_, depName(d), details, L"auto repair", L"close", theme_, fonts_, dpi_)) repairTools(false);
+                };
+            }
+            y += rh;
+        }
+    }
+
     EncoderCaps caps;
     {
         std::lock_guard<std::mutex> lk(capsMu_);
@@ -1744,37 +1834,6 @@ void MainWindow::buildSettings(RECT a) {
         y += rh;
         toggle(row(L""), y, L"try the yt-dlp nightly build after an extraction failure", s.nightlyFallback, [upd] { upd([](Settings& st) { st.nightlyFallback = !st.nightlyFallback; }); });
         y += rh;
-    }
-    section(L"TOOLS");
-    {
-        int verW = std::min<int>(S(300), maxR - colC - S(200));
-        for (int i = 0; i < kDeps; i++) {
-            Dep d = (Dep)i;
-            DepView v = deps_.view(d);
-            int x = row(depName(d));
-            std::wstring st = v.present ? v.version + (d == Dep::YtDlp ? L"  (" + v.channel + L")" : L"") : L"not installed";
-            if (v.busy) st += L"  " + v.status;
-            if (!v.error.empty()) st += L"  ! " + v.error;
-            add(K_Text, RECT{x, y, x + verW, y + rh}, st, S_Mono | (v.error.empty() ? 0 : S_Bold));
-            x += verW + S(12);
-            x = button(x, y, L"update", [this, d] {
-                spawn([this, d] {
-                    if (d == Dep::YtDlp) {
-                        std::wstring n;
-                        deps_.updateYtDlpNow(false, n);
-                    } else {
-                        deps_.startMaintenance(true, true);
-                    }
-                    PostMessageW(hwnd_, WM_APP_DEPS, 0, 0);
-                });
-            }, v.busy ? S_Disabled : 0);
-            button(x, y, L"roll back", [this, d] {
-                std::wstring note2;
-                deps_.rollback(d, note2);
-                flash(note2, 5000);
-            }, v.hasPrevious && !v.busy ? 0 : S_Disabled);
-            y += rh;
-        }
     }
     section(L"DATA");
     {

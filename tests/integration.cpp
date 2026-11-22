@@ -284,6 +284,8 @@ static void runMatrix(Queue& q) {
         L"sine=f=300:d=3:sample_rate=192000", L"-i", ass, L"-i", srt2, L"-f", L"ffmetadata", L"-i", chap, L"-map", L"0", L"-map", L"1", L"-map", L"2", L"-map", L"3",
         L"-map", L"4", L"-map_chapters", L"5", L"-c:v", L"libx265", L"-preset", L"ultrafast", L"-pix_fmt", L"yuv420p10le", L"-x265-params", L"log-level=error",
         L"-c:a:0", L"libopus", L"-b:a:0", L"256k", L"-c:a:1", L"flac", L"-ac:a:1", L"2", L"-sample_fmt:a:1", L"s32", L"-bits_per_raw_sample:a:1", L"24",
+        L"-metadata:s:a:0", L"language=eng", L"-metadata:s:a:0", L"title=Surround English", L"-metadata:s:a:1", L"language=spa",
+        L"-metadata:s:a:1", L"title=Stereo Spanish", L"-disposition:a:0", L"0", L"-disposition:a:1", L"default",
         L"-c:s:0", L"ass", L"-c:s:1", L"srt", L"-shortest", multi});
     mk("VP9 + Vorbis in WebM",
        {L"-f", L"lavfi", L"-i", L"testsrc2=s=426x240:r=30:d=3", L"-f", L"lavfi", L"-i", L"sine=f=500:d=3:sample_rate=48000", L"-ac", L"2", L"-c:v", L"libvpx-vp9",
@@ -353,10 +355,10 @@ static void runMatrix(Queue& q) {
         ConvertSpec s = video(VCodec::H264);
         s.acodec = ACodec::AAC;
         s.aacKbps = 256;
-        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"aac"});
+        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"pcm_s24le"});
         w.ach = 6;
         w.asr = 96000;
-        convertCase(q, "10-bit 4:2:2 -> H.264 MP4 + AAC 256 (5.1 at 96 kHz)", p422, s, w);
+        convertCase(q, "10-bit 4:2:2 -> H.264 MP4: AAC request keeps 5.1(side) PCM", p422, s, w);
         convertCase(q, "10-bit 4:2:2 -> DNxHR HQX MOV", p422, video(VCodec::DNxHR_HQX, Container::MOV), vw(L".mov", "dnxhd", 640, 360, 10, "422", {"pcm_s24le"}));
         convertCase(q, "10-bit 4:2:2 -> DNxHR 444 MOV", p422, video(VCodec::DNxHR_444, Container::MOV), vw(L".mov", "dnxhd", 640, 360, 10, "444", {"pcm_s24le"}));
         convertCase(q, "10-bit 4:2:2 -> DNxHR LB MOV (8-bit 4:2:2)", p422, video(VCodec::DNxHR_LB, Container::MOV), vw(L".mov", "dnxhd", 640, 360, 8, "422", {"pcm_s24le"}));
@@ -485,9 +487,22 @@ static void runMatrix(Queue& q) {
         convertCase(q, "ALAC with cover -> WAV (cover dropped)", alac, a, aw(L".wav", "pcm_s16le", 2, 44100, QC::Lossless, 0));
         a = ConvertSpec();
         a.audio = AudioTarget::WAV;
-        convertCase(q, "multi -> WAV (default track: Opus 5.1 as float)", multi, a, aw(L".wav", "pcm_f32le", 6, 48000, QC::Lossless));
+        MediaInfo multiInfo;
+        CHECK(probeFile(gDeps.ffprobe(), multi, multiInfo) && !planConvert(multiInfo, a, {}).ok,
+              "multi -> WAV refused before dropping a track");
     }
 
+    printf("[matrix: canvas and bitrate]\n");
+    for (auto [mode, label] : {std::pair{Framing::Fit, "fit"}, {Framing::Fill, "fill"}, {Framing::Stretch, "stretch"}, {Framing::Center, "centered"}}) {
+        ConvertSpec cs = video(VCodec::H264);
+        cs.width = 360;
+        cs.height = 640;
+        cs.framing = mode;
+        cs.rate = RateMode::Bitrate;
+        cs.mbps = 1;
+        cs.maxBitrate = mode == Framing::Fit || mode == Framing::Fill;
+        convertCase(q, std::string("landscape -> portrait ") + label, rotTmp, cs, vw(L".mp4", "h264", 360, 640, 8, "420", {"aac"}));
+    }
     printf("[matrix: fastest encoder]\n");
     {
         // Auto takes the graphics encoder when there is one: sizes and codecs must hold there too.
@@ -532,15 +547,12 @@ static void runMatrix(Queue& q) {
         w.ach = 6;
         w.asr = 96000;
         remuxCase(q, "10-bit 4:2:2 MOV -> MP4 original (PCM copied)", p422, Container::MP4, RemuxAudio::Original, 0, w);
-        w = vw(L".mp4", "h264", 640, 360, 10, "422", {"aac"});
-        w.ach = 6;
-        w.asr = 96000;
-        remuxCase(q, "10-bit 4:2:2 MOV -> MP4 AAC 320 (5.1)", p422, Container::MP4, RemuxAudio::AAC, 320, w);
+        remuxCase(q, "10-bit 4:2:2 MOV -> MP4 AAC request keeps 5.1(side) PCM", p422, Container::MP4, RemuxAudio::AAC, 320, w);
         w = vw(L".mp4", "mpeg2video", 720, 576, 8, "420", {"ac3"}, QC::Copy);
         w.ach = 6;
         remuxCase(q, "interlaced MKV -> MP4 original", inter, Container::MP4, RemuxAudio::Original, 0, w);
-        w = vw(L".mov", "mpeg2video", 720, 576, 8, "420", {"aac"});
-        remuxCase(q, "interlaced MKV -> MOV AAC 256 (AC-3 to AAC)", inter, Container::MOV, RemuxAudio::AAC, 256, w);
+        w.ext = L".mov";
+        remuxCase(q, "interlaced MKV -> MOV AAC request keeps 5.1(side) AC-3", inter, Container::MOV, RemuxAudio::AAC, 256, w);
         w = vw(L".mp4", "h264", 0, 0, 8, "420", {"aac"}, QC::Copy);
         w.rotationKept = true;  // copied: the stored 640x360 keeps its rotation tag
         remuxCase(q, "rotated -> MP4 AAC (AAC already: copied, rotation tag kept)", rot, Container::MP4, RemuxAudio::AAC, 256, w);
@@ -702,8 +714,7 @@ int wmain(int argc, wchar_t** argv) {
     probeFile(gDeps.ffprobe(), t.output, m);
     CHECK(m.audio() && m.audio()->codec == "mp3" && t.cls == QualityClass::Lossy, "MP3 output, classed lossy");
     au.audio = AudioTarget::WAV;
-    CHECK(runTask(q, TaskKind::Convert, convertSpec(b, au), t), "MKV FLAC track -> WAV finished");
-    CHECK(decodedAudio(t.output) == decodedAudio(b), "MKV FLAC -> WAV identical");
+    CHECK(probeFile(gDeps.ffprobe(), b, m) && !planConvert(m, au, {}).ok, "Multi-track MKV -> WAV refuses to discard audio");
 
     runMatrix(q);
 

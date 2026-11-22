@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <random>
 #include <semaphore>
 
 #include "../app/runners.h"
@@ -1079,7 +1081,7 @@ LRESULT MainWindow::handle(UINT m, WPARAM w, LPARAM l) {
         case WM_APP_RESULT: applyResults(); return 0;
         case WM_APP_THUMB: relayout(); return 0;
         case WM_APP_UPDATE: relayout(); return 0;
-        case WM_APP_CAPS: relayout(); return 0;
+        case WM_APP_CAPS: convertPlans_.clear(); detectEncodersIfNeeded(); relayout(); return 0;
         case WM_APP_EDITMENU: editMenu((HWND)w, l); return 0;
         case WM_APP_PASTE: return pasteLinks() ? 1 : 0;
         case WM_COPYDATA: {
@@ -1183,7 +1185,10 @@ void MainWindow::removeRow(const ListRow& r) {
         }
     } else {
         auto& list = tab_ == 2 ? remux_ : conv_;
-        if (r.idx >= 0 && r.idx < (int)list.size()) list.erase(list.begin() + r.idx);
+        if (r.idx >= 0 && r.idx < (int)list.size()) {
+            convertPlans_.erase(list[r.idx].key);
+            list.erase(list.begin() + r.idx);
+        }
     }
     if (sel_[tab_] == r.id) sel_[tab_] = RowId{};
     relayout(true);
@@ -1429,7 +1434,9 @@ void MainWindow::analyzeText(const std::wstring& text) {
             ProcOpts po;
             po.env = {{L"PYTHONIOENCODING", L"utf-8"}, {L"PYTHONUTF8", L"1"}};
             deps_.acquire(Dep::YtDlp);
+            deps_.acquire(Dep::Deno);
             auto c = runCapture(deps_.ytdlp(), buildInfoArgs(u, true, deps_.deno(), &auth), po, 180000, &stop_);
+            deps_.release(Dep::Deno);
             deps_.release(Dep::YtDlp);
             gAnalyzeSlots.release();
             if (stop_) return;
@@ -1541,8 +1548,65 @@ int MainWindow::queueGroup(DlGroup& g, int onlyEntry, const Settings& s, uint64_
     return n;
 }
 
+const Plan& MainWindow::convertPlan(const FileRow& f) {
+    auto [it, inserted] = convertPlans_.try_emplace(f.key);
+    if (inserted) {
+        ConvertSpec spec = view_.convert;
+        spec.accel = view_.encoder;
+        std::lock_guard<std::mutex> lk(capsMu_);
+        it->second = planConvert(f.info, spec, caps_);
+    }
+    return it->second;
+}
+
+void MainWindow::previewFile(const RowId& id) {
+    if (tab_ != 1) return;
+    auto it = std::find_if(conv_.begin(), conv_.end(), [&](const FileRow& f) { return f.key == id.key; });
+    if (it == conv_.end() || !deps_.ready(Dep::FFmpeg)) return;
+    const Plan& p = convertPlan(*it);
+    const VideoPreview v = p.preview;
+    if (v.sourceIndex < 0) return;
+    const auto path = it->path;
+    const StreamInfo* source = it->info.video();
+    const double duration = source && source->duration > 0 ? source->duration : it->info.duration;
+    const std::wstring title = fileName(path) + L" · first video track\nFraming and filters shown; compression and HDR display may differ.";
+    auto render = [this, v, path, duration](const std::atomic<bool>& cancel) -> std::pair<HBITMAP, std::wstring> {
+        static std::mt19937 rng(std::random_device{}());
+        const double at = duration > 0 ? duration * std::uniform_real_distribution<double>(0.15, 0.75)(rng) : 0;
+        std::wstring filters = v.filters;
+        if (!filters.empty()) filters += L",";
+        std::wstring wh = std::to_wstring(v.width) + L":" + std::to_wstring(v.height);
+        filters += L"scale=" + wh + L":flags=lanczos,setsar=1";
+        std::vector<std::wstring> args{L"-hide_banner", L"-nostdin", L"-v", L"error", L"-ss", fmtFixed(at, 3), L"-i", path,
+                                       L"-map", L"0:" + std::to_wstring(v.sourceIndex), L"-vf", filters,
+                                       L"-frames:v", L"1", L"-c:v", L"rawvideo", L"-threads:v", L"1", L"-pix_fmt", L"bgra", L"-f", L"rawvideo", L"pipe:1"};
+        deps_.acquire(Dep::FFmpeg);
+        ProcOpts opts;
+        opts.lowPriority = true;
+        Capture c = runCapture(deps_.ffmpeg(), args, opts, 25000, &cancel);
+        if (!cancel && c.code == 0 && c.out.empty() && at > 0) {
+            args[5] = L"0";  // a short video track may end before the container duration
+            c = runCapture(deps_.ffmpeg(), args, opts, 25000, &cancel);
+        }
+        deps_.release(Dep::FFmpeg);
+        if (cancel) return {};
+        size_t bytes = (size_t)v.width * v.height * 4;
+        if (c.code != 0 || c.out.size() != bytes)
+            return {nullptr, c.timedOut ? L"Preview timed out." : !c.startError.empty() ? c.startError : !c.err.empty() ? widen(trim(c.err).substr(0, 220)) : L"No frame could be decoded."};
+        BITMAPINFO info{};
+        info.bmiHeader = {sizeof(BITMAPINFOHEADER), v.width, -v.height, 1, 32, BI_RGB};
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bitmap) return {nullptr, L"Could not allocate the preview image."};
+        std::memcpy(bits, c.out.data(), bytes);
+        return {bitmap, {}};
+    };
+    runPreview(hwnd_, title, v.width, v.height, render, theme_, fonts_, dpi_);
+}
+
 bool MainWindow::fileReady(int tab, const FileRow& f, const Settings& s) {
     if (f.busy || !f.info.ok) return false;
+    if (tab == 1) return convertPlan(f).ok;
     if (tab != 2) return true;
     RemuxSpec rs = f.remux;
     rs.container = s.remuxContainer;
@@ -1590,6 +1654,7 @@ void MainWindow::startRow(const ListRow& r) {
         if (r.idx < 0 || r.idx >= (int)list.size()) return;
         id = queueFile(tab_, list[r.idx], s);
         if (!id) return;
+        convertPlans_.erase(list[r.idx].key);
         list.erase(list.begin() + r.idx);
     }
     if (id && sel_[tab_] == r.id && r.type != ListRow::Head) select(tab_, RowId{id, 0, 0});
@@ -1619,6 +1684,7 @@ void MainWindow::startAll(int tab) {
         auto& list = tab == 2 ? remux_ : conv_;
         for (size_t i = 0; i < list.size();) {
             if (queueFile(tab, list[i], s)) {
+                convertPlans_.erase(list[i].key);
                 list.erase(list.begin() + i);
                 n++;
             } else {
@@ -1656,16 +1722,38 @@ void MainWindow::commitCustom(bool ok) {
     relayout(true);
 }
 
+void MainWindow::repairTools(bool rebuild) {
+    if (deps_.repairing()) return;
+    if (rebuild && !runConfirm(hwnd_, L"Rebuild managed tools?",
+        L"Download and test fresh copies of yt-dlp, FFmpeg, FFprobe and Deno. This replaces the current tools and can replace their rollback copies. Running tasks finish with the tools they started with. Your settings, media, history and queue stay unchanged.",
+        L"rebuild tools", L"cancel", theme_, fonts_, dpi_)) return;
+    std::vector<std::wstring> errors;
+    for (auto it = tasks_.rbegin(); it != tasks_.rend() && errors.size() < 36; ++it) {
+        if (it->state != TaskState::Failed) continue;
+        errors.push_back(it->error + L" " + it->hint);
+        auto log = queue_.taskLog(it->id);
+        for (auto ln = log.rbegin(); ln != log.rend() && ln - log.rbegin() < 3; ++ln) errors.push_back(*ln);
+    }
+    for (auto& g : groups_)
+        if (!g.error.empty() && errors.size() < 40) errors.push_back(g.error + L" " + g.hint);
+    if (!deps_.startRepair(rebuild, std::move(errors), settingsCopy())) {
+        flash(L"Tool maintenance is already running. Try again when it finishes.");
+        return;
+    }
+    relayout();
+}
+
 void MainWindow::detectEncodersIfNeeded() {
     if (capsRunning_ || !deps_.ready(Dep::FFmpeg)) return;
     std::string hash = deps_.ffmpegHash();
-    {
+    if (settingsCopy().encoderCapsFor == hash) {
         std::lock_guard<std::mutex> lk(capsMu_);
-        if (caps_.probed && !hash.empty() && settings_.encoderCapsFor == hash) return;
+        if (caps_.probed) return;
     }
     capsRunning_ = true;
-    spawn([this, hash] {
+    spawn([this] {
         deps_.acquire(Dep::FFmpeg);
+        std::string hash = deps_.ffmpegHash();
         EncoderCaps c = detectEncoders(deps_.ffmpeg(), &stop_);
         deps_.release(Dep::FFmpeg);
         if (stop_) return;

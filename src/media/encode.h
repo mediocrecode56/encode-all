@@ -13,7 +13,8 @@ namespace ea {
 
 enum class VCodec { Copy, H264, H265, DNxHR_LB, DNxHR_SQ, DNxHR_HQ, DNxHR_HQX, DNxHR_444 };
 enum class Accel { Auto, Software, NVENC, QSV, AMF };
-enum class RateMode { Quality, Bitrate, Lossless };
+enum class RateMode { Quality, Bitrate, Lossless };  // persisted values
+enum class Framing { Fit, Fill, Stretch, Center };
 enum class ACodec { Copy, AAC, PCM };
 enum class AudioTarget { None, FLAC, MP3, WAV };  // None = video conversion
 enum class Preset { Lossless, MaxQuality, Balanced, Compact, Custom };
@@ -26,8 +27,10 @@ struct ConvertSpec {
     RateMode rate = RateMode::Quality;
     int quality = 22;     // CRF scale (x264/x265); hardware CQ/QP is mapped from it
     double mbps = 8;      // bitrate mode, video only
+    bool maxBitrate = false;  // cap instead of an average target
     std::string speed = "medium";  // x264/x265 preset; hardware presets are mapped
     int width = 0, height = 0;     // 0 = source; one side 0 keeps the aspect ratio
+    Framing framing = Framing::Fit;  // used with an explicit WxH canvas
     double fps = 0;                // 0 = source
     std::string pixFmt;            // empty = source (or nearest the encoder takes)
     ACodec acodec = ACodec::Copy;
@@ -42,7 +45,6 @@ struct ConvertSpec {
     int sampleRate = 0;  // 0 = source
     int channels = 0;    // 0 = source
     bool keepSubs = true;
-    bool faststart = true;
     // filters (0 = off); video ones apply only when the video is encoded
     int deinterlace = 0;  // 1 auto (interlaced frames only), 2 every frame, 3 every field (double rate)
     int rotate = 0;       // 1 90 clockwise, 2 90 counter-clockwise, 3 180, 4 mirror, 5 flip
@@ -82,6 +84,12 @@ struct OutExpect {
     int depth = 0;              // video bit depth, 0: not checked
     std::string chroma;         // "420", "422", "444", empty: not checked
     int channels = 0, sampleRate = 0;
+    std::string layout, language;
+};
+
+struct VideoPreview {
+    int sourceIndex = -1, width = 0, height = 0;
+    std::wstring filters;  // identical to the first encoded video stream's filter chain
 };
 
 struct Plan {
@@ -94,7 +102,8 @@ struct Plan {
     std::vector<std::wstring> lines;     // what happens to each stream
     std::vector<std::wstring> warnings;  // anything the user should know before starting
     double estBytes = 0;
-    bool estVariable = false;
+    bool estVariable = false, estCapped = false;
+    VideoPreview preview;
     std::wstring estText;
     int outStreams = 0;
     std::vector<int> copiedSourceStreams;  // for verification

@@ -181,6 +181,8 @@ bool checkExpect(const MediaInfo& out, const std::vector<OutExpect>& ex, std::ws
         else if (!e.chroma.empty() && pixFmtChroma(s.pixFmt) != e.chroma) err = at + L" is " + widen(s.pixFmt) + L", planned 4:" + widen(e.chroma.substr(1));
         else if (e.channels && s.channels != e.channels) err = at + L" has " + std::to_wstring(s.channels) + L" channels, planned " + std::to_wstring(e.channels);
         else if (e.sampleRate && s.sampleRate != e.sampleRate) err = at + L" is " + std::to_wstring(s.sampleRate) + L" Hz, planned " + std::to_wstring(e.sampleRate);
+        else if (!e.layout.empty() && s.layout != e.layout) err = at + L" has channel layout " + (s.layout.empty() ? L"unknown" : widen(s.layout)) + L", planned " + widen(e.layout);
+        else if (!e.language.empty() && lower(s.lang) != lower(e.language)) err = at + L" should have language " + widen(e.language);
         if (!err.empty()) return false;
     }
     return true;

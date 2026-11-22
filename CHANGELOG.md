@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6 - 2026-11-22
+- Convert: portrait and landscape canvases, custom resolutions, Fit, Fill, Stretch and Centered, and a random-frame preview rendered with the conversion's filters. MP4 and MOV always use Faststart.
+- Separate CRF and Mbps controls, with average targets and maximum video bitrate caps. Convert shows an estimated total for pending files and identifies content-dependent estimates.
+- Convert and Remux verify audio counts, layouts and language, keep track order and names where supported, and use copy or exact PCM when AAC would change the layout. Single-track audio targets refuse multi-track input rather than selecting one silently.
+- Settings: clickable tool warnings, background Auto Repair, a repair report, and a confirmed clean reinstall of managed tools. Replacements are verified and staged without interrupting running tasks. Removed the top tool-status indicator and redundant file-picker label.
+
 ## 1.0.5 - 2026-11-21
 - Output integrity: before a file gets its name, every stream is checked against the plan (type, codec, size, bit depth, chroma, channels, sample rate) and the start and end of the file must decode. A mismatch fails the task and keeps nothing. Found and fixed with this:
   - odd frame sizes (321x241): x264 and x265 refused them at 4:2:0 and silently rounded them at 4:2:2, and DNxHR silently dropped a row. 4:2:0, 4:2:2 and DNxHR now crop to even sides and say so; 4:4:4 keeps odd sizes;

@@ -190,6 +190,10 @@ bool parseProbeJson(const std::string& text, MediaInfo& m) {
             else if (k == "mimetype") si.mimetype = kv.second.str();
             else if (k == "rotate") si.rotation = (int)kv.second.num();
         }
+        if (si.isAudio() && si.title.empty()) {
+            std::string handler = tags["handler_name"].str();
+            if (handler != "SoundHandler" && handler != "Apple Sound Media Handler") si.title = std::move(handler);
+        }
         if (si.lang == "und") si.lang.clear();
         const auto& disp = s["disposition"];
         si.isDefault = disp["default"].num() != 0;

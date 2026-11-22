@@ -316,16 +316,38 @@ static void testPlans() {
     s.mbps = 40;
     p = planConvert(m, s, caps);
     CHECK(anyContains(p.warnings, L"exceeds what the source needs"));
+    CHECK(hasPair(p.args, L"-b:0", L"40000k") && !hasArg(p.args, L"-maxrate:0"));
+    s.maxBitrate = true;
+    s.width = 1080;
+    s.height = 1920;
+    p = planConvert(m, s, caps);
+    CHECK(p.ok && p.estCapped && hasPair(p.args, L"-maxrate:0", L"40000k") && !hasArg(p.args, L"-crf:0"));
+    CHECK(p.expect[0].width == 1080 && p.expect[0].height == 1920);
+    CHECK(hasPair(p.args, L"-filter:0", p.preview.filters) && p.preview.filters.find(L"pad=1080:1920") != std::wstring::npos);
+    s.framing = Framing::Fill;
+    p = planConvert(m, s, caps);
+    CHECK(p.preview.filters.find(L"crop=1080:1920") != std::wstring::npos);
+    s.framing = Framing::Stretch;
+    p = planConvert(m, s, caps);
+    CHECK(p.preview.filters == L"scale=1080:1920:flags=lanczos,setsar=1");
+    s.framing = Framing::Center;
+    p = planConvert(m, s, caps);
+    CHECK(p.preview.filters.find(L"crop=1080:1080") != std::wstring::npos && p.preview.filters.find(L"pad=1080:1920") != std::wstring::npos);
+    CHECK(ConvertSpec::fromJson(s.toJson()).framing == Framing::Center && ConvertSpec::fromJson(s.toJson()).maxBitrate);
+    CHECK(hasPair(p.args, L"-movflags", L"+faststart"));
     // Audio targets.
     ConvertSpec a;
     a.audio = AudioTarget::WAV;
-    p = planConvert(m, a, caps);
+    CHECK(!planConvert(m, a, caps).ok);  // WAV cannot hold two independent tracks
+    MediaInfo oneTrack = m;
+    oneTrack.streams.erase(oneTrack.streams.begin() + 2);
+    p = planConvert(oneTrack, a, caps);
     CHECK(p.ok && hasPair(p.args, L"-c:0", L"pcm_s24le") && p.cls == QualityClass::Lossless);  // TrueHD 24-bit decoded exactly
     a.audio = AudioTarget::MP3;
-    p = planConvert(m, a, caps);
+    p = planConvert(oneTrack, a, caps);
     CHECK(p.cls == QualityClass::Lossy && hasPair(p.args, L"-b:0", L"320k"));
     a.audio = AudioTarget::FLAC;
-    p = planConvert(m, a, caps);
+    p = planConvert(oneTrack, a, caps);
     CHECK(p.cls == QualityClass::Lossless && hasPair(p.args, L"-bits_per_raw_sample:0", L"24"));
     // Remux: MKV keeps everything bit-for-bit; MP4 lists what it cannot hold.
     RemuxSpec r;
@@ -414,6 +436,7 @@ static MediaInfo fakeMedia(int w, int h, const char* pix, int rotation, const ch
     a.type = "audio";
     a.codec = acodec;
     a.channels = ch;
+    a.layout = ch == 1 ? "mono" : ch == 2 ? "stereo" : ch == 6 ? "5.1" : "";
     a.sampleRate = sr;
     a.sampleFmt = sampleFmt;
     m.streams.push_back(a);

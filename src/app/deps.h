@@ -8,17 +8,20 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace ea {
 
 enum class Dep { YtDlp = 0, FFmpeg = 1, Deno = 2 };
 constexpr int kDeps = 3;
+struct Settings;
 const wchar_t* depName(Dep d);
 
 struct DepView {
     bool present = false, busy = false;
     double progress = -1;
-    std::wstring version, status, error, channel;
+    std::wstring version, status, error, health, channel, path;
+    bool staged = false;
     int64_t checked = 0;
     bool hasPrevious = false;
 };
@@ -43,6 +46,9 @@ public:
     // Synchronous, from a task thread after an extraction failure. True if yt-dlp changed.
     bool updateYtDlpNow(bool allowNightly, std::wstring& note);
     bool rollback(Dep d, std::wstring& note);
+    bool startRepair(bool rebuild, std::vector<std::wstring> recentErrors, const Settings& settings);
+    bool repairing() const { return repairing_; }
+    std::vector<std::wstring> repairReport() const;
 
     // Tasks hold a tool while it runs so it is never swapped underneath them.
     void acquire(Dep d);
@@ -57,15 +63,18 @@ private:
         int64_t checked = 0, installed = 0;
         bool present = false, busy = false;
         double progress = -1;
-        std::wstring status, error;
+        std::wstring status, error, health;
         int users = 0;
         bool pendingSwap = false;
-        std::wstring pendingVersion;
+        std::wstring pendingVersion, pendingChannel;
         std::string pendingSha;
     };
     std::wstring root(Dep d) const;
     std::wstring exeIn(Dep d, const std::wstring& dir) const;
-    bool install(Dep d, bool force, std::wstring& note);
+    bool install(Dep d, bool reinstall, std::wstring& note, const wchar_t* requestedChannel = nullptr);
+    bool checkLocal(Dep d, std::wstring& version, std::wstring& error);
+    bool launchMaintenance(std::function<void()> work);
+    void repair(bool rebuild, const std::vector<std::wstring>& recentErrors, const Settings& settings);
     bool fetchExpected(Dep d, const std::wstring& channel, std::string& sha, std::wstring& err);
     bool stage(Dep d, const std::wstring& channel, const std::string& sha, std::wstring& version, std::wstring& err);
     bool smoke(Dep d, const std::wstring& dir, std::wstring& version, std::wstring& err);
@@ -83,6 +92,9 @@ private:
     std::atomic<bool> stop_{false};
     std::mutex installMu_;  // one install at a time
     std::mutex maintMu_;    // one maintenance thread at a time
+    std::mutex saveMu_;
+    std::atomic<bool> maintaining_{false}, repairing_{false};
+    std::vector<std::wstring> repairReport_;
 };
 
 std::string extractHash(const std::string& text, const std::string& name);
