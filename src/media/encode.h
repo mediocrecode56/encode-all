@@ -43,7 +43,7 @@ struct ConvertSpec {
     int mp3Quality = 0;  // VBR V0..V9
     int bitDepth = 0;    // 0 = source (FLAC/WAV)
     int sampleRate = 0;  // 0 = source
-    int channels = 0;    // 0 = source
+    int channels = 0;    // 0 = source (copied), 1 mono, 2 stereo (every audio track; see remixTo)
     bool keepSubs = true;
     // filters (0 = off); video ones apply only when the video is encoded
     int deinterlace = 0;  // 1 auto (interlaced frames only), 2 every frame, 3 every field (double rate)
@@ -51,10 +51,8 @@ struct ConvertSpec {
     int denoise = 0;      // 1 light, 2 medium, 3 strong (hqdn3d)
     int sharpen = 0;      // 1 light, 2 medium (unsharp)
     int loudness = 0;     // 1 -23 LUFS (EBU R128), 2 -16 LUFS, 3 -14 LUFS (loudnorm); audio is re-encoded
-    // channels (above) also downmixes the audio of a video target
 
     bool hasVideoFilters() const;
-    bool hasAudioFilters() const { return loudness > 0 || channels > 0; }
     json::Value toJson() const;
     static ConvertSpec fromJson(const json::Value& v);
 };
@@ -118,6 +116,10 @@ const wchar_t* pcmBitsName(int bits);  // exact, 16-bit, 24-bit, 32-bit float
 // AAC quality is named by its stereo bitrate; mono gets half, surround a quarter per channel (max 512k).
 int aacKbpsFor(int quality, int channels);
 int aacSampleRate(int sourceRate);  // the source rate when AAC takes it, else 48000 or 44100
+// The channel count a track changes to for the CHANNELS choice (0 source, 1 mono, 2 stereo), or 0 when it
+// stays as it is. Downmixes use FFmpeg's standard matrix; mono to stereo duplicates the channel.
+int remixTo(int sourceChannels, int want);
+const wchar_t* channelsChoiceName(int want);  // "source", "mono", "stereo"
 Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& caps);
 
 enum class TrackAction { Copy, ToAAC, ToPCM, ToText, Exclude };
@@ -133,6 +135,7 @@ struct RemuxSpec {
     RemuxAudio audio = RemuxAudio::Original;
     int pcmBits = 0;        // 0 = exact (source depth, 32-bit float for lossy sources), 16, 24, 32 (float)
     int aacKbps = 256;      // AAC quality (stereo bitrate, see aacKbpsFor)
+    int channels = 0;       // 0 source, 1 mono, 2 stereo: every audio track not explicitly set to COPY
     bool chapters = true;
     bool faststart = true;
     json::Value toJson() const;
@@ -141,6 +144,10 @@ struct RemuxSpec {
 
 TrackAction defaultAction(Container c, const StreamInfo& s, RemuxAudio audio = RemuxAudio::Original);
 std::vector<TrackAction> allowedActions(Container c, const StreamInfo& s);
+// What Remux does with one track: its own choice when allowed, else the mode's default. A channel
+// change turns a default copy into AAC (MP4, or the AAC mode) or exact PCM (MOV); an explicit COPY
+// stays bit-for-bit. `to` receives the new channel count (0 = unchanged).
+TrackAction remuxTrack(const RemuxSpec& s, const StreamInfo& st, int* to = nullptr);
 Plan planRemux(const MediaInfo& m, const RemuxSpec& s);
 
 // Copy / Remux / Convert advice for a file and the target the user picked.

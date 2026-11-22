@@ -429,13 +429,16 @@ int MainWindow::check(int x, int y, bool on, std::function<void()> fn) {
 }
 
 int MainWindow::choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel,
-                       int maxW) {
+                       int maxW, unsigned style) {
+    bool off = style & S_Disabled;
     if (!label.empty()) x = text(x, y, label, S_Mid) + S(8);
     int w = std::max<int>(tw(value) + S(9) + S(26), S(64));
     if (maxW > 0 && w > maxW) w = std::max<int>(maxW, S(64));
-    Item& it = add(K_Box, RECT{x, y + S(3), x + w, y + rowH() - S(3)}, value, S_Click);
-    it.click = std::move(open);
-    it.wheel = std::move(wheel);
+    Item& it = add(K_Box, RECT{x, y + S(3), x + w, y + rowH() - S(3)}, value, off ? S_Disabled : S_Click);
+    if (!off) {
+        it.click = std::move(open);
+        it.wheel = std::move(wheel);
+    }
     return x + w + S(16);
 }
 
@@ -522,12 +525,16 @@ int MainWindow::fieldW(const std::wstring& caption, const std::wstring& value) {
 }
 
 void MainWindow::field(int& x, int& y, int left, int right, const std::wstring& caption, const std::wstring& value, std::function<void()> open,
-                       std::function<void(int)> wheel) {
+                       std::function<void(int)> wheel, unsigned style) {
     if (x > left && x + fieldW(caption, value) > right) {
         y += rowH();
         x = left;
     }
-    x = choice(x, y, caption, value, std::move(open), std::move(wheel));
+    x = choice(x, y, caption, value, std::move(open), std::move(wheel), 0, style);
+}
+
+void MainWindow::rowNote(int x, int y, int right, const std::wstring& note) {
+    if (!note.empty() && right - x > S(140)) text(x, y, note, S_Mid, right - x);
 }
 
 int MainWindow::sectionTitle(int x, int y, const std::wstring& title) { return text(x, y, title, S_Bold); }
@@ -688,10 +695,12 @@ void MainWindow::onPaint() {
                 break;
             }
             case K_Box: {
-                if (hov || press) p.fill(it.r, theme_.hover);
-                p.frame(it.r, hov ? theme_.ink : theme_.line);
-                p.text(RECT{it.r.left + S(9), it.r.top, it.r.right - S(22), it.r.bottom}, it.text, theme_.ink, f);
-                p.icon(I_Chevron, RECT{it.r.right - S(22), it.r.top, it.r.right - S(4), it.r.bottom}, hov ? theme_.ink : theme_.mid, S(14));
+                bool off = it.style & S_Disabled;
+                bool lit = (hov || press) && !off;
+                if (lit) p.fill(it.r, theme_.hover);
+                p.frame(it.r, lit ? theme_.ink : theme_.line);
+                p.text(RECT{it.r.left + S(9), it.r.top, it.r.right - S(22), it.r.bottom}, it.text, off ? theme_.mid : theme_.ink, fontFor(it.style & ~S_Disabled));
+                p.icon(I_Chevron, RECT{it.r.right - S(22), it.r.top, it.r.right - S(4), it.r.bottom}, lit ? theme_.ink : off ? theme_.line : theme_.mid, S(14));
                 break;
             }
             case K_Icon: {
@@ -1608,12 +1617,7 @@ bool MainWindow::fileReady(int tab, const FileRow& f, const Settings& s) {
     if (f.busy || !f.info.ok) return false;
     if (tab == 1) return convertPlan(f).ok;
     if (tab != 2) return true;
-    RemuxSpec rs = f.remux;
-    rs.container = s.remuxContainer;
-    rs.audio = s.remuxAudio;
-    rs.pcmBits = s.remuxPcmBits;
-    rs.aacKbps = s.remuxAacKbps;
-    return planRemux(f.info, rs).ok;
+    return planRemux(f.info, s.remuxSpec(f.remux)).ok;
 }
 
 uint64_t MainWindow::queueFile(int tab, const FileRow& f, const Settings& s) {
@@ -1622,13 +1626,8 @@ uint64_t MainWindow::queueFile(int tab, const FileRow& f, const Settings& s) {
     spec.set("input", f.path);
     spec.set("order", (long long)f.order);
     if (tab == 2) {
-        RemuxSpec rs = f.remux;
-        rs.container = s.remuxContainer;
-        rs.audio = s.remuxAudio;
-        rs.pcmBits = s.remuxPcmBits;
-        rs.aacKbps = s.remuxAacKbps;
         spec.set("outDir", s.remuxDir);
-        spec.set("remux", rs.toJson());
+        spec.set("remux", s.remuxSpec(f.remux).toJson());
         return queue_.add(TaskKind::Remux, fileName(f.path), spec);
     }
     spec.set("outDir", s.convertDir);

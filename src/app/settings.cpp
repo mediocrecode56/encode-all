@@ -39,6 +39,7 @@ json::Value Settings::toJson() const {
     v.set("dlOut", (int)dlOut);
     v.set("dlCrf", dlCrf);
     v.set("dlHevc", dlHevc);
+    v.set("dlChannels", dlChannels);
     v.set("metadata", metadata);
     v.set("chapters", chapters);
     v.set("thumbnail", thumbnail);
@@ -60,6 +61,7 @@ json::Value Settings::toJson() const {
     v.set("remuxContainer", (int)remuxContainer);
     v.set("remuxAudio", (int)remuxAudio);
     v.set("remuxAacKbps", remuxAacKbps);
+    v.set("remuxChannels", remuxChannels);
     v.set("remuxPcmBits", remuxPcmBits);
     v.set("encoder", (int)encoder);
     v.set("winX", winX);
@@ -82,6 +84,7 @@ void Settings::fromJson(const json::Value& v) {
     dlOut = (DlOut)std::clamp((int)v["dlOut"].num(0), 0, 5);
     dlCrf = std::clamp((int)v["dlCrf"].num(16), 0, 51);
     dlHevc = v["dlHevc"].boolean(false);
+    dlChannels = std::clamp((int)v["dlChannels"].num(0), 0, 2);
     metadata = v["metadata"].boolean(d.metadata);
     chapters = v["chapters"].boolean(d.chapters);
     thumbnail = v["thumbnail"].boolean(d.thumbnail);
@@ -105,6 +108,7 @@ void Settings::fromJson(const json::Value& v) {
     remuxAudio = v.has("remuxAudio") ? (RemuxAudio)std::clamp((int)v["remuxAudio"].num(0), 0, 2)
                                      : v["remuxPcm"].boolean(false) ? RemuxAudio::PCM : RemuxAudio::Original;
     remuxAacKbps = std::clamp((int)v["remuxAacKbps"].num(256), 64, 512);
+    remuxChannels = std::clamp((int)v["remuxChannels"].num(0), 0, 2);
     remuxPcmBits = (int)v["remuxPcmBits"].num(0);
     if (remuxPcmBits != 16 && remuxPcmBits != 24 && remuxPcmBits != 32) remuxPcmBits = 0;
     encoder = (Accel)std::clamp((int)v["encoder"].num(0), 0, (int)Accel::AMF);
@@ -128,6 +132,16 @@ bool loadSettings(Settings& s) {
     }
     if (s.dlDir.empty()) s.dlDir = downloadsFolder();
     return true;
+}
+
+RemuxSpec Settings::remuxSpec(const RemuxSpec& tracks) const {
+    RemuxSpec rs = tracks;
+    rs.container = remuxContainer;
+    rs.audio = remuxAudio;
+    rs.pcmBits = remuxPcmBits;
+    rs.aacKbps = remuxAacKbps;
+    rs.channels = remuxChannels;
+    return rs;
 }
 
 bool saveSettings(const Settings& s) { return writeFileAtomic(settingsPath(), json::dump(s.toJson(), true)); }

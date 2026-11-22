@@ -58,6 +58,7 @@ struct DlPrefs {
     bool preferH264 = false;  // at equal resolution, frame rate and dynamic range only
     int crf = 16;             // MP4/MOV video quality
     bool hevc = false;        // MP4/MOV target codec: H.265 instead of H.264
+    int channels = 0;         // MP4, MOV, MP3, WAV: 0 source, 1 mono, 2 stereo (Original ignores it)
 };
 
 struct Selection {

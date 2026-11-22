@@ -18,7 +18,6 @@ enum class Fit {
 const wchar_t* containerName(Container c);  // "MP4"
 const wchar_t* containerExt(Container c);   // ".mp4"
 const char* containerMuxer(Container c);    // ffmpeg -f value
-bool containerFromName(const std::wstring& s, Container& out);
 
 Fit fitStream(Container c, const StreamInfo& s);
 // Same question for yt-dlp format codecs ("avc1.640028", "opus", "mp4a.40.2", "av01.0.08M.08").

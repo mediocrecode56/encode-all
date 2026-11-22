@@ -202,6 +202,20 @@ static void testFormats() {
         in.formats.erase(in.formats.begin() + 1);  // drop Opus so AAC is the best audio
         Selection h = selectFormats(in, aac);
         CHECK(h.videoId == "137" && h.audioId == "140" && !h.needsConvert && h.container == Container::MP4);  // already H.264/AAC: pure copy
+        // CHANNELS: stereo AAC stays a copy for "stereo"; "mono" converts the audio; an unknown count converts (checked after the download).
+        for (auto& f : in.formats)
+            if (f.id == "140") f.channels = 2;
+        aac.channels = 2;
+        h = selectFormats(in, aac);
+        CHECK(!h.needsConvert && h.brief.find(L"AAC stereo") != std::wstring::npos);
+        aac.channels = 1;
+        h = selectFormats(in, aac);
+        CHECK(h.needsConvert && h.brief.find(L"\u2192 MP4 AAC mono") != std::wstring::npos);
+        aac.out = DlOut::AudioWAV;
+        h = selectFormats(in, aac);
+        CHECK(h.needsConvert && h.brief.find(L"WAV mono") != std::wstring::npos);
+        aac.out = DlOut::MP4;
+        aac.channels = 0;
         aac.hevc = true;
         h = selectFormats(in, aac);
         CHECK(h.needsConvert && h.summary.find(L"H.265 CRF 16") != std::wstring::npos);  // H.264 source re-encoded for an H.265 target
@@ -388,6 +402,26 @@ static void testPlans() {
     CHECK(RemuxSpec::fromJson(old).audio == RemuxAudio::PCM);
     CHECK(RemuxSpec::fromJson(r.toJson()).audio == RemuxAudio::AAC && RemuxSpec::fromJson(r.toJson()).aacKbps == 256);
     r.audio = RemuxAudio::Original;
+    // Remux CHANNELS: a track that changes is decoded (exact PCM where MP4 cannot copy it, AAC for a default
+    // copy in MP4, PCM in MOV); a track already at that count is copied; an explicit COPY stays bit-for-bit.
+    r.channels = 2;
+    p = planRemux(m, r);
+    CHECK(hasPair(p.args, L"-c:1", L"pcm_s24le") && hasPair(p.args, L"-ac:1", L"2") && p.expect[1].channels == 2 && hasPair(p.args, L"-c:2", L"copy"));
+    CHECK(p.cls == QualityClass::Lossy && anyContains(p.lines, L"7.1 to stereo"));
+    r.channels = 1;
+    p = planRemux(m, r);
+    CHECK(hasPair(p.args, L"-c:2", L"aac") && hasPair(p.args, L"-ac:2", L"1") && p.expect[2].channels == 1 && p.expect[2].layout == "mono");
+    int to = 0;
+    CHECK(remuxTrack(r, m.streams[2], &to) == TrackAction::ToAAC && to == 1);
+    r.container = Container::MOV;
+    CHECK(remuxTrack(r, m.streams[2], &to) == TrackAction::ToPCM && to == 1);
+    r.actions[2] = TrackAction::Copy;
+    CHECK(remuxTrack(r, m.streams[2], &to) == TrackAction::Copy && to == 0);
+    r.actions.clear();
+    CHECK(RemuxSpec::fromJson(r.toJson()).channels == 1);
+    CHECK(remixTo(1, 2) == 2 && remixTo(2, 2) == 0 && remixTo(6, 1) == 1 && remixTo(0, 2) == 0 && remixTo(6, 0) == 0);
+    r.channels = 0;
+    r.container = Container::MP4;
     // Auto takes the fastest encoder that works; lossless stays on x264/x265 unless NVENC is chosen.
     EncoderCaps hw;
     hw.works["h264_nvenc"] = true;
@@ -493,15 +527,30 @@ static void testEdges() {
     p = planConvert(hd, s, caps);
     CHECK(hasPair(p.args, L"-c:1", L"aac") && anyContains(p.args, L"loudnorm=I=-16") && anyContains(p.args, L"aresample=48000"));
     CHECK(hasPair(p.args, L"-b:1", L"" + std::to_wstring(aacKbpsFor(s.aacKbps, 6)) + L"k"));
-    // Downmix to stereo for a video target; never an upmix.
+    // CHANNELS: 5.1 downmixes to stereo (exact PCM in MOV, AAC in MP4); mono becomes stereo by duplication
+    // (pan, no -ac level change); a track already stereo is copied.
     s.loudness = 0;
     s.channels = 2;
     s.container = Container::MOV;
     p = planConvert(hd, s, caps);
-    CHECK(hasPair(p.args, L"-ac:1", L"2") && p.expect[1].channels == 2 && startsWith(p.expect[1].codec, "pcm_"));
+    CHECK(hasPair(p.args, L"-ac:1", L"2") && p.expect[1].channels == 2 && p.expect[1].layout == "stereo" && startsWith(p.expect[1].codec, "pcm_"));
+    CHECK(p.cls == QualityClass::Lossy && anyContains(p.lines, L"5.1 to stereo"));
     MediaInfo mono = fakeMedia(640, 360, "yuv420p", 0, "aac", 1, 44100);
     p = planConvert(mono, s, caps);
-    CHECK(hasPair(p.args, L"-c:1", L"copy"));
+    CHECK(!hasArg(p.args, L"-ac:1") && hasPair(p.args, L"-filter:1", L"pan=stereo|c0=c0|c1=c0") && p.expect[1].channels == 2);
+    s.container = Container::MP4;
+    p = planConvert(mono, s, caps);
+    CHECK(hasPair(p.args, L"-c:1", L"aac") && hasPair(p.args, L"-b:1", std::to_wstring(aacKbpsFor(s.aacKbps, 2)) + L"k") && anyContains(p.lines, L"mono to stereo"));
+    MediaInfo st2 = fakeMedia(640, 360, "yuv420p", 0, "aac", 2, 48000);
+    p = planConvert(st2, s, caps);
+    CHECK(hasPair(p.args, L"-c:1", L"copy") && p.cls == QualityClass::Lossy);  // the video is encoded; the audio is untouched
+    s.channels = 1;
+    s.loudness = 2;
+    p = planConvert(st2, s, caps);
+    CHECK(hasPair(p.args, L"-ac:1", L"1") && anyContains(p.args, L"loudnorm") && p.expect[1].channels == 1 && p.expect[1].layout == "mono");
+    s.loudness = 0;
+    s.channels = 2;
+    s.container = Container::MOV;
     // MP3 holds stereo at most and up to 48 kHz.
     MediaInfo hi = fakeMedia(640, 360, "yuv420p", 0, "flac", 6, 192000, "s32");
     hi.streams[1].bitsPerSample = 24;
@@ -570,7 +619,7 @@ static void testEdges() {
     ConvertSpec g = ConvertSpec::fromJson(f.toJson());
     CHECK(g.rotate == 2 && g.denoise == 3 && g.loudness == 1 && g.deinterlace == 3 && g.sharpen == 2);
     applyPreset(g, Preset::Lossless);
-    CHECK(!g.hasVideoFilters() && !g.hasAudioFilters());
+    CHECK(!g.hasVideoFilters() && !g.loudness && !g.channels);
     // Labels for list rows.
     CHECK(codecLabel("hevc") == L"H.265" && codecLabel("pcm_s24le") == L"PCM 24-bit" && codecLabel("opus") == L"Opus");
     CHECK(resolutionLabel(1920, 1080, 60) == L"1080p60" && resolutionLabel(1080, 1920, 30) == L"1080p30" && resolutionLabel(1000, 750, 0) == L"1000x750");

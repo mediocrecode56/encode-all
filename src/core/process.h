@@ -36,7 +36,6 @@ public:
     void kill();
     bool suspend();
     bool resume();
-    bool suspended() const { return suspended_; }
     bool running() const;
 
 private:

@@ -213,6 +213,10 @@ static std::wstring describeA(const YtFormat& f) {
 
 std::string Selection::formatSpec() const { return audioId.empty() ? videoId : videoId + "+" + audioId; }
 
+// The channel count a CHANNELS choice changes the audio to; an unknown count counts as a change (the
+// conversion after the download sees the real one and copies when nothing changes).
+static int remixChoice(int channels, int want) { return want >= 1 && want <= 2 && channels != want ? want : 0; }
+
 Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
     Selection s;
     std::vector<const YtFormat*> vids, auds, combos;
@@ -292,10 +296,15 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
                     (prefs.out == DlOut::AudioOriginal ? s.ext.substr(1) + L" (as it comes, bit-for-bit)"
                      : prefs.out == DlOut::AudioMP3   ? std::wstring(L"MP3 320 kb/s (lossy)")
                                                       : std::wstring(L"WAV (exact decode)"));
-        s.brief = codecLabel(ac) + L" \u2192 " +
+        std::wstring layout = s.a.channels > 0 ? L" " + channelsLabel(s.a.channels) : L"";
+        // MP3 holds stereo at most; a CHANNELS choice applies to MP3 and WAV (Original stays as it comes).
+        int to = prefs.out == DlOut::AudioOriginal ? 0 : remixChoice(s.a.channels, prefs.channels);
+        if (prefs.out == DlOut::AudioMP3 && !to && s.a.channels > 2) to = 2;
+        s.brief = codecLabel(ac) + layout + L" \u2192 " +
                   (prefs.out == DlOut::AudioOriginal ? std::wstring(containerName(s.container)) + L" copy"
                    : prefs.out == DlOut::AudioMP3    ? std::wstring(L"MP3 320k")
-                                                     : std::wstring(L"WAV"));
+                                                     : std::wstring(L"WAV")) +
+                  (to ? L" " + channelsLabel(to) : L"");
         s.estBytes = s.a.bytes(info.duration);
         s.ok = true;
         return s;
@@ -322,8 +331,6 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
         return s;
     }
     std::string vc = normalizeYtCodec(s.v.vcodec), ac = s.audioId.empty() && !useCombo ? "" : normalizeYtCodec(s.a.acodec);
-    bool fitsMp4 = (vc != "unknown" && ac != "unknown") && ytCodecFitsMp4(vc, ac);
-    (void)fitsMp4;
     // The download is always the best streams, bit-for-bit, in their native container
     // (MKV when video and audio come from different families). MP4 and MOV convert afterwards.
     std::string ve = lower(s.v.ext), ae = lower(s.a.ext);
@@ -335,20 +342,22 @@ Selection selectFormats(const YtInfo& info, const DlPrefs& prefs) {
     if (s.ext.empty()) s.ext = containerExt(s.container);
     std::wstring streams = describeV(s.v) + (s.audioId.empty() ? L"" : L" + " + describeA(s.a));
     s.brief = (s.v.height ? resolutionLabel(s.v.width ? s.v.width : s.v.height * 16 / 9, s.v.height, s.v.fps) + L" " : L"") + codecLabel(vc) +
-              (hdr(s.v) ? L" HDR" : L"") + (ac.empty() ? L"" : L" + " + codecLabel(ac));
+              (hdr(s.v) ? L" HDR" : L"") + (ac.empty() ? L"" : L" + " + codecLabel(ac) + (s.a.channels > 0 ? L" " + channelsLabel(s.a.channels) : L""));
     if (prefs.out == DlOut::MP4 || prefs.out == DlOut::MOV) {
         bool mov = prefs.out == DlOut::MOV;
         s.finalExt = mov ? L".mov" : L".mp4";
         std::wstring codec = prefs.hevc ? L"H.265" : L"H.264";
         bool vCopy = vc == (prefs.hevc ? "hevc" : "h264");
-        bool aCopy = ac.empty() || ac == "aac" || (mov && (ac == "mp3" || ac == "ac3" || ac == "eac3" || ac == "alac"));
+        int to = ac.empty() ? 0 : remixChoice(s.a.channels, prefs.channels);
+        bool aCopy = !to && (ac.empty() || ac == "aac" || (mov && (ac == "mp3" || ac == "ac3" || ac == "eac3" || ac == "alac")));
         s.needsConvert = !vCopy || !aCopy || mov || s.container != Container::MP4;
         std::wstring crf = codec + L" CRF " + std::to_wstring(prefs.crf);
-        std::wstring aTo = mov ? L"PCM exact" : L"AAC 320k";
+        std::wstring aTo = std::wstring(mov ? L"PCM" : L"AAC 320k") + (to ? L" " + channelsLabel(to) : mov ? L" exact" : L"");
         std::wstring what = (vCopy ? codec + L" copied" : crf) + (ac.empty() ? L"" : aCopy ? L" + " + W(ac) + L" copied" : L" + " + aTo);
         s.summary = streams + (mov ? L" -> MOV (" : L" -> MP4 (") + what + L")";
-        std::wstring to = (vCopy ? std::wstring() : crf) + (ac.empty() || aCopy ? L"" : (vCopy ? L"" : L" + ") + (mov ? std::wstring(L"PCM") : std::wstring(L"AAC")));
-        s.brief += (mov ? L" \u2192 MOV " : L" \u2192 MP4 ") + (to.empty() ? std::wstring(L"copy") : to);
+        std::wstring aShort = std::wstring(mov ? L"PCM" : L"AAC") + (to ? L" " + channelsLabel(to) : L"");
+        std::wstring target = (vCopy ? std::wstring() : crf) + (ac.empty() || aCopy ? L"" : (vCopy ? L"" : L" + ") + aShort);
+        s.brief += (mov ? L" \u2192 MOV " : L" \u2192 MP4 ") + (target.empty() ? std::wstring(L"copy") : target);
         if (!vCopy || !aCopy)
             s.notes.push_back(L"Converted after download: " + std::wstring(vCopy ? L"" : L"video " + W(vc) + L" -> " + crf) + (!vCopy && !aCopy ? L", " : L"") +
                               (aCopy ? L"" : L"audio " + W(ac) + L" -> " + aTo) + L". Original keeps the source bit-for-bit.");

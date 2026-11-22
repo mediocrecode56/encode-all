@@ -74,6 +74,8 @@ std::wstring channelsLabel(int ch, const std::string& layout) {
         std::string l = layout.substr(0, layout.find('('));
         return widen(l);
     }
+    if (ch == 6) return L"5.1";  // the usual arrangement when only the count is known (yt-dlp formats)
+    if (ch == 8) return L"7.1";
     return std::to_wstring(ch) + L" ch";
 }
 

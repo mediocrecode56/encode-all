@@ -5,14 +5,15 @@ remux video and audio with yt-dlp, FFmpeg and FFprobe. Paste a link or drop a fi
 best source quality and tells you exactly what will happen before anything runs.
 
 ```
-ENCODE ALL v1.0.6                                                                      _  []  X
+ENCODE ALL v1.0.7                                                                      _  []  X
 [DOWNLOAD 2]  CONVERT   REMUX                                           (history) (log) (settings)
 [ (link)  Paste links, or type one and press Enter                                     paste ]
 VIDEO       [MP4|MOV|Original]  [H.264|H.265]  QUALITY [extreme|high|normal]
 AUDIO ONLY  [MP3 320|WAV|Original]
+SOUND       CHANNELS [source (5.1) v]
 LINKS  1 ready (~812 MiB)  .  1 running            [pause all]  [download all 1 (v)]
 [thumb]  A video title                                  ~812 MiB    (v) (open) (folder) (x)
-         03:12  .  2160p60 AV1 + Opus -> MP4 H.264 CRF 16 + AAC
+         03:12  .  2160p60 AV1 + Opus 5.1 -> MP4 H.264 CRF 16 + AAC
 [thumb]  Another title                          48%  12 MB/s  00:41  (||) (open) (folder) (x)
          downloading  ________________
 ```
@@ -25,6 +26,7 @@ LINKS  1 ready (~812 MiB)  .  1 running            [pause all]  [download all 1 
   - **MOV**: the same video choices, with exact audio (copied, or PCM when MOV cannot hold it). Good for editing.
   - **Original**: the best quality exactly as it comes (VP9, AV1, Opus...), bit-for-bit.
 - **AUDIO ONLY** (no video is downloaded): **MP3 320** (labelled lossy; MP3 cannot be bit-exact), **WAV** (exact decode), **Original** (the audio stream bit-for-bit).
+- **SOUND**: CHANNELS shows what the link carries (mono, stereo, 5.1) and keeps it (**source**), or makes the audio **stereo** or **mono** for MP4, MOV, MP3 and WAV. Original outputs stay as they come.
 - Segments are cut at keyframes with stream copy, so they can start a little early rather than being re-encoded.
 - Fast and resilient: 8 parallel fragments, retries, resumable `.part` files, automatic yt-dlp update and retry when a site changes, sign-in cookies from your browser for private or age-restricted videos.
 
@@ -34,7 +36,7 @@ LINKS  1 ready (~812 MiB)  .  1 running            [pause all]  [download all 1 
 - Separate CRF and Mbps controls: quality or lossless, average bitrate target, or maximum video bitrate cap. The footer estimates the pending outputs. MP4 and MOV always use Faststart.
 - Choose a portrait, landscape, source-aspect or custom canvas. Fit keeps the whole image, Fill crops to cover, Stretch changes proportions, and Centered crops or pads without zoom. Preview renders a random frame with the selected filters; it does not simulate compression or HDR playback.
 - AAC, exact PCM or copied audio. WAV, FLAC and MP3 hold one track; use a video target or Remux for multi-track input.
-- Filters, each its own dropdown: PICTURE size (up to 8K or custom), frame rate, pixel format (8/10-bit, 4:2:0/4:2:2/4:4:4), deinterlace (auto, every frame, double rate), rotate or mirror, denoise, sharpen; SOUND channels (stereo or mono downmix), loudness (-23, -16 or -14 LUFS), sample rate for audio files.
+- Filters, each its own dropdown: PICTURE size (up to 8K or custom), frame rate, pixel format (8/10-bit, 4:2:0/4:2:2/4:4:4), deinterlace (auto, every frame, double rate), rotate or mirror, denoise, sharpen; SOUND channels (source, stereo or mono; the box names what the files hold, such as "source (5.1)"), loudness (-23, -16 or -14 LUFS), sample rate for audio files.
 - Odd frame sizes, rotated phone clips, 192 kHz or surround audio are handled: the plan says what is cropped, turned, resampled or downmixed so the output always plays.
 - Presets: lossless, max quality, balanced, compact, plus your own saved presets.
 - Every plan is labelled **STREAM COPY**, **LOSSLESS ENCODE** or **LOSSY ENCODE**, lists what happens to each stream, estimates the size (variable-bitrate estimates are marked), warns about bitrates above what the source needs, upscaling, bit-depth or chroma loss, and recommends Remux when the codec already matches.
@@ -43,6 +45,7 @@ LINKS  1 ready (~812 MiB)  .  1 running            [pause all]  [download all 1 
 ## Remux
 - Change container without re-encoding: MP4 or MOV.
 - Audio: **Original** (copied bit-for-bit; exact PCM only where the container cannot hold a track), **Linear PCM** for every track (exact, 16-bit, 24-bit or 32-bit float), or **AAC** 128/192/256/320k (labelled lossy; AAC tracks stay copied; surround gets a rate per channel).
+- CHANNELS (as on Download and Convert): **source** keeps every track as it is; **stereo** or **mono** converts the tracks that differ (AAC in MP4, exact PCM in MOV). A track set to COPY stays bit-for-bit.
 - Every track can be copied, decoded to PCM, encoded to AAC, converted to text subtitles, or excluded. Incompatibilities are listed before you start (with MOV or MP4 one click away when it keeps everything). Nothing is dropped silently.
 
 ## One list per section

@@ -156,7 +156,7 @@ ConvertSpec ConvertSpec::fromJson(const json::Value& v) {
     s.bitDepth = (int)v["bitDepth"].num(0);
     if (s.bitDepth != 16 && s.bitDepth != 24 && s.bitDepth != 32) s.bitDepth = 0;
     s.sampleRate = std::clamp((int)v["sampleRate"].num(0), 0, 384000);
-    s.channels = std::clamp((int)v["channels"].num(0), 0, 8);
+    s.channels = std::clamp((int)v["channels"].num(0), 0, 2);
     s.keepSubs = v["keepSubs"].boolean(true);
     s.deinterlace = clampEnum(v["deinterlace"].num(0), 3);
     s.rotate = clampEnum(v["rotate"].num(0), 5);
@@ -172,6 +172,7 @@ json::Value RemuxSpec::toJson() const {
     v.set("audio", (int)audio);
     v.set("pcmBits", pcmBits);
     v.set("aacKbps", aacKbps);
+    v.set("channels", channels);
     v.set("chapters", chapters);
     v.set("faststart", faststart);
     json::Value a = json::Value::object();
@@ -188,6 +189,7 @@ RemuxSpec RemuxSpec::fromJson(const json::Value& v) {
     s.pcmBits = (int)v["pcmBits"].num(0);
     if (s.pcmBits != 16 && s.pcmBits != 24 && s.pcmBits != 32) s.pcmBits = 0;
     s.aacKbps = std::clamp((int)v["aacKbps"].num(256), 64, 512);
+    s.channels = std::clamp((int)v["channels"].num(0), 0, 2);
     s.chapters = v["chapters"].boolean(true);
     s.faststart = v["faststart"].boolean(true);
     for (auto& kv : v["actions"].o) s.actions[atoi(kv.first.c_str())] = (TrackAction)std::clamp((int)kv.second.num(0), 0, 4);
@@ -429,6 +431,20 @@ static int mp3SampleRate(int sr) {
 
 static std::wstring chName(int ch) { return ch == 1 ? L"mono" : ch == 2 ? L"stereo" : I(ch) + L" channels"; }
 
+int remixTo(int src, int want) { return want >= 1 && want <= 2 && src > 0 && want != src ? want : 0; }
+
+const wchar_t* channelsChoiceName(int want) { return want == 1 ? L"mono" : want == 2 ? L"stereo" : L"source"; }
+
+static std::wstring remixText(const StreamInfo& st, int to) { return channelsLabel(st.channels, st.layout) + L" to " + chName(to); }
+
+// A channel change for one output stream: downmixes by -ac (FFmpeg's standard matrix); mono to stereo
+// duplicates the channel with pan (exact samples, no level change), placed before any other filter.
+static void remixArgs(Plan& p, const std::wstring& idx, int from, int to, std::string& filter) {
+    if (!to) return;
+    if (from == 1 && to == 2) filter = "pan=stereo|c0=c0|c1=c0" + (filter.empty() ? "" : "," + filter);
+    else p.args.insert(p.args.end(), {L"-ac:" + idx, I(to)});
+}
+
 // Loudness normalisation (loudnorm resamples to 192 kHz inside; the output goes back to `rate`).
 static std::string audioFilter(const ConvertSpec& s, int rate) {
     if (!s.loudness) return "";
@@ -476,18 +492,20 @@ static void expectLanguage(OutExpect& e, Container c, const StreamInfo& st) {
 
 // AAC for one stream: the rate and channels the encoder takes, the bitrate for those channels.
 // Returns the output bitrate; `what` says what was done.
-static double addAac(Plan& p, const StreamInfo& st, const std::wstring& idx, int quality, int wantCh, const std::string& filter, std::wstring& what) {
+// `wantCh`: the new channel count (remixTo), 0 keeps the source's.
+static double addAac(Plan& p, const StreamInfo& st, const std::wstring& idx, int quality, int wantCh, std::string filter, std::wstring& what) {
     int ch = wantCh ? wantCh : st.channels > 0 ? st.channels : 2;
     int sr = st.sampleRate > 0 ? aacSampleRate(st.sampleRate) : 0;
     int kbps = aacKbpsFor(quality, ch);
     p.args.insert(p.args.end(), {L"-c:" + idx, L"aac", L"-b:" + idx, I(kbps) + L"k"});
-    if (ch != st.channels) p.args.insert(p.args.end(), {L"-ac:" + idx, I(ch)});
+    remixArgs(p, idx, st.channels, wantCh, filter);
     if (sr && sr != st.sampleRate) {
         p.args.insert(p.args.end(), {L"-ar:" + idx, I(sr)});
         p.warnings.push_back(describeStream(st) + L": AAC cannot store " + I(st.sampleRate) + L" Hz; resampled to " + I(sr) + L" Hz.");
     }
     if (!filter.empty()) p.args.insert(p.args.end(), {L"-filter:" + idx, W(filter)});
-    what = L"AAC " + I(kbps) + L" kb/s" + (ch != st.channels ? L" " + chName(ch) : L"") + (sr && sr != st.sampleRate ? L" " + I(sr) + L" Hz" : L"");
+    what = L"AAC " + I(kbps) + L" kb/s" + (wantCh ? L", " + remixText(st, wantCh) : ch != st.channels ? L" " + chName(ch) : L"") +
+           (sr && sr != st.sampleRate ? L" " + I(sr) + L" Hz" : L"");
     p.expect.push_back(audioExpect(st, "aac", wantCh, sr));
     return kbps * 1000.0;
 }
@@ -521,7 +539,7 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
     p.args = {L"-map", L"0:" + I(a.index)};
     // Output rate and channels: the user's choice, else the source, within what the format holds.
     int sr = s.sampleRate ? s.sampleRate : a.sampleRate;
-    int ch = s.channels && s.channels < a.channels ? s.channels : a.channels;
+    int ch = remixTo(a.channels, s.channels) ? s.channels : a.channels;
     if (s.audio == AudioTarget::MP3) {
         if (ch > 2) {
             ch = 2;
@@ -619,15 +637,14 @@ static Plan planAudioTarget(const MediaInfo& m, const ConvertSpec& s) {
         line += L", resampled to " + I(sr) + L" Hz";
         if (s.sampleRate) p.warnings.push_back(L"Resampling changes every sample (not lossless).");
     }
+    if (!filter.empty()) line += L", loudness " + loudnessName(s.loudness);
     if (remix) {
-        p.args.insert(p.args.end(), {L"-ac:0", I(ch)});
-        line += L", " + chName(ch);
-        if (s.channels) p.warnings.push_back(L"Channel downmix/upmix is not lossless.");
+        remixArgs(p, L"0", a.channels, ch, filter);
+        line += L", " + remixText(a, ch);
+        if (s.channels) p.warnings.push_back(a.channels == 1 ? L"Mono to stereo copies the one channel to both sides; the file is larger with nothing added."
+                                                             : L"A downmix mixes the channels together: not lossless.");
     }
-    if (!filter.empty()) {
-        p.args.insert(p.args.end(), {L"-filter:0", W(filter)});
-        line += L", loudness " + loudnessName(s.loudness);
-    }
+    if (!filter.empty()) p.args.insert(p.args.end(), {L"-filter:0", W(filter)});
     p.lines.push_back(line);
     p.expect.push_back(ex);
     int o = 1;
@@ -953,11 +970,10 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
             }
         } else if (st.isAudio()) {
             p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
-            int ch = s.channels && st.channels && s.channels < st.channels ? s.channels : 0;  // downmix only, never upmix
+            int ch = remixTo(st.channels, s.channels);  // 0: the source's channels
             bool fxNeeded = s.loudness || ch;
             std::wstring fx;
             if (s.loudness) fx += L", loudness " + loudnessName(s.loudness);
-            if (ch && ch != st.channels) fx += L", " + chName(ch);
             Fit fit = fitStream(c, st);
             ACodec act = s.acodec;
             std::wstring reason;
@@ -999,15 +1015,15 @@ Plan planConvert(const MediaInfo& m, const ConvertSpec& s, const EncoderCaps& ca
                 std::string pc = pcmCodecFor(st, bits);
                 std::string filter = audioFilter(s, st.sampleRate);
                 p.args.insert(p.args.end(), {L"-c:" + idx, W(pc)});
-                if (ch && ch != st.channels) p.args.insert(p.args.end(), {L"-ac:" + idx, I(ch)});
+                remixArgs(p, idx, st.channels, ch, filter);
                 if (!filter.empty()) p.args.insert(p.args.end(), {L"-filter:" + idx, W(filter)});
-                p.lines.push_back(L"audio #" + I(st.index) + L": " + W(st.codec) + L" -> " + W(pc) + fx + reason);
+                p.lines.push_back(L"audio #" + I(st.index) + L": " + W(st.codec) + L" -> " + W(pc) + (ch ? L", " + remixText(st, ch) : L"") + fx + reason);
                 anyEncode = true;
                 if (!pcmExact(st, bits)) {
                     anyLossy = true;
                     p.warnings.push_back(L"Audio #" + I(st.index) + L": " + I(s.pcmBits) + L"-bit PCM rounds the samples; 'exact' keeps them identical.");
                 }
-                if (!filter.empty() || (ch && ch != st.channels)) anyLossy = true;
+                if (!filter.empty() || ch) anyLossy = true;
                 p.expect.push_back(audioExpect(st, pc, ch));
                 bps += pcmBitrate(st, pc, 0, ch);
             }
@@ -1129,6 +1145,19 @@ std::vector<TrackAction> allowedActions(Container c, const StreamInfo& s) {
     return r;
 }
 
+TrackAction remuxTrack(const RemuxSpec& s, const StreamInfo& st, int* to) {
+    Container c = s.container;
+    auto allowed = allowedActions(c, st);
+    auto it = s.actions.find(st.index);
+    bool own = it != s.actions.end() && std::find(allowed.begin(), allowed.end(), it->second) != allowed.end();
+    TrackAction a = own ? it->second : defaultAction(c, st, s.audio);
+    int n = st.isAudio() && a != TrackAction::Exclude && !(own && a == TrackAction::Copy) ? remixTo(st.channels, s.channels) : 0;
+    // Mixing channels needs decoded samples: the compact codec where MP4 (or the AAC mode) wants one, exact PCM in MOV.
+    if (n && a == TrackAction::Copy) a = c == Container::MP4 || s.audio == RemuxAudio::AAC ? TrackAction::ToAAC : TrackAction::ToPCM;
+    if (to) *to = n;
+    return a;
+}
+
 Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
     Plan p;
     if (!m.ok) {
@@ -1141,10 +1170,8 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
     bool anyLossy = false, anyEncode = false;
     double bps = 0;
     for (const auto& st : m.streams) {
-        auto it = s.actions.find(st.index);
-        TrackAction a = it != s.actions.end() ? it->second : defaultAction(c, st, s.audio);
-        auto allowed = allowedActions(c, st);
-        if (std::find(allowed.begin(), allowed.end(), a) == allowed.end()) a = defaultAction(c, st, s.audio);
+        int to = 0;
+        TrackAction a = remuxTrack(s, st, &to);
         std::wstring idx = I(o), d = describeStream(st);
         if (a == TrackAction::Exclude && st.codec == "bin_data" && m.chapters) {
             p.lines.push_back(d + L"  ->  chapter text track (chapters are carried separately)");
@@ -1156,9 +1183,9 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
             if (f == Fit::No && st.type != "data") p.warnings.push_back(d + L" is left out: " + containerName(c) + L" cannot hold it.");
             continue;
         }
-        bool layoutFallback = a == TrackAction::ToAAC && !aacKeepsLayout(st);
+        bool layoutFallback = a == TrackAction::ToAAC && !aacKeepsLayout(st, to);
         if (layoutFallback) {
-            a = fitStream(c, st) == Fit::Copy ? TrackAction::Copy : TrackAction::ToPCM;
+            a = fitStream(c, st) == Fit::Copy && !to ? TrackAction::Copy : TrackAction::ToPCM;
             p.warnings.push_back(d + L": AAC would not preserve this channel layout; using " + trackActionName(a) + L" instead.");
         }
         p.args.insert(p.args.end(), {L"-map", L"0:" + I(st.index)});
@@ -1174,22 +1201,26 @@ Plan planRemux(const MediaInfo& m, const RemuxSpec& s) {
                 break;
             case TrackAction::ToPCM: {
                 int bits = layoutFallback ? 0 : s.pcmBits;
-                std::string pc = pcmCodecFor(st, bits);
+                std::string pc = pcmCodecFor(st, bits), filter;
                 p.args.insert(p.args.end(), {L"-c:" + idx, W(pc)});
+                remixArgs(p, idx, st.channels, to, filter);
+                if (!filter.empty()) p.args.insert(p.args.end(), {L"-filter:" + idx, W(filter)});
                 bool exact = pcmExact(st, bits);
-                p.lines.push_back(d + L"  ->  " + W(pc) + (exact ? L" (exact decode, lossless)" : L" (samples rounded)"));
+                p.lines.push_back(d + L"  ->  " + W(pc) + (to ? L", " + remixText(st, to) + L" (lossy: channels mixed)"
+                                                            : exact ? L" (exact decode, lossless)" : L" (samples rounded)"));
                 if (!exact) {
                     anyLossy = true;
                     p.warnings.push_back(d + L": " + I(s.pcmBits) + L"-bit PCM rounds the samples; 'exact' keeps them identical.");
                 }
+                if (to) anyLossy = true;
                 anyEncode = true;
-                p.expect.push_back(audioExpect(st, pc));
-                bps += pcmBitrate(st, pc, 0, 0);
+                p.expect.push_back(audioExpect(st, pc, to));
+                bps += pcmBitrate(st, pc, 0, to);
                 break;
             }
             case TrackAction::ToAAC: {
                 std::wstring what;
-                bps += addAac(p, st, idx, s.aacKbps, 0, "", what);
+                bps += addAac(p, st, idx, s.aacKbps, to, "", what);
                 p.lines.push_back(d + L"  ->  " + what + L" (lossy)");
                 if (st.lossyAudio()) p.warnings.push_back(d + L" is already lossy: AAC adds a second generation of loss.");
                 anyLossy = true;

@@ -19,6 +19,7 @@ struct Settings {
     DlOut dlOut = DlOut::MP4;
     int dlCrf = 16;  // MP4/MOV download quality: 12 extreme, 14 high, 16 normal
     bool dlHevc = false;  // MP4/MOV download codec: H.265 instead of H.264
+    int dlChannels = 0;   // 0 source (copied), 1 mono, 2 stereo; MP4, MOV, MP3 and WAV (Original stays as it comes)
     bool metadata = true, chapters = true, thumbnail = false, subs = false;
     int fragments = 8;
     std::wstring cookiesBrowser, cookiesFile;
@@ -33,6 +34,8 @@ struct Settings {
     RemuxAudio remuxAudio = RemuxAudio::Original;  // Remux audio: original, every track to linear PCM, or to AAC
     int remuxPcmBits = 0;    // 0 exact, 16, 24, 32 (float)
     int remuxAacKbps = 256;  // AAC quality (stereo bitrate; aacKbpsFor scales it per channel)
+    int remuxChannels = 0;   // 0 source, 1 mono, 2 stereo
+    RemuxSpec remuxSpec(const RemuxSpec& tracks) const;  // the track choices with the Remux options above
     Accel encoder = Accel::Auto;  // every encode: Auto = fastest available (GPU first); set only in Settings
     int winX = INT32_MIN, winY = INT32_MIN, winW = 0, winH = 0;
     bool winMax = false;

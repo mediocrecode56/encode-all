@@ -49,15 +49,6 @@ const char* containerMuxer(Container c) {
     return "";
 }
 
-bool containerFromName(const std::wstring& s, Container& out) {
-    for (int i = 0; i <= (int)Container::WEBM; i++)
-        if (lower(s) == lower(containerName((Container)i))) {
-            out = (Container)i;
-            return true;
-        }
-    return false;
-}
-
 static bool in(const std::string& c, std::initializer_list<const char*> l) {
     for (auto x : l)
         if (c == x) return true;

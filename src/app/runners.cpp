@@ -50,6 +50,7 @@ json::Value makeDownloadSpec(const Settings& s, const std::wstring& url, const s
     v.set("keepAudioSource", s.keepAudioSource);
     v.set("crf", s.dlCrf);
     v.set("hevc", s.dlHevc);
+    if (s.dlOut != DlOut::Original && s.dlOut != DlOut::AudioOriginal) v.set("channels", s.dlChannels);
     if (!infoFile.empty()) {
         v.set("infoFile", infoFile);
         v.set("infoTime", (long long)nowUnix());
@@ -378,11 +379,19 @@ RunResult runDownload(RunCtx& c) {
             if (changed) {
                 c.specSet("infoFile", "");
                 r.retryNow = true;
+            } else if (contains(lower(errText), "http error 403")) {
+                // A refused stream URL is often a one-off: read the link again (fresh URLs) and retry, twice at most.
+                c.specSet("infoFile", "");
+                r.retryAfterMs = 4000 * (c.t.autoRetries + 1);
+                r.hint = L"The site refused the stream (HTTP 403). Encode All reads the link again and retries.";
             } else {
                 r.hint = L"yt-dlp is already the newest build and still cannot read this page. Try again later; the fix usually ships within days.";
             }
         } else if (e == DlError::Network) {
             r.retryAfterMs = 5000 * (c.t.autoRetries + 1);
+        } else if (e == DlError::Extraction && contains(lower(errText), "http error 403")) {
+            c.specSet("infoFile", "");  // yt-dlp was updated on an earlier try: fresh URLs are all that is left
+            r.retryAfterMs = 4000 * (c.t.autoRetries + 1);
         } else if (e == DlError::Format && !c.t.triedUpdate) {
             c.t.triedUpdate = true;
             c.specSet("infoFile", "");
@@ -422,6 +431,7 @@ RunResult runDownload(RunCtx& c) {
     prefs.preferH264 = sp["preferH264"].boolean(true);
     prefs.crf = std::clamp((int)sp["crf"].num(16), 0, 51);
     prefs.hevc = sp["hevc"].boolean(false);
+    prefs.channels = out == DlOut::Original || out == DlOut::AudioOriginal ? 0 : std::clamp((int)sp["channels"].num(0), 0, 2);
     Selection sel = selectFormats(yr.info, prefs);
     if (!sel.ok) return fail(sel.error);
     c.setTitle(widen(yr.info.title));
@@ -569,6 +579,7 @@ RunResult runDownload(RunCtx& c) {
         cs.quality = prefs.crf;
         cs.speed = "slow";  // slow for downloads: best quality per bit at these CRFs (NVENC p6)
         cs.accel = c.t.triedSoftware ? Accel::Software : c.settings.encoder;  // fastest encoder unless Settings says otherwise
+        cs.channels = prefs.channels;  // a change re-encodes the audio (AAC in MP4, exact PCM in MOV)
         if (out == DlOut::MP4) {
             cs.acodec = !au || au->codec == "aac" ? ACodec::Copy : ACodec::AAC;
             cs.aacKbps = 320;  // stereo 320k, mono 160k, surround 80k per channel (aacKbpsFor)
@@ -597,6 +608,7 @@ RunResult runDownload(RunCtx& c) {
         cs.audio = out == DlOut::AudioMP3 ? AudioTarget::MP3 : AudioTarget::WAV;
         cs.mp3Vbr = false;
         cs.mp3Kbps = 320;
+        cs.channels = prefs.channels;
         Plan plan = planConvert(mi, cs, EncoderCaps());
         if (!plan.ok) return fail(plan.error);
         c.setClass(plan.cls);

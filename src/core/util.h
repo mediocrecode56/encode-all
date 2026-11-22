@@ -16,7 +16,6 @@ std::string lower(std::string s);
 bool startsWith(const std::wstring& s, const std::wstring& p);
 bool startsWith(const std::string& s, const std::string& p);
 bool contains(const std::string& s, const std::string& needle);
-bool icontains(const std::string& s, const std::string& needle);
 std::vector<std::wstring> splitLines(const std::wstring& s);
 std::vector<std::string> split(const std::string& s, char sep);
 std::wstring replaceAll(std::wstring s, const std::wstring& from, const std::wstring& to);
@@ -27,7 +26,6 @@ std::wstring fmtBitrate(double bps);       // 8.2 Mb/s
 std::wstring fmtDuration(double seconds);  // 03:12 or 1:02:03
 std::wstring fmtFixed(double v, int decimals);
 std::wstring fmtFps(double fps);           // 23.976, 30, 59.94
-std::wstring padRight(const std::wstring& s, size_t width);
 std::wstring ellipsize(const std::wstring& s, size_t width);
 
 // "1:02:03.5", "02:03", "90", "90.5". Returns false on junk.

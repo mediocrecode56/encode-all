@@ -208,10 +208,12 @@ static void convertCase(Queue& q, const std::string& name, const std::wstring& i
     matrixCheck(q, name, TaskKind::Convert, convertSpec(in, cs), w);
 }
 
-static void remuxCase(Queue& q, const std::string& name, const std::wstring& in, Container c, RemuxAudio audio, int bitsOrKbps, const Want& w) {
+static void remuxCase(Queue& q, const std::string& name, const std::wstring& in, Container c, RemuxAudio audio, int bitsOrKbps, const Want& w,
+                      int channels = 0) {
     RemuxSpec r;
     r.container = c;
     r.audio = audio;
+    r.channels = channels;
     if (audio == RemuxAudio::PCM) r.pcmBits = bitsOrKbps;
     if (audio == RemuxAudio::AAC) r.aacKbps = bitsOrKbps;
     json::Value v = json::Value::object();
@@ -487,6 +489,15 @@ static void runMatrix(Queue& q) {
         convertCase(q, "ALAC with cover -> WAV (cover dropped)", alac, a, aw(L".wav", "pcm_s16le", 2, 44100, QC::Lossless, 0));
         a = ConvertSpec();
         a.audio = AudioTarget::WAV;
+        a.channels = 2;
+        convertCase(q, "mono MP3 -> WAV stereo (the channel duplicated)", mono, a, aw(L".wav", "pcm_f32le", 2, 22050, QC::Lossy));
+        a.audio = AudioTarget::MP3;
+        convertCase(q, "mono MP3 -> MP3 stereo (encoded)", mono, a, aw(L".mp3", "mp3", 2, 22050, QC::Lossy));
+        a.audio = AudioTarget::FLAC;
+        a.channels = 1;
+        convertCase(q, "192 kHz 5.1 FLAC -> FLAC mono", hiFlac, a, aw(L".flac", "flac", 1, 192000, QC::Lossy));
+        a = ConvertSpec();
+        a.audio = AudioTarget::WAV;
         MediaInfo multiInfo;
         CHECK(probeFile(gDeps.ffprobe(), multi, multiInfo) && !planConvert(multiInfo, a, {}).ok,
               "multi -> WAV refused before dropping a track");
@@ -562,6 +573,21 @@ static void runMatrix(Queue& q) {
         a.covers = 1;
         a.cls = QC::Lossy;
         remuxCase(q, "ALAC with cover -> MP4 AAC (cover kept)", alac, Container::MP4, RemuxAudio::AAC, 256, a);
+        // CHANNELS: a track that changes is encoded (AAC in MP4, exact PCM in MOV); one already there is copied.
+        w = vw(L".mp4", "mpeg2video", 720, 576, 8, "420", {"aac"});
+        w.ach = 2;
+        remuxCase(q, "interlaced MKV (AC-3 5.1) -> MP4 stereo (AAC)", inter, Container::MP4, RemuxAudio::Original, 0, w, 2);
+        w = vw(L".mov", "mpeg2video", 720, 576, 8, "420", {"pcm_f32le"});
+        w.ach = 1;
+        remuxCase(q, "interlaced MKV (AC-3 5.1) -> MOV mono (exact PCM)", inter, Container::MOV, RemuxAudio::Original, 0, w, 1);
+        a.acodecs = {"alac"};
+        a.ach = 2;
+        a.cls = QC::Copy;
+        remuxCase(q, "ALAC stereo with cover -> MP4 stereo (already stereo: copied)", alac, Container::MP4, RemuxAudio::Original, 0, a, 2);
+        a.acodecs = {"aac"};
+        a.ach = 1;
+        a.cls = QC::Lossy;
+        remuxCase(q, "ALAC stereo with cover -> MP4 AAC mono", alac, Container::MP4, RemuxAudio::AAC, 256, a, 1);
     }
     printf("  matrix: %d of %d outputs correct\n", gMatrixOk, gMatrixRun);
 }
@@ -789,9 +815,15 @@ int wmain(int argc, wchar_t** argv) {
         for (auto id : {sel.videoId, sel.audioId}) {
             if (id.empty()) continue;
             std::wstring out = joinPath(raw, widen(id) + L".bin");
-            auto c = runCapture(gDeps.ytdlp(), {L"--ignore-config", L"-f", widen(id), L"--js-runtimes", L"deno:" + gDeps.deno(), L"--ffmpeg-location",
-                                                 gDeps.ffmpegDir(), L"-o", out, L"--no-part", L"--fixup", L"never", url},
-                                {}, 300000);
+            // YouTube refuses a stream URL now and then (HTTP 403): the reference fetch gets two more tries, as the app's downloads do.
+            Capture c;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                c = runCapture(gDeps.ytdlp(), {L"--ignore-config", L"-f", widen(id), L"--js-runtimes", L"deno:" + gDeps.deno(), L"--ffmpeg-location",
+                                               gDeps.ffmpegDir(), L"-o", out, L"--no-part", L"--fixup", L"never", url},
+                               {}, 300000);
+                if (c.code == 0 || c.err.find("HTTP Error 403") == std::string::npos) break;
+                Sleep(4000 * (attempt + 1));
+            }
             if (c.code != 0) {
                 printf("    raw fetch failed: %s\n", c.err.substr(0, 300).c_str());
                 same = false;
@@ -811,6 +843,17 @@ int wmain(int argc, wchar_t** argv) {
         gSettings.dlOut = DlOut::AudioMP3;
         CHECK(runTask(q, TaskKind::Download, makeDownloadSpec(gSettings, url, L"", L"", L""), t, 600), "MP3 download finished");
         CHECK(extension(t.output) == L".mp3" && t.cls == QualityClass::Lossy, "MP3 output labelled lossy");
+        // CHANNELS on downloads: mono MP3, and an H.264/AAC source into MP4 with the video copied and the audio mixed to mono.
+        gSettings.dlChannels = 1;
+        CHECK(runTask(q, TaskKind::Download, makeDownloadSpec(gSettings, url, L"", L"", L""), t, 600), "MP3 mono download finished");
+        probeFile(gDeps.ffprobe(), t.output, m);
+        CHECK(m.audio() && m.audio()->codec == "mp3" && m.audio()->channels == 1, "MP3 download mixed to mono");
+        gSettings.dlOut = DlOut::MP4;
+        CHECK(runTask(q, TaskKind::Download, makeDownloadSpec(gSettings, url, L"", L"", L""), t, 600), "MP4 mono download finished");
+        probeFile(gDeps.ffprobe(), t.output, m);
+        CHECK(m.video() && m.video()->codec == "h264" && m.audio() && m.audio()->codec == "aac" && m.audio()->channels == 1 && t.cls == QualityClass::Lossy,
+              "MP4 download: video copied, AAC mixed to mono, labelled lossy");
+        gSettings.dlChannels = 0;
         gSettings.dlOut = DlOut::MOV;
         CHECK(runTask(q, TaskKind::Download, makeDownloadSpec(gSettings, url, L"", L"", L""), t, 600), "MOV lossless download finished");
         CHECK(extension(t.output) == L".mov" && t.cls == QualityClass::Copy, "H.264/AAC source goes into MOV bit-for-bit");

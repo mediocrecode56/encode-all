@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.7 - 2026-11-23
+- First published release since 1.0.5: it also carries everything in 1.0.6 (conversion preview and canvases, CRF/Mbps controls, audio track integrity, Auto Repair), listed below.
+- Audio channels in every section: Download, Convert and Remux each have a SOUND row with CHANNELS. The box names what the source holds ("source (5.1)", "source (stereo, mono)" for several files, the selected one first) and keeps it, or makes every audio track stereo or mono. Downmixes use FFmpeg's standard matrix; mono to stereo copies the channel to both sides (no level drop). A track that changes is re-encoded and labelled lossy (AAC in MP4, exact PCM in MOV, the target codec for audio files); a track already at that count is not touched.
+  - Download: MP4, MOV, MP3 and WAV (Original stays as it comes, and the box says so). Rows show the source's channels ("AAC stereo", "Opus 5.1") and what they become ("→ MP4 AAC mono").
+  - Convert: mono sources can now become stereo (before, CHANNELS only downmixed).
+  - Remux: tracks that change become AAC in MP4 (or with AUDIO on AAC) and exact PCM in MOV; a track set to COPY in its details stays bit-for-bit. The track list shows the result ("AAC 256k stereo").
+- UI: Convert's PICTURE lines stay in place for every target, greyed when the video is not encoded, so the list no longer jumps when you switch to an audio or copy target. Greyed dropdowns for options that do not apply. One SOUND row per section with CHANNELS in the same place; row notes share one style.
+- Downloads: a stream refused with HTTP 403 (YouTube does this now and then) is read again with fresh URLs and retried twice, instead of failing when yt-dlp is already current. Found by the integration run on 1.0.6.
+- Cleanup: one helper builds the Remux spec from the settings (it was copied in four places), unused helpers and fields removed (`containerFromName`, `padRight`, `icontains`, `hasAudioFilters`, three window fields).
+- Tests: unit checks for channel plans (downmix, mono to stereo, copy when unchanged, Remux overrides, download selection); integration cases for Remux to stereo and mono, mono to stereo WAV and MP3, FLAC mono, and MP3 and MP4 downloads mixed to mono. The bit-identity check's own reference fetch retries a YouTube 403 too.
+
 ## 1.0.6 - 2026-11-22
 - Convert: portrait and landscape canvases, custom resolutions, Fit, Fill, Stretch and Centered, and a random-frame preview rendered with the conversion's filters. MP4 and MOV always use Faststart.
 - Separate CRF and Mbps controls, with average targets and maximum video bitrate caps. Convert shows an estimated total for pending files and identifies content-dependent estimates.

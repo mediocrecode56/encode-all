@@ -47,7 +47,6 @@ std::string lower(std::string s) {
 bool startsWith(const std::wstring& s, const std::wstring& p) { return s.compare(0, p.size(), p) == 0; }
 bool startsWith(const std::string& s, const std::string& p) { return s.compare(0, p.size(), p) == 0; }
 bool contains(const std::string& s, const std::string& n) { return s.find(n) != std::string::npos; }
-bool icontains(const std::string& s, const std::string& n) { return lower(s).find(lower(n)) != std::string::npos; }
 
 std::vector<std::wstring> splitLines(const std::wstring& s) {
     std::vector<std::wstring> out;
@@ -127,11 +126,6 @@ std::wstring fmtFps(double f) {
     std::wstring s = fmtFixed(f, 3);
     while (!s.empty() && s.back() == L'0') s.pop_back();
     return s;
-}
-
-std::wstring padRight(const std::wstring& s, size_t w) {
-    if (s.size() >= w) return s;
-    return s + std::wstring(w - s.size(), L' ');
 }
 
 std::wstring ellipsize(const std::wstring& s, size_t w) {

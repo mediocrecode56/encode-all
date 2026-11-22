@@ -96,8 +96,11 @@ DlPrefs dlPrefs(const Settings& s) {
     p.preferH264 = (s.dlOut == DlOut::MP4 || s.dlOut == DlOut::MOV) && !s.dlHevc;
     p.crf = s.dlCrf;
     p.hevc = s.dlHevc;
+    p.channels = s.dlOut == DlOut::Original || s.dlOut == DlOut::AudioOriginal ? 0 : s.dlChannels;
     return p;
 }
+
+const int kChannelValues[] = {0, 2, 1};  // the CHANNELS list: source, stereo, mono
 
 // "C:\clip.mkv" -> "MKV" (the tag a file shows where a download shows its thumbnail).
 std::wstring extTag(const std::wstring& path) {
@@ -135,6 +138,48 @@ bool applyRanges(DlGroup& g, const std::wstring& text) {
     for (int i : idx) want[i] = 1;
     for (size_t e = 0; e < g.entries.size() && e < g.checked.size(); e++) g.checked[e] = g.entries[e].index > 0 && want[g.entries[e].index];
     return true;
+}
+
+std::wstring MainWindow::sourceLayouts(int tab) {
+    std::vector<std::wstring> found;
+    auto put = [&](const std::wstring& l) {
+        if (std::find(found.begin(), found.end(), l) == found.end()) found.push_back(l);
+    };
+    const RowId& sel = sel_[tab];
+    DlPrefs prefs = dlPrefs(view_);
+    // The selected item first; when it says nothing (none selected, a task, still reading), every pending item.
+    for (int pass = 0; pass < 2 && found.empty(); pass++) {
+        auto wanted = [&](uint64_t key) { return pass == 1 || (!sel.task && sel.key == key); };
+        if (tab == 0) {
+            for (auto& g : groups_) {
+                if (!wanted(g.key) || g.busy || !g.error.empty() || g.playlist) continue;
+                Selection sl = selectFormats(g.info, prefs);
+                if (sl.ok && sl.a.channels > 0) put(channelsLabel(sl.a.channels));
+            }
+        } else {
+            for (auto& f : tab == 2 ? remux_ : conv_) {
+                if (!wanted(f.key) || !f.info.ok) continue;
+                for (auto& st : f.info.streams)
+                    if (st.isAudio() && st.channels > 0) put(channelsLabel(st.channels, st.layout));
+            }
+        }
+    }
+    if (found.size() > 3) return L"mixed";
+    std::wstring r;
+    for (auto& l : found) r += (r.empty() ? L"" : L", ") + l;
+    return r;
+}
+
+void MainWindow::channelsField(int& x, int& y, int left, int right, int cur, const std::wstring& sources, bool enabled, std::function<void(int)> set) {
+    std::wstring src = sources.empty() ? L"" : L" (" + sources + L")";
+    std::wstring to = channelsChoiceName(cur);
+    std::wstring value = cur == 0 ? L"source" + src : sources.empty() || sources == to ? to : sources + L" \u2192 " + to;
+    int ci = cur == 2 ? 1 : cur == 1 ? 2 : 0;
+    field(x, y, left, right, L"CHANNELS", value, [this, src, ci, set] {
+        int r = popup({L"source" + src + L", as it is", L"stereo", L"mono"}, ci);
+        if (r >= 0 && r < 3) set(kChannelValues[r]);
+    }, [ci, set](int n) { set(kChannelValues[std::clamp(ci - n, 0, 2)]); }, enabled ? 0 : S_Disabled);
+    items_.back().tip = L"audio channels: the source as it is, or every track as stereo or mono";
 }
 
 void MainWindow::build() {
@@ -525,6 +570,18 @@ void MainWindow::buildDownloadOptions(int& y, const RECT& a) {
         relayout();
     });
     y += rh;
+    // SOUND: the channels of MP4, MOV, MP3 and WAV outputs; Original keeps the audio as it comes.
+    x = fieldLabel(a.left, y, L"SOUND");
+    bool original = s.dlOut == DlOut::Original || s.dlOut == DlOut::AudioOriginal;
+    int ch = original ? 0 : s.dlChannels;
+    channelsField(x, y, a.left + labelW(), a.right, ch, sourceLayouts(0), !original, [this](int v) {
+        updateSetting([v](Settings& st) { st.dlChannels = v; });
+        relayout();
+    });
+    rowNote(x, y, a.right, original ? L"Original keeps the audio as it comes"
+                           : ch ? (s.dlOut == DlOut::MOV ? L"audio with other channels becomes exact PCM" : L"audio with other channels is converted")
+                           : s.dlOut == DlOut::AudioMP3 ? L"MP3 holds stereo at most" : L"channels kept as they are");
+    y += rh;
     x = fieldLabel(a.left, y, L"SAVE TO");
     int pathMax = std::max<int>(S(200), (a.right - x) * 2 / 5);
     x = choice(x, y, L"", s.dlDir, [this] {
@@ -744,8 +801,8 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
             else if (r >= 2 && r <= 6) change([&](ConvertSpec& c) { c.acodec = ACodec::AAC; c.aacKbps = k[r - 2]; });
             else if (r >= 8) change([&](ConvertSpec& c) { c.acodec = ACodec::PCM; c.pcmBits = r == 8 ? 0 : r == 9 ? 16 : 24; });
         });
-        if (isDnxhr(cs.vcodec) && a.right - x > S(160)) text(x, y, L"fixed rate per profile, visually lossless", S_Mid, a.right - x);
-        else if (cs.vcodec == VCodec::Copy && a.right - x > S(160)) text(x, y, L"video copied bit-for-bit", S_Mid, a.right - x);
+        if (isDnxhr(cs.vcodec)) rowNote(x, y, a.right, L"fixed rate per profile, visually lossless");
+        else if (cs.vcodec == VCodec::Copy) rowNote(x, y, a.right, L"video copied bit-for-bit");
     } else {
         if (cs.audio == AudioTarget::FLAC)
             field(x, y, left, a.right, L"LEVEL", std::to_wstring(cs.flacLevel), [this, change] {
@@ -788,7 +845,7 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
     // PICTURE shows only when the video is encoded; SOUND changes re-encode the audio they touch.
     // A dropdown over a fixed list of values: the box shows the short name, the wheel steps through them.
     auto pick = [&](const std::wstring& cap, const std::vector<std::wstring>& names, const std::vector<int>& vals, int cur,
-                    std::function<void(ConvertSpec&, int)> set) {
+                    std::function<void(ConvertSpec&, int)> set, unsigned style = 0) {
         int ci = -1;
         for (size_t i = 0; i < vals.size(); i++)
             if (vals[i] == cur) ci = (int)i;
@@ -798,7 +855,7 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
         }, [ci, vals, set, change](int n) {
             int r = std::clamp((ci < 0 ? 0 : ci) - n, 0, (int)vals.size() - 1);
             change([&](ConvertSpec& c) { set(c, vals[r]); });
-        });
+        }, style);
     };
     // "clear" at the end of a row puts that row's filters back to source / off.
     auto clearButton = [&](std::function<void(ConvertSpec&)> reset) {
@@ -809,8 +866,11 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
         button(x, y, L"clear", [change, reset] { change(reset); });
         items_.back().tip = L"back to source / off";
     };
-    if (encodesVideo) {
-        x = fieldLabel(a.left, y, L"PICTURE");
+    // PICTURE keeps its two lines for every target (greyed when the video is not encoded), so the list
+    // below does not jump when the target changes.
+    {
+        unsigned pst = encodesVideo ? 0 : S_Disabled;
+        x = fieldLabel(a.left, y, L"PICTURE", encodesVideo ? S_Mid : S_Mid | S_Disabled);
         field(x, y, left, a.right, L"RESOLUTION", sizeText(cs), [this, change] {
             RECT at = anchor_;
             ConvertSpec cur = settingsCopy().convert;
@@ -841,13 +901,13 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
                     change([&](ConvertSpec& c) { c.width = w; c.height = h; });
                 else flash(L"Enter a resolution such as 1080x1920 (each side 16 to 16384).");
             });
-        });
+        }, nullptr, pst);
         if (cs.width && cs.height) {
             const wchar_t* names[] = {L"fit", L"fill", L"stretch", L"centered"};
             field(x, y, left, a.right, L"FRAMING", names[(int)cs.framing], [this, change] {
                 int r = popup({L"fit (whole frame, add bars)", L"fill (crop to fill the canvas)", L"stretch (change proportions)", L"centered (no zoom, crop or pad)"}, (int)settingsCopy().convert.framing);
                 if (r >= 0) change([&](ConvertSpec& c) { c.framing = (Framing)r; });
-            });
+            }, nullptr, pst);
         }
         field(x, y, left, a.right, L"FRAME RATE", cs.fps > 0 ? fmtFps(cs.fps) : L"source", [this, change] {
             RECT at = anchor_;
@@ -860,11 +920,12 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
             int r = popup(o, checked);
             if (r >= 0 && r <= 10) change([&](ConvertSpec& c) { c.fps = fps[r]; });
             else if (r == 12)
-                customValue(cur > 0 ? fmtFps(cur) : L"30", at, [change](const std::wstring& v) {
+                customValue(cur > 0 ? fmtFps(cur) : L"30", at, [this, change](const std::wstring& v) {
                     double d = _wtof(v.c_str());
                     if (d >= 1 && d <= 240) change([&](ConvertSpec& c) { c.fps = d; });
+                    else flash(L"Enter a frame rate between 1 and 240.");
                 });
-        });
+        }, nullptr, pst);
         if (!isDnxhr(cs.vcodec)) {
             std::vector<std::wstring> pn = {L"source", L"8-bit 4:2:0", L"10-bit 4:2:0", L"8-bit 4:2:2", L"10-bit 4:2:2", L"8-bit 4:4:4", L"10-bit 4:4:4"};
             const char* pf[] = {"", "yuv420p", "yuv420p10le", "yuv422p", "yuv422p10le", "yuv444p", "yuv444p10le"};
@@ -875,18 +936,19 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
                 const char* pf2[] = {"", "yuv420p", "yuv420p10le", "yuv422p", "yuv422p10le", "yuv444p", "yuv444p10le"};
                 int r = popup(pn, pi);
                 if (r >= 0) change([&](ConvertSpec& c) { c.pixFmt = pf2[r]; });
-            });
+            }, nullptr, pst);
         }
+        if (!encodesVideo) rowNote(x, y, a.right, audioTarget ? L"audio only: no picture" : L"video copied: the picture stays as it is");
         // A second line for what processes the frames (the first one says what they become).
         y += rh;
         x = left;
         pick(L"DEINTERLACE", {L"off", L"auto (interlaced frames)", L"every frame", L"double rate (every field)"}, {0, 1, 2, 3}, cs.deinterlace,
-             [](ConvertSpec& c, int v) { c.deinterlace = v; });
+             [](ConvertSpec& c, int v) { c.deinterlace = v; }, pst);
         pick(L"ROTATE", {L"none", L"90° clockwise", L"90° counter-clockwise", L"180°", L"mirror (left-right)", L"flip (upside down)"}, {0, 1, 2, 3, 4, 5},
-             cs.rotate, [](ConvertSpec& c, int v) { c.rotate = v; });
-        pick(L"DENOISE", {L"off", L"light", L"medium", L"strong"}, {0, 1, 2, 3}, cs.denoise, [](ConvertSpec& c, int v) { c.denoise = v; });
-        pick(L"SHARPEN", {L"off", L"light", L"medium"}, {0, 1, 2}, cs.sharpen, [](ConvertSpec& c, int v) { c.sharpen = v; });
-        if (cs.hasVideoFilters())
+             cs.rotate, [](ConvertSpec& c, int v) { c.rotate = v; }, pst);
+        pick(L"DENOISE", {L"off", L"light", L"medium", L"strong"}, {0, 1, 2, 3}, cs.denoise, [](ConvertSpec& c, int v) { c.denoise = v; }, pst);
+        pick(L"SHARPEN", {L"off", L"light", L"medium"}, {0, 1, 2}, cs.sharpen, [](ConvertSpec& c, int v) { c.sharpen = v; }, pst);
+        if (encodesVideo && cs.hasVideoFilters())
             clearButton([](ConvertSpec& c) {
                 c.width = c.height = 0;
                 c.framing = Framing::Fit;
@@ -896,7 +958,11 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
             });
         y += rh;
     }
+    // SOUND: channels first (as on Download and Remux), then loudness and, for audio files, the sample rate.
     x = fieldLabel(a.left, y, L"SOUND");
+    channelsField(x, y, left, a.right, cs.channels, sourceLayouts(1), true, [change](int v) { change([v](ConvertSpec& c) { c.channels = v; }); });
+    pick(L"LOUDNESS", {L"off", L"-23 LUFS (broadcast)", L"-16 LUFS (podcast)", L"-14 LUFS (streaming)"}, {0, 1, 2, 3}, cs.loudness,
+         [](ConvertSpec& c, int v) { c.loudness = v; });
     if (audioTarget) {
         std::vector<std::wstring> rn = {L"source", L"44100 Hz", L"48000 Hz"};
         std::vector<int> rv = {0, 44100, 48000};
@@ -906,12 +972,10 @@ void MainWindow::buildConvertOptions(int& y, const RECT& a) {
         }
         pick(L"SAMPLE RATE", rn, rv, cs.sampleRate, [](ConvertSpec& c, int v) { c.sampleRate = v; });
     }
-    pick(L"CHANNELS", {L"source", L"stereo", L"mono"}, {0, 2, 1}, cs.channels, [](ConvertSpec& c, int v) { c.channels = v; });
-    pick(L"LOUDNESS", {L"off", L"-23 LUFS (broadcast)", L"-16 LUFS (podcast)", L"-14 LUFS (streaming)"}, {0, 1, 2, 3}, cs.loudness,
-         [](ConvertSpec& c, int v) { c.loudness = v; });
     if (cs.channels || cs.loudness || (audioTarget && cs.sampleRate))
         clearButton([](ConvertSpec& c) { c.loudness = c.channels = c.sampleRate = 0; });
-    if (!audioTarget && a.right - x > S(200)) text(x, y, cs.acodec == ACodec::Copy && !cs.channels && !cs.loudness ? L"changes here re-encode the audio" : L"", S_Mid, a.right - x);
+    else if (!audioTarget && cs.acodec == ACodec::Copy) rowNote(x, y, a.right, L"a change here re-encodes the tracks it touches");
+    else if (cs.audio == AudioTarget::MP3) rowNote(x, y, a.right, L"MP3 holds stereo at most");
     y += rh;
     // SAVE TO, with the stream options on the same row (as on Download), and the encoder at the right.
     x = fieldLabel(a.left, y, L"SAVE TO");
@@ -996,7 +1060,17 @@ void MainWindow::buildRemuxOptions(int& y, const RECT& a) {
             if (r >= 0 && r < 4) setQ(kq[r]);
         }, [qi, setQ](int n) { setQ(kq[std::clamp(qi - n, 0, 3)]); });
     }
-    if (a.right - x > S(120)) text(x, y, note, S_Mid, a.right - x);
+    rowNote(x, y, a.right, note);
+    y += rh;
+    // SOUND: the channels of every audio track (a track set to COPY in its details stays bit-for-bit).
+    x = fieldLabel(a.left, y, L"SOUND");
+    channelsField(x, y, a.left + labelW(), a.right, s.remuxChannels, sourceLayouts(2), true, [this](int v) {
+        updateSetting([v](Settings& st) { st.remuxChannels = v; });
+        relayout();
+    });
+    const wchar_t* becomes = s.remuxAudio == RemuxAudio::PCM ? L"exact PCM"
+                             : s.remuxAudio == RemuxAudio::AAC || s.remuxContainer == Container::MP4 ? L"AAC" : L"exact PCM";
+    rowNote(x, y, a.right, s.remuxChannels ? std::wstring(L"tracks that change become ") + becomes + L"; COPY on a track keeps it" : L"channels kept as they are");
     y += rh;
     x = fieldLabel(a.left, y, L"SAVE TO");
     choice(x, y, L"", s.remuxDir.empty() ? L"next to the source" : s.remuxDir, [this] {
@@ -1401,11 +1475,7 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
         return y + S(10) - y0;
     }
     // Remux: container advice, then every track with what happens to it.
-    RemuxSpec rs = f.remux;
-    rs.container = s.remuxContainer;
-    rs.audio = s.remuxAudio;
-    rs.pcmBits = s.remuxPcmBits;
-    rs.aacKbps = s.remuxAacKbps;
+    RemuxSpec rs = s.remuxSpec(f.remux);
     ContainerAdvice adv = adviseContainer(s.remuxContainer, f.info);
     if (adv.best != s.remuxContainer) {
         std::wstring t = std::wstring(containerName(s.remuxContainer)) + L" cannot keep " + std::to_wstring(adv.convertible + adv.impossible) +
@@ -1427,10 +1497,9 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
     }
     int boxW = S(220);
     for (auto& st : f.info.streams) {
-        auto it = rs.actions.find(st.index);
-        TrackAction act = it != rs.actions.end() ? it->second : defaultAction(s.remuxContainer, st, s.remuxAudio);
+        int to = 0;
+        TrackAction act = remuxTrack(rs, st, &to);
         auto allowed = allowedActions(s.remuxContainer, st);
-        if (std::find(allowed.begin(), allowed.end(), act) == allowed.end()) act = defaultAction(s.remuxContainer, st, s.remuxAudio);
         int sid = st.index;
         int ax = right - boxW;
         text(left, y, describeStream(st), (act == TrackAction::Exclude ? S_Mid : 0) | S_Mono, ax - left - S(16));
@@ -1439,20 +1508,23 @@ int MainWindow::buildRowDetail(const ListRow& r, int left, int right, int y0) {
             y += rh;
             continue;
         }
+        std::wstring mix = to ? std::wstring(L" ") + channelsChoiceName(to) : L"";
+        int aacK = aacKbpsFor(s.remuxAacKbps, std::min(8, to ? to : st.channels));
         std::wstring label = trackActionName(act);
-        if (act == TrackAction::ToPCM) label = std::wstring(L"PCM ") + pcmBitsName(s.remuxPcmBits);
-        if (act == TrackAction::ToAAC) label = L"AAC " + std::to_wstring(aacKbpsFor(s.remuxAacKbps, std::min(8, st.channels))) + L"k";
+        if (act == TrackAction::ToPCM) label = std::wstring(L"PCM ") + pcmBitsName(s.remuxPcmBits) + mix;
+        if (act == TrackAction::ToAAC) label = L"AAC " + std::to_wstring(aacK) + L"k" + mix;
         if (fitStream(s.remuxContainer, st) == Fit::No && act == TrackAction::Exclude) label = L"EXCLUDED (cannot fit)";
         Item& ch = add(K_Box, RECT{ax, y + S(3), right, y + rh - S(3)}, label, S_Click | (act == TrackAction::Copy ? 0 : S_Bold));
-        int pcmBits = s.remuxPcmBits, aacK = aacKbpsFor(s.remuxAacKbps, std::min(8, st.channels));
-        ch.click = [this, key, sid, allowed, act, pcmBits, aacK] {
+        int pcmBits = s.remuxPcmBits;
+        ch.click = [this, key, sid, allowed, act, pcmBits, aacK, mix] {
             std::vector<std::wstring> o;
             int cur = -1;
             for (size_t i = 0; i < allowed.size(); i++) {
                 std::wstring n = trackActionName(allowed[i]);
                 if (allowed[i] == TrackAction::Copy) n += L" (bit-for-bit)";
-                if (allowed[i] == TrackAction::ToPCM) n = std::wstring(L"PCM ") + pcmBitsName(pcmBits) + (pcmBits == 0 || pcmBits == 32 ? L" (lossless decode)" : L" (rounded)");
-                if (allowed[i] == TrackAction::ToAAC) n = L"AAC " + std::to_wstring(aacK) + L"k (lossy)";
+                if (allowed[i] == TrackAction::ToPCM)
+                    n = std::wstring(L"PCM ") + pcmBitsName(pcmBits) + mix + (!mix.empty() ? L" (channels mixed)" : pcmBits == 0 || pcmBits == 32 ? L" (lossless decode)" : L" (rounded)");
+                if (allowed[i] == TrackAction::ToAAC) n = L"AAC " + std::to_wstring(aacK) + L"k" + mix + L" (lossy)";
                 if (allowed[i] == TrackAction::ToText) n += L" (mov_text, styling lost)";
                 if (allowed[i] == act) cur = (int)i;
                 o.push_back(n);

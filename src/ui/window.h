@@ -150,8 +150,9 @@ private:
     int iconW() const { return S(19); }  // the glyph in a labelled button
     int check(int x, int y, bool on, std::function<void()> fn);  // a box without a label (list rows)
     HFONT fontFor(unsigned style) const;
+    // A dropdown box; S_Disabled draws it greyed and inert (it keeps its place, so the layout does not jump).
     int choice(int x, int y, const std::wstring& label, const std::wstring& value, std::function<void()> open, std::function<void(int)> wheel = nullptr,
-               int maxW = 0);
+               int maxW = 0, unsigned style = 0);
     int seg(int x, int y, const std::vector<std::wstring>& opts, int sel, std::function<void(int)> fn);
     int iconButton(int x, int y, int icon, bool on, std::function<void()> fn);  // returns the left edge (laid out right to left)
     int fieldLabel(int x, int y, const std::wstring& label, unsigned style = S_Mid);  // fixed label column; returns the control x
@@ -168,7 +169,12 @@ private:
     void endClip() { clipping_ = false; }
     // field: an inline caption and a dropdown, flowing left to right and wrapping to the control column.
     void field(int& x, int& y, int left, int right, const std::wstring& caption, const std::wstring& value, std::function<void()> open,
-               std::function<void(int)> wheel = nullptr);
+               std::function<void(int)> wheel = nullptr, unsigned style = 0);
+    // The CHANNELS dropdown of every section: "source (5.1)" names what the items hold and keeps it; stereo and mono convert.
+    void channelsField(int& x, int& y, int left, int right, int cur, const std::wstring& sources, bool enabled, std::function<void(int)> set);
+    std::wstring sourceLayouts(int tab);  // the audio layouts of the selected item, else of every pending item: "5.1", "stereo, mono"
+    // A short mid-ink note at the end of an options row, when there is room for it.
+    void rowNote(int x, int y, int right, const std::wstring& note);
     int fieldW(const std::wstring& caption, const std::wstring& value);
     int popup(const std::vector<std::wstring>& items, int checked);  // the app's own dropdown, under the clicked control
     int popup(const std::vector<std::wstring>& items, const std::vector<int>& checked);  // sectioned: one check per section
@@ -279,11 +285,9 @@ private:
     int historyScroll_ = 0;
     std::vector<HistoryItem> history_;
     std::wstring flash_;  // one-line notice in the header
-    ULONGLONG flashUntil_ = 0;
     std::function<void(const std::wstring&)> customDone_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> queuePosted_{false};
-    std::atomic<ULONGLONG> lastQueuePost_{0};
     std::mutex resMu_;
     std::vector<WorkResult> results_;
     struct Worker {
@@ -295,7 +299,6 @@ private:
     std::atomic<bool> updateBusy_{false};
     uint64_t nextKey_ = 1;
     bool timerOn_ = false;
-    bool healthy_ = false;
     bool building_ = false;  // inside build(): relayout() is ignored
 };
 
